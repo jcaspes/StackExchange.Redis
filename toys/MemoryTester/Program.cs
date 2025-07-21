@@ -143,7 +143,10 @@ namespace MemoryTester
             Threads.TraceConsole($"Total Rediscalls:{redisCallsCount}");
             Threads.TraceConsole($"Success redis calls:{redisCallsCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}/{redisCallsCount}");
             Threads.TraceConsole($"Corrupted redis commands key value: {corruptedDataCount}");
-            Threads.TraceConsole($"Corrupted redis commands data size: {corruptedDataSizeCount}");
+            if (checkContent)
+            {
+                Threads.TraceConsole($"Corrupted redis commands data size: {corruptedDataSizeCount}");
+            }
             Threads.TraceConsole($"Key not found unexpected errors {keyNotFoundCount}");
         }
     }
