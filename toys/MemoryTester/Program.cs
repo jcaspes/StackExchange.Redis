@@ -108,7 +108,7 @@ namespace MemoryTester
                         if (key != props["thread"])
                         {
                             System.Threading.Interlocked.Increment(ref corruptedDataCount);
-                            Threads.TraceConsole($"Error in key, expected:{key}, actual:{props["thread"]}, value is valid but from an other query: {valueIsValid}");
+                            Threads.TraceConsole($"Error in thread field, expected:{key}, actual:{props["thread"]}, value is valid but from an other query: {valueIsValid}");
                         }
                         if (checkContent && expectedSize != props["Value"].Length)
                         {
@@ -119,7 +119,7 @@ namespace MemoryTester
                                 Threads.TraceConsole(valueInRedis);
                                 Threads.TraceConsole(props["Value"]);
                             }
-                            Threads.TraceConsole($"Error in value lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
+                            Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
                         }
 
                         // if we have no OutOfMemory exception, we can add the value to results
