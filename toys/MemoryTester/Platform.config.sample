@@ -1,0 +1,5 @@
+<?xml version="1.0"?>
+<appSettings>
+	<add key="redisHost" value="localhost:7379" />
+	<add key="redisPassword" value="******" />
+</appSettings>

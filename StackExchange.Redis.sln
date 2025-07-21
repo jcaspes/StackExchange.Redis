@@ -119,6 +119,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ConsoleTestBaseline", "test
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "docs", "docs\docs.csproj", "{1DC43E76-5372-4C7F-A433-0602273E87FC}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "MemoryTester", "toys\MemoryTester\MemoryTester.csproj", "{8835D1C3-BE2F-65F6-586F-CB7C0E83872C}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -173,6 +175,10 @@ Global
 		{1DC43E76-5372-4C7F-A433-0602273E87FC}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{1DC43E76-5372-4C7F-A433-0602273E87FC}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{1DC43E76-5372-4C7F-A433-0602273E87FC}.Release|Any CPU.Build.0 = Release|Any CPU
+		{8835D1C3-BE2F-65F6-586F-CB7C0E83872C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{8835D1C3-BE2F-65F6-586F-CB7C0E83872C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{8835D1C3-BE2F-65F6-586F-CB7C0E83872C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{8835D1C3-BE2F-65F6-586F-CB7C0E83872C}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -194,6 +200,7 @@ Global
 		{A9F81DA3-DA82-423E-A5DD-B11C37548E06} = {96E891CD-2ED7-4293-A7AB-4C6F5D8D2B05}
 		{A0F89B8B-32A3-4C28-8F1B-ADE343F16137} = {73A5C363-CA1F-44C4-9A9B-EF791A76BA6A}
 		{69A0ACF2-DF1F-4F49-B554-F732DCA938A3} = {73A5C363-CA1F-44C4-9A9B-EF791A76BA6A}
+		{8835D1C3-BE2F-65F6-586F-CB7C0E83872C} = {E25031D3-5C64-430D-B86F-697B66816FD8}
 	EndGlobalSection
 	GlobalSection(ExtensibilityGlobals) = postSolution
 		SolutionGuid = {193AA352-6748-47C1-A5FC-C9AA6B5F000B}
