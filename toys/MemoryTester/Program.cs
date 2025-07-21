@@ -17,7 +17,7 @@ namespace MemoryTester
             {
                 checkContent = true;
             }
-            Threads.TraceConsole($"Starting the tests");
+            Threads.TraceConsole($"Starting the tests (press any key to stop)");
 
             string BaseKeyName = "MemoryTester";
 
@@ -41,6 +41,8 @@ namespace MemoryTester
             {
                 count = 200,
             };
+
+            bool stopAllThreads = false;
             threads.Loop((int threadIndex) =>
             {
                 // A list to memoryse loop data and consume memory
@@ -65,10 +67,19 @@ namespace MemoryTester
                 redis.HashSet(objectUid, hashEntries);
 
                 // loop to fill memory with redis data and try to get OutOffMemory exceptions
-                while (true)
+                while (!stopAllThreads)
                 {
                     try
                     {
+                        if (!stopAllThreads)
+                        {
+                            if (Console.KeyAvailable)
+                            {
+                                Console.WriteLine("Exiting the test loop.");
+                                stopAllThreads = true;
+                            }
+                        }
+
                         HashEntry[] hashEntriesFromRedis = redis.HashGetAll(objectUid);
                         System.Threading.Interlocked.Increment(ref redisCallsCount);
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
