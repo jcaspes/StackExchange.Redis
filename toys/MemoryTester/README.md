@@ -30,6 +30,12 @@ All logs start with thread id
 
 #### Simple usage:
 Will only check that the hgetall returned the asked hashset and if data is valid (simple check of size and start / end tags)
+
+Found issue with this command:
+
+   - https://github.com/StackExchange/StackExchange.Redis/issues/2919
+   - https://github.com/StackExchange/StackExchange.Redis/issues/2920
+
 ```
 MemoryTester.exe
 ```
@@ -44,7 +50,8 @@ Exiting the test loop.
 #### Data check usage:
 Will check if received content (value field) contain valid data (simple check of size and start /end tags)
 
-  Found issue with this command: https://github.com/StackExchange/StackExchange.Redis/issues/2913
+Found issue with this command: https://github.com/StackExchange/StackExchange.Redis/issues/2913
+
 ```
 MemoryTester.exe checkContent
 ```
