@@ -1,6 +1,7 @@
 # MemoryTester
 
 This tool allow to test stackexchange.redis library under high memory load conditions.
+For now tested only under windows 2022 server + .Net 4.8
 
 # How it work
 
