@@ -8,6 +8,7 @@ namespace MemoryTester
     {
         private static int corruptedDataCount;
         private static int corruptedDataSizeCount;
+        private static int keyNotFoundCount;
         private static int redisCallsCount;
         private static bool checkContent = false;
         private static double maxSize = 0x24000; // max size of string
@@ -100,6 +101,7 @@ namespace MemoryTester
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
                         {
                             Threads.TraceConsole($"Key '{key}' not found");
+                            System.Threading.Interlocked.Increment(ref keyNotFoundCount);
                             continue;
                         }
 
@@ -139,9 +141,10 @@ namespace MemoryTester
             Threads.TraceConsole("-------------------------------");
             exceptionStats.TraceStats();
             Threads.TraceConsole($"Total Rediscalls:{redisCallsCount}");
-            Threads.TraceConsole($"Success redis calls:{redisCallsCount - corruptedDataCount - corruptedDataSizeCount}/{redisCallsCount}");
+            Threads.TraceConsole($"Success redis calls:{redisCallsCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}/{redisCallsCount}");
             Threads.TraceConsole($"Corrupted redis commands key value: {corruptedDataCount}");
             Threads.TraceConsole($"Corrupted redis commands data size: {corruptedDataSizeCount}");
+            Threads.TraceConsole($"Key not found unexpected errors {keyNotFoundCount}");
         }
     }
 }
