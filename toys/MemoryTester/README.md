@@ -17,6 +17,9 @@ This tool allow to test stackexchange.redis library under high memory load condi
 
 ### Usage:
 
+You can configure redis address and password in a platform.config file in the same directory as the executable. [platform.config.sample](platform.config.sample)
+Program will write in harcoded DB 1 of redis instance
+
 MemoryTester.exe [checkContent] [log] [maxSize=123456789] 
 - checkContent: Optional, if present will check if the content of the value field is valid (start and end tags).
 - log: Optional, if present will log unique stacks traces to a log file + all console output.
