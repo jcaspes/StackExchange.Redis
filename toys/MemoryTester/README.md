@@ -36,8 +36,8 @@ MemoryTester.exe
 Ouput sample (say that key is from an other thread, and if data is valid (but from an other thread)):
 ```
 1 : Starting the tests (press any key to stop)
-87 : Error in key, expected:Th87hT, actual:Th71hT, value is a valid but from an other query: True
-126 : Error in key, expected:Th126hT, actual:Th56hT, value is a valid but from an other query: True
+87 : Error in key, expected:Th87hT, actual:Th71hT, value is valid but from an other query: True
+126 : Error in key, expected:Th126hT, actual:Th56hT, value is valid but from an other query: True
 Exiting the test loop.
 ```
 
@@ -52,12 +52,12 @@ Ouput sample:
 ```
 1 : Starting the tests (press any key to stop)
 
-67 : Error in key, expected:Th67hT, actual:Th54hT, value is a valid but from an other query: True
+67 : Error in key, expected:Th67hT, actual:Th54hT, value is valid but from an other query: True
 67 : >>>!KVWVPW8ACCD.....2UFKD8HVMRK12!<<<
-67 : Error in value lenght in thread 'Th67hT', expected:57399, actual:100094, value is a valid but from an other query: True
+67 : Error in value lenght in thread 'Th67hT', expected:57399, actual:100094, value is valid but from an other query: True
 67 : >>>!R2T3UJFRG3M.....6EQQHPN14CEG2!<<<
-218 : Error in key, expected:Th218hT, actual:Th58hT, value is a valid but from an other query: True
-218 : Error in value lenght in thread 'Th218hT', expected:34098, actual:118465, value is a valid but from an other query: True
+218 : Error in key, expected:Th218hT, actual:Th58hT, value is valid but from an other query: True
+218 : Error in value lenght in thread 'Th218hT', expected:34098, actual:118465, value is valid but from an other query: True
 ```
 
 Program will also output stats about exceptions type and stack hash
