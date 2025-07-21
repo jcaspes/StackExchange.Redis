@@ -10,13 +10,28 @@ namespace MemoryTester
         private static int corruptedDataSizeCount;
         private static int redisCallsCount;
         private static bool checkContent = false;
+        private static double maxSize = 0x24000; // max size of string
 
         private static void Main(string[] args)
         {
-            if (args.Length > 0 && args[0] == "checkContent")
+            if (args.Length > 0)
             {
-                checkContent = true;
+                foreach (string arg in args)
+                {
+                    if (arg.Equals("checkContent", StringComparison.OrdinalIgnoreCase))
+                        checkContent = true;
+                    if (arg.Equals("log", StringComparison.OrdinalIgnoreCase))
+                        Threads.traceInFile = true;
+                    if (arg.StartsWith("maxsize", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string[] argSplit = arg.Split('=');
+                        maxSize = double.Parse(argSplit[1]);
+                    }
+                }
             }
+
+            Threads.Init();
+
             Threads.TraceConsole($"Starting the tests (press any key to stop)");
 
             string BaseKeyName = "MemoryTester";
@@ -53,7 +68,7 @@ namespace MemoryTester
 
                 // construct a big random string for current thread
                 // set this string in redis so when can test HGET on high memory pressure
-                string valueInRedis = ">>>!" + StringsHelpers.RandomString((int)(new Random(threadIndex).NextDouble() * 0x24000), threadIndex) + "!<<<";
+                string valueInRedis = ">>>!" + StringsHelpers.RandomString((int)(new Random(threadIndex).NextDouble() * maxSize), threadIndex) + "!<<<";
                 int expectedSize = valueInRedis.Length;
                 string objectUid = $"{BaseKeyName}:{key}";
 

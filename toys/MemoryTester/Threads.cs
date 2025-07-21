@@ -8,16 +8,11 @@ namespace MemoryTester
     public sealed class Threads
     {
         public int count = 1;
-
         public delegate void Callback(int threadIndex);
+        private static StreamWriter logger;
+        public static bool traceInFile = false;
 
-        private static readonly object traceLock = new object();
-
-        private static readonly StreamWriter logger;
-
-        private static readonly bool traceInFile = false;
-
-        static Threads()
+        public static void Init()
         {
             if (traceInFile)
             {
