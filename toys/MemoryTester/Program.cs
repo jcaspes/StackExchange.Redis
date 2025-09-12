@@ -12,6 +12,7 @@ namespace MemoryTester
         private static int redisCallsCount;
         private static bool checkContent = false;
         private static double maxSize = 0x24000; // max size of string
+        private static bool highIntegrity = false;
 
         private static void Main(string[] args)
         {
@@ -28,6 +29,8 @@ namespace MemoryTester
                         string[] argSplit = arg.Split('=');
                         maxSize = double.Parse(argSplit[1]);
                     }
+                    if (arg.Equals("highIntegrity", StringComparison.OrdinalIgnoreCase))
+                        highIntegrity = true;
                 }
             }
 
@@ -45,8 +48,10 @@ namespace MemoryTester
                 AllowAdmin = true,
                 AbortOnConnectFail = false,
                 SyncTimeout = 5000,
-                // HighIntegrity = true,
+                HighIntegrity = highIntegrity,
             };
+
+            Console.WriteLine(configuration);
 
             ExceptionStats exceptionStats = new ExceptionStats();
             ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
