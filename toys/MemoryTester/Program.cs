@@ -62,7 +62,7 @@ namespace MemoryTester
 
             // Unique key base on process id so multiple instance of the tester can run on the same redis server
             string processId = System.Diagnostics.Process.GetCurrentProcess().Id.ToString();
-            string BaseKeyName = $"MemoryTester:pid{processId}:";
+            string BaseKeyName = $"MemoryTester:pid{processId}";
 
             threads.Loop((int threadIndex) =>
             {
