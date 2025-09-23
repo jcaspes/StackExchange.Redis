@@ -12,6 +12,7 @@ namespace MemoryTester
         private static bool checkContent = false;
         private static double maxSize = 0x24000; // max size of string
         private static bool highIntegrity = false;
+        private static bool cleanPreviousRun = true;
 
         private static void Main(string[] args)
         {
@@ -30,6 +31,8 @@ namespace MemoryTester
                     }
                     if (arg.Equals("highIntegrity", StringComparison.OrdinalIgnoreCase))
                         highIntegrity = true;
+                    if (arg.Equals("noClean", StringComparison.OrdinalIgnoreCase))
+                        cleanPreviousRun = false;
                 }
             }
 
@@ -64,6 +67,18 @@ namespace MemoryTester
             string processId = System.Diagnostics.Process.GetCurrentProcess().Id.ToString();
             string BaseKeyName = $"MemoryTester:pid{processId}";
 
+            IDatabase redis = connection.GetDatabase();
+            IEnumerable<RedisKey> resultKeysEnumerable;
+
+            if (cleanPreviousRun)
+            {
+                resultKeysEnumerable = connection.GetServers()[0].Keys((int)configuration.DefaultDatabase, pattern: $"MemoryTester:*");
+                foreach (RedisKey key in resultKeysEnumerable)
+                {
+                    redis.KeyDelete(key);
+                }
+            }
+
             threads.Loop((int threadIndex) =>
             {
                 // A list to memoryse loop data and consume memory
@@ -84,7 +99,6 @@ namespace MemoryTester
                     new HashEntry("thread", key),
                 };
 
-                IDatabase redis = connection.GetDatabase();
                 redis.HashSet(objectUid, hashEntries);
                 redis.KeyExpire(key, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
 

@@ -25,6 +25,8 @@ MemoryTester.exe [checkContent] [log] [maxSize=123456789]
 - checkContent: Optional, if present will check if the content of the value field is valid (start and end tags).
 - log: Optional, if present will log unique stacks traces to a log file + all console output.
 - maxSize: Optional, if present will set the maximum size of the random string to generate (default is 0x24000 bytes).
+- highIntegrity: Activate or not the highIntegrity mode of Redis Lib
+- noClean: Optional, if present will not clean the redis db 1 at start of the program.
 
 All logs start with thread id
 
