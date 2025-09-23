@@ -7,7 +7,9 @@ namespace MemoryTester
 {
     public sealed class Threads
     {
+        public static int redisCallsCount;
         public int count = 1;
+        public bool stopAllThreads = false;
         public delegate void Callback(int threadIndex);
         private static StreamWriter logger;
         public static bool traceInFile = false;
@@ -42,24 +44,40 @@ namespace MemoryTester
             }
         }
 
+        private static readonly Dictionary<string, Thread> threads = new();
+
+        private int threadId = 0;
         public void Loop(Callback callback)
         {
-            List<Thread> threads = new List<Thread>(count);
+            while (!stopAllThreads)
+            {
+                Console.WriteLine($"===> Threads loop, count: {threads.Count}, redis calls: {Threads.redisCallsCount} <===");
+                // Create the wanted threads count
+                while (threads.Count < count)
+                {
+                    Thread thread = new Thread(ThreadCallBack(callback))
+                    {
+                        Name = threadId.ToString(),
+                    };
+                    threads.Add(thread.Name, thread);
+                    thread.Start(threadId++);
+                }
+                // Check for dead threads and reloop
+                List<string> deadThreads = new();
+                foreach (var threadKVP in threads)
+                {
+                    if (!threadKVP.Value.IsAlive)
+                    {
+                        deadThreads.Add(threadKVP.Key);
+                    }
+                }
 
-            for (int iThread = 0; iThread < count; iThread++)
-            {
-                Thread thread = new Thread(ThreadCallBack(callback));
-                threads.Add(thread);
-            }
+                foreach (var deadThread in deadThreads)
+                {
+                    threads.Remove(deadThread);
+                }
 
-            for (int iThread = 0; iThread < count; iThread++)
-            {
-                Thread thread = threads[iThread];
-                thread.Start(iThread);
-            }
-            foreach (Thread thread in threads)
-            {
-                thread.Join();
+                Thread.Sleep(1000);
             }
         }
 
@@ -67,16 +85,11 @@ namespace MemoryTester
         {
             try
             {
-                int threadId = -1;
-                if (obj != null)
-                {
-                    threadId = (int)obj;
-                }
-                callback(threadId);
+                callback((int)obj);
             }
-            catch (Exception)
+            catch (Exception) // exception)
             {
-                // TraceConsole($"Stop thread: {exception.GetType().FullName} occured : {exception.Message}\r\n{exception.StackTrace}");
+                // TraceConsole($"Stop thread: {exception.GetType().FullName} occured.");
             }
         };
     }

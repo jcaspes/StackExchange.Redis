@@ -9,7 +9,6 @@ namespace MemoryTester
         private static int corruptedDataCount;
         private static int corruptedDataSizeCount;
         private static int keyNotFoundCount;
-        private static int redisCallsCount;
         private static bool checkContent = false;
         private static double maxSize = 0x24000; // max size of string
         private static bool highIntegrity = false;
@@ -61,8 +60,6 @@ namespace MemoryTester
                 count = 200,
             };
 
-            bool stopAllThreads = false;
-
             // Unique key base on process id so multiple instance of the tester can run on the same redis server
             string processId = System.Diagnostics.Process.GetCurrentProcess().Id.ToString();
             string BaseKeyName = $"MemoryTester:pid{processId}:";
@@ -92,21 +89,21 @@ namespace MemoryTester
                 redis.KeyExpire(key, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
 
                 // loop to fill memory with redis data and try to get OutOffMemory exceptions
-                while (!stopAllThreads)
+                while (!threads.stopAllThreads)
                 {
                     try
                     {
-                        if (!stopAllThreads)
+                        if (!threads.stopAllThreads)
                         {
                             if (Console.KeyAvailable)
                             {
                                 Console.WriteLine("Exiting the test loop.");
-                                stopAllThreads = true;
+                                threads.stopAllThreads = true;
                             }
                         }
 
                         HashEntry[] hashEntriesFromRedis = redis.HashGetAll(objectUid);
-                        System.Threading.Interlocked.Increment(ref redisCallsCount);
+                        System.Threading.Interlocked.Increment(ref Threads.redisCallsCount);
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
                         {
                             Threads.TraceConsole($"Key '{key}' not found");
@@ -149,8 +146,8 @@ namespace MemoryTester
             Threads.TraceConsole("");
             Threads.TraceConsole("-------------------------------");
             exceptionStats.TraceStats();
-            Threads.TraceConsole($"Total Rediscalls:{redisCallsCount}");
-            Threads.TraceConsole($"Success redis calls:{redisCallsCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}/{redisCallsCount}");
+            Threads.TraceConsole($"Total Rediscalls:{Threads.redisCallsCount}");
+            Threads.TraceConsole($"Success redis calls:{Threads.redisCallsCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}/{Threads.redisCallsCount}");
             Threads.TraceConsole($"Corrupted redis commands key value: {corruptedDataCount}");
             if (checkContent)
             {
