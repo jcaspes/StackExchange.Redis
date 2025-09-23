@@ -176,8 +176,9 @@ namespace MemoryTester
             Threads.TraceConsole("");
             Threads.TraceConsole("-------------------------------");
             exceptionStats.TraceStats();
-            Threads.TraceConsole($"Total Rediscalls:{Threads.redisCallsCount}");
-            Threads.TraceConsole($"Success redis calls:{Threads.redisCallsCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}/{Threads.redisCallsCount}");
+            Threads.TraceConsole($"Total redis calls:{Threads.redisCallsCount}");
+            Threads.TraceConsole($"Total redis calls without exception:{Threads.redisCallsCount - ExceptionStats.ExceptionCount}");
+            Threads.TraceConsole($"Success redis calls (without exception and with correct data):{Threads.redisCallsCount - ExceptionStats.ExceptionCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}");
             Threads.TraceConsole($"Corrupted redis commands key value: {corruptedDataCount}");
             if (checkContent)
             {
