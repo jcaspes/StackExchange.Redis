@@ -56,8 +56,6 @@ namespace MemoryTester
             ExceptionStats exceptionStats = new ExceptionStats();
             ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
 
-            bool contentLogged = false;
-
             Threads threads = new Threads
             {
                 count = 200,
@@ -135,12 +133,8 @@ namespace MemoryTester
                         if (checkContent && expectedSize != props["Value"].Length)
                         {
                             System.Threading.Interlocked.Increment(ref corruptedDataSizeCount);
-                            if (!contentLogged)
-                            {
-                                contentLogged = true;
-                                Threads.TraceConsole($"{valueInRedis.Substring(0, 25)}...");
-                                Threads.TraceConsole($"{props["Value"].Substring(0, 25)}...");
-                            }
+                            Threads.TraceConsole($"{valueInRedis.Substring(0, 25)}...");
+                            Threads.TraceConsole($"{props["Value"].Substring(0, 25)}...");
                             Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
                         }
 
