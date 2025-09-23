@@ -51,33 +51,40 @@ namespace MemoryTester
         {
             while (!stopAllThreads)
             {
-                Console.WriteLine($"===> Threads loop, count: {threads.Count}, redis calls: {Threads.redisCallsCount} <===");
-                // Create the wanted threads count
-                while (threads.Count < count)
+                try
                 {
-                    Thread thread = new Thread(ThreadCallBack(callback))
+                    Console.WriteLine($"===> Threads loop, count: {threads.Count}, redis calls: {Threads.redisCallsCount} <===");
+                    // Create the wanted threads count
+                    while (threads.Count < count)
                     {
-                        Name = threadId.ToString(),
-                    };
-                    threads.Add(thread.Name, thread);
-                    thread.Start(threadId++);
-                }
-                // Check for dead threads and reloop
-                List<string> deadThreads = new();
-                foreach (var threadKVP in threads)
-                {
-                    if (!threadKVP.Value.IsAlive)
-                    {
-                        deadThreads.Add(threadKVP.Key);
+                        Thread thread = new Thread(ThreadCallBack(callback))
+                        {
+                            Name = threadId.ToString(),
+                        };
+                        threads.Add(thread.Name, thread);
+                        thread.Start(threadId++);
                     }
-                }
+                    // Check for dead threads and reloop
+                    List<string> deadThreads = new();
+                    foreach (var threadKVP in threads)
+                    {
+                        if (!threadKVP.Value.IsAlive)
+                        {
+                            deadThreads.Add(threadKVP.Key);
+                        }
+                    }
 
-                foreach (var deadThread in deadThreads)
+                    foreach (var deadThread in deadThreads)
+                    {
+                        threads.Remove(deadThread);
+                    }
+
+                    Thread.Sleep(1000);
+                }
+                catch (OutOfMemoryException)
                 {
-                    threads.Remove(deadThread);
+                    TraceConsole($"Loop OutOfMemoryException, retrying");
                 }
-
-                Thread.Sleep(1000);
             }
         }
 
