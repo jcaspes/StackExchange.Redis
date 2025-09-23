@@ -124,8 +124,8 @@ namespace MemoryTester
                             if (!contentLogged)
                             {
                                 contentLogged = true;
-                                Threads.TraceConsole(valueInRedis);
-                                Threads.TraceConsole(props["Value"]);
+                                Threads.TraceConsole($"{valueInRedis.Substring(0, 25)}...");
+                                Threads.TraceConsole($"{props["Value"].Substring(0, 25)}...");
                             }
                             Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
                         }
