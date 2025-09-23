@@ -126,8 +126,15 @@ namespace MemoryTester
                             }
                         }
 
-                        HashEntry[] hashEntriesFromRedis = redis.HashGetAll(objectUid);
+                        HashEntry[] hashEntriesFromRedis;
+                        try
+                        {
+                            hashEntriesFromRedis = redis.HashGetAll(objectUid);
+                        }
+                        finally
+                        {
                         System.Threading.Interlocked.Increment(ref Threads.redisCallsCount);
+                        }
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
                         {
                             Threads.TraceConsole($"Key '{key}' not found");
