@@ -83,9 +83,20 @@ namespace MemoryTester
                 }
                 catch (OutOfMemoryException)
                 {
-                    TraceConsole($"Loop OutOfMemoryException, retrying");
+                    Console.WriteLine($"Loop OutOfMemoryException, retrying");
                 }
             }
+        }
+
+        internal void WaitAll()
+        {
+            Console.WriteLine($"Waiting for threads to end...");
+            foreach (var threadKVP in threads)
+            {
+                threadKVP.Value.Join();
+                Console.Write($"{threadKVP.Value.Name}|");
+            }
+            Console.WriteLine($"All thread are ended.");
         }
 
         private static ParameterizedThreadStart ThreadCallBack(Callback callback) => (object obj) =>

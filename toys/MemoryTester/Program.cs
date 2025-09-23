@@ -143,6 +143,9 @@ namespace MemoryTester
                 }
             });
 
+            // Wait for all threads to end to avoid conflict in Exceptions stats dictionnary
+            threads.WaitAll();
+
             Threads.TraceConsole("");
             Threads.TraceConsole("-------------------------------");
             exceptionStats.TraceStats();
