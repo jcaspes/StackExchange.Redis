@@ -100,7 +100,7 @@ namespace MemoryTester
                 };
 
                 redis.HashSet(objectUid, hashEntries);
-                redis.KeyExpire(key, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
+                redis.KeyExpire(objectUid, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
 
                 // loop to fill memory with redis data and try to get OutOffMemory exceptions
                 while (!threads.stopAllThreads)
