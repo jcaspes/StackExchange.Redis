@@ -53,7 +53,7 @@ namespace MemoryTester
             {
                 try
                 {
-                    Console.WriteLine($"===> Threads loop, count: {threads.Count}, redis calls: {Threads.redisCallsCount} <===");
+                    TraceConsole($"===> Threads loop, count: {threads.Count}, redis calls: {redisCallsCount}, exceptions: {ExceptionStats.ExceptionCount}<===");
                     // Create the wanted threads count
                     while (threads.Count < count)
                     {
@@ -83,7 +83,7 @@ namespace MemoryTester
                 }
                 catch (OutOfMemoryException)
                 {
-                    Console.WriteLine($"Loop OutOfMemoryException, retrying");
+                    TraceConsole("Loop OutOfMemoryException, retrying");
                 }
             }
         }
