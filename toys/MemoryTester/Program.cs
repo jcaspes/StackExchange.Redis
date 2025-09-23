@@ -46,7 +46,7 @@ namespace MemoryTester
                 Password = System.Configuration.ConfigurationManager.AppSettings["redisPassword"],
                 DefaultDatabase = 1,
                 AllowAdmin = true,
-                AbortOnConnectFail = false,
+                AbortOnConnectFail = true,
                 SyncTimeout = 5000,
                 HighIntegrity = highIntegrity,
             };
@@ -54,7 +54,18 @@ namespace MemoryTester
             Console.WriteLine(configuration);
 
             ExceptionStats exceptionStats = new ExceptionStats();
+
             ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
+
+            if (!connection.IsConnected)
+            {
+                Threads.TraceConsole("No connection to redis, exiting");
+                return;
+            }
+            else
+            {
+                Threads.TraceConsole("Connected to redis");
+            }
 
             Threads threads = new Threads
             {
@@ -65,7 +76,7 @@ namespace MemoryTester
             string processId = System.Diagnostics.Process.GetCurrentProcess().Id.ToString();
             string BaseKeyName = $"MemoryTester:pid{processId}";
 
-            IDatabase redis = connection.GetDatabase();
+            IDatabase redisDbForClean = connection.GetDatabase();
             IEnumerable<RedisKey> resultKeysEnumerable;
 
             if (cleanPreviousRun)
@@ -73,7 +84,7 @@ namespace MemoryTester
                 resultKeysEnumerable = connection.GetServers()[0].Keys((int)configuration.DefaultDatabase, pattern: $"MemoryTester:*");
                 foreach (RedisKey key in resultKeysEnumerable)
                 {
-                    redis.KeyDelete(key);
+                    redisDbForClean.KeyDelete(key);
                 }
             }
 
@@ -97,6 +108,7 @@ namespace MemoryTester
                     new HashEntry("thread", key),
                 };
 
+                IDatabase redis = connection.GetDatabase();
                 redis.HashSet(objectUid, hashEntries);
                 redis.KeyExpire(objectUid, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
 

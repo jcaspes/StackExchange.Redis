@@ -96,7 +96,7 @@ namespace MemoryTester
                 threadKVP.Value.Join();
                 Console.Write($"{threadKVP.Value.Name}|");
             }
-            Console.WriteLine($"All thread are ended.");
+            Console.WriteLine($"All threads are stopped");
         }
 
         private static ParameterizedThreadStart ThreadCallBack(Callback callback) => (object obj) =>
