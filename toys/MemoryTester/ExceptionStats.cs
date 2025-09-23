@@ -6,14 +6,11 @@ namespace MemoryTester
     internal class ExceptionStats
     {
         private readonly Dictionary<string, int> _exceptionCounts = new Dictionary<string, int>();
-        public int outOfMemoryExceptionCount = 0;
+        public static int ExceptionCount = 0;
 
         internal void Add(Exception ex)
         {
-            if (ex is OutOfMemoryException)
-            {
-                System.Threading.Interlocked.Increment(ref outOfMemoryExceptionCount);
-            }
+            System.Threading.Interlocked.Increment(ref ExceptionCount);
             string exceptionName = ex.GetType().Name;
             string stackHash = ex.StackTrace?.GetHashCode().ToString() ?? "NoStackTrace";
             string key = $"{exceptionName}_{stackHash}";
