@@ -133,7 +133,7 @@ namespace MemoryTester
                         }
                         finally
                         {
-                        System.Threading.Interlocked.Increment(ref Threads.redisCallsCount);
+                            System.Threading.Interlocked.Increment(ref Threads.redisCallsCount);
                         }
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
                         {
@@ -157,11 +157,11 @@ namespace MemoryTester
                             Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
                         }
 
-                        // if we have no OutOfMemory exception, we can add the value to results
-                        results.Add(props["Value"]);
                         // generate a big string to consume memory and generate out of memory exceptions
                         // this string will be freed by GC so we can continue to run
                         bigString = string.Join("-", results);
+                        // if we have no OutOfMemory exception, we can add the value to results
+                        results.Add(props["Value"]);
                     }
                     catch (Exception ex)
                     {
