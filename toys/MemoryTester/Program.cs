@@ -38,8 +38,6 @@ namespace MemoryTester
 
             Threads.TraceConsole($"Starting the tests (press any key to stop)");
 
-            string BaseKeyName = "MemoryTester";
-
             ConfigurationOptions configuration = new ConfigurationOptions()
             {
                 EndPoints = { System.Configuration.ConfigurationManager.AppSettings["redisHost"] },
@@ -64,13 +62,18 @@ namespace MemoryTester
             };
 
             bool stopAllThreads = false;
+
+            // Unique key base on process id so multiple instance of the tester can run on the same redis server
+            string processId = System.Diagnostics.Process.GetCurrentProcess().Id.ToString();
+            string BaseKeyName = $"MemoryTester:pid{processId}:";
+
             threads.Loop((int threadIndex) =>
             {
                 // A list to memoryse loop data and consume memory
                 List<string> results = new List<string>();
 
                 string bigString = "";
-                string key = "Th" + System.Threading.Thread.CurrentThread.ManagedThreadId.ToString() + "hT";
+                string key = $"Th{System.Threading.Thread.CurrentThread.ManagedThreadId}hT";
 
                 // construct a big random string for current thread
                 // set this string in redis so when can test HGET on high memory pressure
@@ -86,6 +89,7 @@ namespace MemoryTester
 
                 IDatabase redis = connection.GetDatabase();
                 redis.HashSet(objectUid, hashEntries);
+                redis.KeyExpire(key, TimeSpan.FromHours(24)); // to auto clean redis afdter testing
 
                 // loop to fill memory with redis data and try to get OutOffMemory exceptions
                 while (!stopAllThreads)
