@@ -151,26 +151,44 @@ namespace MemoryTester
                         {
                             System.Threading.Interlocked.Increment(ref Threads.redisCallsCount);
                         }
+
+                        // All keys must be found, if not it is an error, we expect an exception
                         if (hashEntriesFromRedis == null || hashEntriesFromRedis.Length == 0)
                         {
-                            Threads.TraceConsole($"Key '{key}' not found");
                             System.Threading.Interlocked.Increment(ref keyNotFoundCount);
+                            try
+                            {
+                                Threads.TraceConsole($"Key '{key}' not found");
+                            }
+                            catch { }
                             continue;
                         }
 
                         IDictionary<string, string> props = hashEntriesFromRedis.ToStringDictionary();
+                        // Check if content is not corrupted by looking prefix and suffix
                         bool valueIsValid = props["Value"].EndsWith("!<<<") && props["Value"].StartsWith(">>>!");
+                        // Check data integrity, first check if received data is from current thread by comparing key
                         if (key != props["thread"])
                         {
                             System.Threading.Interlocked.Increment(ref corruptedDataCount);
+                            try
+                            {
                             Threads.TraceConsole($"Error in thread field, expected:{key}, actual:{props["thread"]}, value is valid but from an other query: {valueIsValid}");
                         }
+                            catch { }
+                        }
+
+                        // Check data integrity, first check if received data is from current thread by comparing key
                         if (checkContent && expectedSize != props["Value"].Length)
                         {
                             System.Threading.Interlocked.Increment(ref corruptedDataSizeCount);
-                            Threads.TraceConsole($"{valueInRedis.Substring(0, 25)}...");
-                            Threads.TraceConsole($"{props["Value"].Substring(0, 25)}...");
+                            try
+                            {
+                                Threads.TraceConsole($"Expected:{valueInRedis.Substring(0, 25)}...");
+                                Threads.TraceConsole($"inRedis :{props["Value"].Substring(0, 25)}...");
                             Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
+                        }
+                            catch { }
                         }
 
                         // generate a big string to consume memory and generate out of memory exceptions
