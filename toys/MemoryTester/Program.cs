@@ -46,7 +46,15 @@ namespace MemoryTester
 
             Threads.Init();
 
+            Threads.TraceConsole("-----------------------------------------------");
             Threads.TraceConsole($"Starting the tests (press any key to stop)");
+            Threads.TraceConsole($"\tCheckContent    : {checkContent}");
+            Threads.TraceConsole($"\tLog             : {Threads.traceInFile}");
+            Threads.TraceConsole($"\tMaxsize         : {maxSize}");
+            Threads.TraceConsole($"\tHighIntegrity   : {highIntegrity}");
+            Threads.TraceConsole($"\tCleanPreviousRun: {cleanPreviousRun}");
+            Threads.TraceConsole($"\tThreads         : {threadCount}");
+            Threads.TraceConsole("-----------------------------------------------");
 
             ConfigurationOptions configuration = new ConfigurationOptions()
             {
