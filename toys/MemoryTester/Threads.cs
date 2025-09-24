@@ -88,10 +88,12 @@ namespace MemoryTester
                 }
                 catch (OutOfMemoryException)
                 {
-                    TraceConsole("Loop OutOfMemoryException, retrying");
+                    TraceConsole(Message);
                 }
             }
         }
+
+        private const string Message = "Loop OutOfMemoryException, retrying";
 
         internal void WaitAll()
         {
