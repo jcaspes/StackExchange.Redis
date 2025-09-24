@@ -38,8 +38,8 @@ namespace MemoryTester
                     {
                         string[] argSplit = arg.Split('=');
                         threadCount = int.Parse(argSplit[1]);
+                    }
                 }
-            }
             }
 
             System.Threading.Thread.CurrentThread.Name = "Main";
@@ -173,8 +173,8 @@ namespace MemoryTester
                             System.Threading.Interlocked.Increment(ref corruptedDataCount);
                             try
                             {
-                            Threads.TraceConsole($"Error in thread field, expected:{key}, actual:{props["thread"]}, value is valid but from an other query: {valueIsValid}");
-                        }
+                                Threads.TraceConsole($"Error in thread field, expected:{key}, actual:{props["thread"]}, value is valid but from an other query: {valueIsValid}");
+                            }
                             catch { }
                         }
 
@@ -186,8 +186,8 @@ namespace MemoryTester
                             {
                                 Threads.TraceConsole($"Expected:{valueInRedis.Substring(0, 25)}...");
                                 Threads.TraceConsole($"inRedis :{props["Value"].Substring(0, 25)}...");
-                            Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
-                        }
+                                Threads.TraceConsole($"Error in value field lenght in thread '{key}', expected:{expectedSize}, actual:{props["Value"].Length}, value is valid but from an other query: {valueIsValid}");
+                            }
                             catch { }
                         }
 
