@@ -11,6 +11,7 @@ namespace MemoryTester
         private static int keyNotFoundCount;
         private static bool checkContent = false;
         private static double maxSize = 0x24000; // max size of string
+        private static int threadCount = 200;
         private static bool highIntegrity = false;
         private static bool cleanPreviousRun = true;
 
@@ -33,6 +34,10 @@ namespace MemoryTester
                         highIntegrity = true;
                     if (arg.Equals("noClean", StringComparison.OrdinalIgnoreCase))
                         cleanPreviousRun = false;
+                    if (arg.StartsWith("threads", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string[] argSplit = arg.Split('=');
+                        threadCount = int.Parse(argSplit[1]);
                 }
             }
 
@@ -69,7 +74,7 @@ namespace MemoryTester
 
             Threads threads = new Threads
             {
-                count = 200,
+                count = threadCount,
             };
 
             // Unique key base on process id so multiple instance of the tester can run on the same redis server
