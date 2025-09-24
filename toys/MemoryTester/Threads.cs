@@ -49,11 +49,16 @@ namespace MemoryTester
         private int threadId = 0;
         public void Loop(Callback callback)
         {
+            int lastNbCalls = 0;
+            int lastNbExcptions = 0;
             while (!stopAllThreads)
             {
                 try
                 {
-                    TraceConsole($"===> Threads loop, count: {threads.Count}, redis calls: {redisCallsCount}, exceptions: {ExceptionStats.ExceptionCount}<===");
+                    int nbCalls = redisCallsCount - ExceptionStats.ExceptionCount;
+                    TraceConsole($"===> Threads loop, count: {threads.Count}, redis calls: {redisCallsCount}, exceptions: {ExceptionStats.ExceptionCount}(+{ExceptionStats.ExceptionCount - lastNbExcptions}), succeed calls: {nbCalls - lastNbCalls}<===");
+                    lastNbCalls = nbCalls;
+                    lastNbExcptions = ExceptionStats.ExceptionCount;
                     // Create the wanted threads count
                     while (threads.Count < count)
                     {
@@ -79,7 +84,7 @@ namespace MemoryTester
                         threads.Remove(deadThread);
                     }
 
-                    Thread.Sleep(1000);
+                    Thread.Sleep(2000);
                 }
                 catch (OutOfMemoryException)
                 {
