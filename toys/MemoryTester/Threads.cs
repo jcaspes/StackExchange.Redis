@@ -31,7 +31,7 @@ namespace MemoryTester
         {
             if (inConsole || traceInFile)
             {
-                string log = $"{Thread.CurrentThread.ManagedThreadId.ToString()} : {text}";
+                    string log = $"{Thread.CurrentThread.Name} : {text}";
                 if (inConsole)
                 {
                     Console.WriteLine(log);

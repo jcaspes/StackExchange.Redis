@@ -40,6 +40,9 @@ namespace MemoryTester
                         threadCount = int.Parse(argSplit[1]);
                 }
             }
+            }
+
+            System.Threading.Thread.CurrentThread.Name = "Main";
 
             Threads.Init();
 
@@ -99,7 +102,7 @@ namespace MemoryTester
                 List<string> results = new List<string>();
 
                 string bigString = "";
-                string key = $"Th{System.Threading.Thread.CurrentThread.ManagedThreadId}hT";
+                string key = $"Th{System.Threading.Thread.CurrentThread.Name}hT";
 
                 // construct a big random string for current thread
                 // set this string in redis so when can test HGET on high memory pressure

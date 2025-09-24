@@ -17,12 +17,12 @@ namespace MemoryTester
             if (_exceptionCounts.ContainsKey(key))
             {
                 _exceptionCounts[key]++;
-                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.ManagedThreadId} Key:{key}", inConsole: false);
+                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
             }
             else
             {
                 _exceptionCounts[key] = 1;
-                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.ManagedThreadId} Key:{key}", inConsole: false);
+                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
                 Threads.TraceConsole(ex.StackTrace, inConsole: false);
             }
         }
