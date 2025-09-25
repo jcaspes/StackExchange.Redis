@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Net;
 using System.Text;
 using System.Threading.Tasks;
@@ -204,7 +204,7 @@ internal static partial class LoggerExtensions
         Level = LogLevel.Information,
         EventId = 23,
         Message = "  Server[{Index}] ({Server}) Status: {Status} (inst: {MessagesSinceLastHeartbeat}, qs: {MessagesSentAwaitingResponse}, in: {BytesAvailableOnSocket}, qu: {MessagesSinceLastHeartbeat2}, aw: {IsWriterActive}, in-pipe: {BytesInReadPipe}, out-pipe: {BytesInWritePipe}, bw: {BacklogStatus}, rs: {ReadStatus}. ws: {WriteStatus})")]
-    internal static partial void LogInformationServerStatus(this ILogger logger, int index, ServerEndPointLogValue server, TaskStatus status, long messagesSinceLastHeartbeat, long messagesSentAwaitingResponse, long bytesAvailableOnSocket, long messagesSinceLastHeartbeat2, bool isWriterActive, long bytesInReadPipe, long bytesInWritePipe, PhysicalBridge.BacklogStatus backlogStatus, PhysicalConnection.ReadStatus readStatus, PhysicalConnection.WriteStatus writeStatus);
+    internal static partial void LogInformationServerStatus(this ILogger logger, int index, ServerEndPointLogValue server, TaskStatus status, long messagesSinceLastHeartbeat, long messagesSentAwaitingResponse, long bytesAvailableOnSocket, long messagesSinceLastHeartbeat2, bool isWriterActive, long bytesInReadPipe, long bytesInWritePipe, PhysicalBridge.BacklogStatus backlogStatus, ReadStatus readStatus, WriteStatus writeStatus);
 
     [LoggerMessage(
         Level = LogLevel.Information,

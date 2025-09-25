@@ -380,7 +380,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal async Task AutoConfigureAsync(PhysicalConnection? connection, ILogger? log = null)
+        internal async Task AutoConfigureAsync(IPhysicalConnection? connection, ILogger? log = null)
         {
             if (!serverType.SupportsAutoConfigure())
             {
@@ -653,9 +653,9 @@ namespace StackExchange.Redis
             }
         }
 
-        internal Task OnEstablishingAsync(PhysicalConnection connection, ILogger? log)
+        internal Task OnEstablishingAsync(IPhysicalConnection connection, ILogger? log)
         {
-            static async Task OnEstablishingAsyncAwaited(PhysicalConnection connection, Task handshake)
+            static async Task OnEstablishingAsyncAwaited(IPhysicalConnection connection, Task handshake)
             {
                 try
                 {
@@ -685,7 +685,7 @@ namespace StackExchange.Redis
             return Task.CompletedTask;
         }
 
-        internal void OnFullyEstablished(PhysicalConnection connection, string source)
+        internal void OnFullyEstablished(IPhysicalConnection connection, string source)
         {
             try
             {
@@ -888,7 +888,7 @@ namespace StackExchange.Redis
         /// Write the message directly to the pipe or fail...will not queue.
         /// </summary>
         /// <typeparam name="T">The type of the result processor.</typeparam>
-        internal ValueTask WriteDirectOrQueueFireAndForgetAsync<T>(PhysicalConnection? connection, Message message, ResultProcessor<T> processor)
+        internal ValueTask WriteDirectOrQueueFireAndForgetAsync<T>(IPhysicalConnection? connection, Message message, ResultProcessor<T> processor)
         {
             static async ValueTask Awaited(ValueTask<WriteResult> l_result) => await l_result.ForAwait();
 
@@ -933,7 +933,7 @@ namespace StackExchange.Redis
             return bridge;
         }
 
-        private async Task HandshakeAsync(PhysicalConnection connection, ILogger? log)
+        private async Task HandshakeAsync(IPhysicalConnection connection, ILogger? log)
         {
             log?.LogInformationServerHandshake(new(this));
             if (connection == null)

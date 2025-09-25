@@ -12,7 +12,6 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Security.Authentication;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -23,20 +22,11 @@ using static StackExchange.Redis.Message;
 
 namespace StackExchange.Redis
 {
-    internal sealed partial class PhysicalConnection : IDisposable
+    internal partial class PhysicalConnection : IDisposable, IPhysicalConnection
     {
-        internal readonly byte[]? ChannelPrefix;
+        byte[]? IPhysicalConnection.ChannelPrefix => _ChannelPrefix;
 
-        private const int DefaultRedisDatabaseCount = 16;
-
-        private static readonly CommandBytes message = "message", pmessage = "pmessage", smessage = "smessage";
-
-        private static readonly Message[] ReusableChangeDatabaseCommands = Enumerable.Range(0, DefaultRedisDatabaseCount).Select(
-            i => Message.Create(i, CommandFlags.FireAndForget, RedisCommand.SELECT)).ToArray();
-
-        private static readonly Message
-            ReusableReadOnlyCommand = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.READONLY),
-            ReusableReadWriteCommand = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.READWRITE);
+        private readonly byte[]? _ChannelPrefix;
 
         private static int totalCount;
 
@@ -61,9 +51,9 @@ namespace StackExchange.Redis
 
         private long bytesLastResult;
         private long bytesInBuffer;
-        internal long? ConnectionId { get; set; }
+        public long? ConnectionId { get; set; }
 
-        internal void GetBytes(out long sent, out long received)
+        public void GetBytes(out long sent, out long received)
         {
             if (_ioPipe is IMeasuredDuplexPipe sc)
             {
@@ -81,7 +71,7 @@ namespace StackExchange.Redis
         /// ...but in those cases, we'll accept any null ref in a race - it's fine.
         /// </summary>
         private IDuplexPipe? _ioPipe;
-        internal bool HasOutputPipe => _ioPipe?.Output != null;
+        public bool HasOutputPipe => _ioPipe?.Output != null;
 
         private Socket? _socket;
         internal Socket? VolatileSocket => Volatile.Read(ref _socket);
@@ -92,8 +82,8 @@ namespace StackExchange.Redis
             lastBeatTickCount = 0;
             connectionType = bridge.ConnectionType;
             _bridge = new WeakReference(bridge);
-            ChannelPrefix = bridge.Multiplexer.RawConfig.ChannelPrefix;
-            if (ChannelPrefix?.Length == 0) ChannelPrefix = null; // null tests are easier than null+empty
+            _ChannelPrefix = bridge.Multiplexer.RawConfig.ChannelPrefix;
+            if (_ChannelPrefix?.Length == 0) _ChannelPrefix = null; // null tests are easier than null+empty
             var endpoint = bridge.ServerEndPoint.EndPoint;
             _physicalName = connectionType + "#" + Interlocked.Increment(ref totalCount) + "@" + Format.ToString(endpoint);
 
@@ -101,9 +91,9 @@ namespace StackExchange.Redis
         }
 
         // *definitely* multi-database; this can help identify some unusual config scenarios
-        internal bool MultiDatabasesOverride { get; set; } // switch to flags-enum if more needed later
+        public bool MultiDatabasesOverride { get; set; } // switch to flags-enum if more needed later
 
-        internal async Task BeginConnectAsync(ILogger? log)
+        public async Task BeginConnectAsync(ILogger? log)
         {
             var bridge = BridgeCouldBeNull;
             var endpoint = bridge?.ServerEndPoint?.EndPoint;
@@ -267,23 +257,25 @@ namespace StackExchange.Redis
         private bool IncludeDetailInExceptions => BridgeCouldBeNull?.Multiplexer.RawConfig.IncludeDetailInExceptions ?? false;
 
         [Conditional("VERBOSE")]
-        internal void Trace(string message) => BridgeCouldBeNull?.Multiplexer?.Trace(message, ToString());
+        private void TraceInternal(string message) => BridgeCouldBeNull?.Multiplexer?.Trace(message, ToString());
+
+        public void Trace(string message) => TraceInternal(message);
 
         public long SubscriptionCount { get; set; }
 
-        public bool TransactionActive { get; internal set; }
+        public bool TransactionActive { get; set; }
 
         private RedisProtocol _protocol; // note starts at **zero**, not RESP2
         public RedisProtocol? Protocol => _protocol == 0 ? null : _protocol;
 
-        internal void SetProtocol(RedisProtocol value)
+        public void SetProtocol(RedisProtocol value)
         {
             _protocol = value;
             BridgeCouldBeNull?.SetProtocol(value);
         }
 
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Usage", "CA2202:Do not dispose objects multiple times", Justification = "Trust me yo")]
-        internal void Shutdown()
+        public void Shutdown()
         {
             var ioPipe = Interlocked.Exchange(ref _ioPipe, null); // compare to the critical read
             var socket = Interlocked.Exchange(ref _socket, null);
@@ -325,28 +317,29 @@ namespace StackExchange.Redis
         private async Task AwaitedFlush(ValueTask<FlushResult> flush)
         {
             await flush.ForAwait();
-            _writeStatus = WriteStatus.Flushed;
+            SetWriteStatus(WriteStatus.Flushed);
             UpdateLastWriteTime();
         }
-        internal void UpdateLastWriteTime() => Interlocked.Exchange(ref lastWriteTickCount, Environment.TickCount);
+        public void UpdateLastWriteTime() => Interlocked.Exchange(ref lastWriteTickCount, Environment.TickCount);
+
         public Task FlushAsync()
         {
             var tmp = _ioPipe?.Output;
             if (tmp != null)
             {
-                _writeStatus = WriteStatus.Flushing;
+                SetWriteStatus(WriteStatus.Flushing);
                 var flush = tmp.FlushAsync();
                 if (!flush.IsCompletedSuccessfully)
                 {
                     return AwaitedFlush(flush);
                 }
-                _writeStatus = WriteStatus.Flushed;
+                SetWriteStatus(WriteStatus.Flushed);
                 UpdateLastWriteTime();
             }
             return Task.CompletedTask;
         }
 
-        internal void SimulateConnectionFailure(SimulatedFailureType failureType)
+        public void SimulateConnectionFailure(SimulatedFailureType failureType)
         {
             var raiseFailed = false;
             if (connectionType == ConnectionType.Interactive)
@@ -559,24 +552,14 @@ namespace StackExchange.Redis
             }
         }
 
-        internal bool IsIdle() => _writeStatus == WriteStatus.Idle;
-        internal void SetIdle() => _writeStatus = WriteStatus.Idle;
-        internal void SetWriting() => _writeStatus = WriteStatus.Writing;
+        public bool IsIdle() => _writeStatus == WriteStatus.Idle;
+        public void SetIdle() => SetWriteStatus(WriteStatus.Idle);
+        public void SetWriting() => SetWriteStatus(WriteStatus.Writing);
+        public void SetWriteStatus(WriteStatus status) => _writeStatus = status;
 
         private volatile WriteStatus _writeStatus;
 
-        internal WriteStatus GetWriteStatus() => _writeStatus;
-
-        internal enum WriteStatus
-        {
-            Initializing,
-            Idle,
-            Writing,
-            Flushing,
-            Flushed,
-
-            NA = -1,
-        }
+        public WriteStatus GetWriteStatus() => _writeStatus;
 
         /// <summary>Returns a string that represents the current object.</summary>
         /// <returns>A string that represents the current object.</returns>
@@ -601,7 +584,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void EnqueueInsideWriteLock(Message next)
+        public void EnqueueInsideWriteLock(Message next)
         {
             var multiplexer = BridgeCouldBeNull?.Multiplexer;
             if (multiplexer is null)
@@ -630,7 +613,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void GetCounters(ConnectionCounters counters)
+        public void GetCounters(ConnectionCounters counters)
         {
             lock (_writtenAwaitingResponse)
             {
@@ -639,7 +622,7 @@ namespace StackExchange.Redis
             counters.Subscriptions = SubscriptionCount;
         }
 
-        internal Message? GetReadModeCommand(bool isPrimaryOnly)
+        public Message? GetReadModeCommand(bool isPrimaryOnly)
         {
             if (BridgeCouldBeNull?.ServerEndPoint?.RequiresReadMode == true)
             {
@@ -649,8 +632,8 @@ namespace StackExchange.Redis
                     currentReadMode = requiredReadMode;
                     switch (requiredReadMode)
                     {
-                        case ReadMode.ReadOnly: return ReusableReadOnlyCommand;
-                        case ReadMode.ReadWrite: return ReusableReadWriteCommand;
+                        case ReadMode.ReadOnly: return PhysicalConnectionHelpers.ReusableReadOnlyCommand;
+                        case ReadMode.ReadWrite: return PhysicalConnectionHelpers.ReusableReadWriteCommand;
                     }
                 }
             }
@@ -659,12 +642,12 @@ namespace StackExchange.Redis
                 // we don't need it (because we're not a cluster, or not a replica),
                 // but we are in read-only mode; switch to read-write
                 currentReadMode = ReadMode.ReadWrite;
-                return ReusableReadWriteCommand;
+                return PhysicalConnectionHelpers.ReusableReadWriteCommand;
             }
             return null;
         }
 
-        internal Message? GetSelectDatabaseCommand(int targetDatabase, Message message)
+        public Message? GetSelectDatabaseCommand(int targetDatabase, Message message)
         {
             if (targetDatabase < 0 || targetDatabase == currentDatabase)
             {
@@ -709,17 +692,10 @@ namespace StackExchange.Redis
             }
             BridgeCouldBeNull?.Trace("Switching database: " + targetDatabase);
             currentDatabase = targetDatabase;
-            return GetSelectDatabaseCommand(targetDatabase);
+            return PhysicalConnectionHelpers.GetSelectDatabaseCommand(targetDatabase);
         }
 
-        internal static Message GetSelectDatabaseCommand(int targetDatabase)
-        {
-            return targetDatabase < DefaultRedisDatabaseCount
-                   ? ReusableChangeDatabaseCommands[targetDatabase] // 0-15 by default
-                   : Message.Create(targetDatabase, CommandFlags.FireAndForget, RedisCommand.SELECT);
-        }
-
-        internal int GetSentAwaitingResponseCount()
+        public int GetSentAwaitingResponseCount()
         {
             lock (_writtenAwaitingResponse)
             {
@@ -727,7 +703,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void GetStormLog(StringBuilder sb)
+        public void GetStormLog(StringBuilder sb)
         {
             lock (_writtenAwaitingResponse)
             {
@@ -747,7 +723,7 @@ namespace StackExchange.Redis
         /// Runs on every heartbeat for a bridge, timing out any commands that are overdue and returning an integer of how many we timed out.
         /// </summary>
         /// <returns>How many commands were overdue and threw timeout exceptions.</returns>
-        internal int OnBridgeHeartbeat()
+        public int OnBridgeHeartbeat()
         {
             var result = 0;
             var now = Environment.TickCount;
@@ -794,7 +770,7 @@ namespace StackExchange.Redis
             return result;
         }
 
-        internal void OnInternalError(Exception exception, [CallerMemberName] string? origin = null)
+        public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null)
         {
             if (BridgeCouldBeNull is PhysicalBridge bridge)
             {
@@ -802,32 +778,32 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void SetUnknownDatabase()
+        public void SetUnknownDatabase()
         {
             // forces next db-specific command to issue a select
             currentDatabase = -1;
         }
 
-        internal void Write(in RedisKey key)
+        public void Write(in RedisKey key)
         {
             var val = key.KeyValue;
             if (val is string s)
             {
-                WriteUnifiedPrefixedString(_ioPipe?.Output, key.KeyPrefix, s);
+               PhysicalConnectionHelpers.WriteUnifiedPrefixedString(_ioPipe?.Output, key.KeyPrefix, s);
             }
             else
             {
-                WriteUnifiedPrefixedBlob(_ioPipe?.Output, key.KeyPrefix, (byte[]?)val);
+                PhysicalConnectionHelpers.WriteUnifiedPrefixedBlob(_ioPipe?.Output, key.KeyPrefix, (byte[]?)val);
             }
         }
 
-        internal void Write(in RedisChannel channel)
-            => WriteUnifiedPrefixedBlob(_ioPipe?.Output, ChannelPrefix, channel.Value);
+        public void Write(in RedisChannel channel)
+            => PhysicalConnectionHelpers.WriteUnifiedPrefixedBlob(_ioPipe?.Output, _ChannelPrefix, channel.Value);
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal void WriteBulkString(in RedisValue value)
+        public void WriteBulkString(in RedisValue value)
             => WriteBulkString(value, _ioPipe?.Output);
-        internal static void WriteBulkString(in RedisValue value, PipeWriter? maybeNullWriter)
+        public static void WriteBulkString(in RedisValue value, PipeWriter? maybeNullWriter)
         {
             if (maybeNullWriter is not PipeWriter writer)
             {
@@ -837,39 +813,37 @@ namespace StackExchange.Redis
             switch (value.Type)
             {
                 case RedisValue.StorageType.Null:
-                    WriteUnifiedBlob(writer, (byte[]?)null);
+                    PhysicalConnectionHelpers.WriteUnifiedBlob(writer, (byte[]?)null);
                     break;
                 case RedisValue.StorageType.Int64:
-                    WriteUnifiedInt64(writer, value.OverlappedValueInt64);
+                    PhysicalConnectionHelpers.WriteUnifiedInt64(writer, value.OverlappedValueInt64);
                     break;
                 case RedisValue.StorageType.UInt64:
-                    WriteUnifiedUInt64(writer, value.OverlappedValueUInt64);
+                    PhysicalConnectionHelpers.WriteUnifiedUInt64(writer, value.OverlappedValueUInt64);
                     break;
                 case RedisValue.StorageType.Double:
-                    WriteUnifiedDouble(writer, value.OverlappedValueDouble);
+                    PhysicalConnectionHelpers.WriteUnifiedDouble(writer, value.OverlappedValueDouble);
                     break;
                 case RedisValue.StorageType.String:
-                    WriteUnifiedPrefixedString(writer, null, (string?)value);
+                    PhysicalConnectionHelpers.WriteUnifiedPrefixedString(writer, null, (string?)value);
                     break;
                 case RedisValue.StorageType.Raw:
-                    WriteUnifiedSpan(writer, ((ReadOnlyMemory<byte>)value).Span);
+                    PhysicalConnectionHelpers.WriteUnifiedSpan(writer, ((ReadOnlyMemory<byte>)value).Span);
                     break;
                 default:
                     throw new InvalidOperationException($"Unexpected {value.Type} value: '{value}'");
             }
         }
 
-        internal void WriteBulkString(ReadOnlySpan<byte> value)
+        public void WriteBulkString(ReadOnlySpan<byte> value)
         {
             if (_ioPipe?.Output is { } writer)
             {
-                WriteUnifiedSpan(writer, value);
+                PhysicalConnectionHelpers.WriteUnifiedSpan(writer, value);
             }
         }
 
-        internal const int REDIS_MAX_ARGS = 1024 * 1024; // there is a <= 1024*1024 max constraint inside redis itself: https://github.com/antirez/redis/blob/6c60526db91e23fb2d666fc52facc9a11780a2a3/src/networking.c#L1024
-
-        internal void WriteHeader(RedisCommand command, int arguments, CommandBytes commandBytes = default)
+        public void WriteHeader(RedisCommand command, int arguments, CommandBytes commandBytes = default)
         {
             if (_ioPipe?.Output is not PipeWriter writer)
             {
@@ -881,12 +855,12 @@ namespace StackExchange.Redis
             if (command == RedisCommand.UNKNOWN)
             {
                 // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
-                if (arguments >= REDIS_MAX_ARGS) throw ExceptionFactory.TooManyArgs(commandBytes.ToString(), arguments);
+                if (arguments >= PhysicalConnectionHelpers.REDIS_MAX_ARGS) throw ExceptionFactory.TooManyArgs(commandBytes.ToString(), arguments);
             }
             else
             {
                 // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
-                if (arguments >= REDIS_MAX_ARGS) throw ExceptionFactory.TooManyArgs(command.ToString(), arguments);
+                if (arguments >= PhysicalConnectionHelpers.REDIS_MAX_ARGS) throw ExceptionFactory.TooManyArgs(command.ToString(), arguments);
 
                 // for everything that isn't custom commands: ask the muxer for the actual bytes
                 commandBytes = bridge.Multiplexer.CommandMap.GetBytes(command);
@@ -902,139 +876,29 @@ namespace StackExchange.Redis
             var span = writer.GetSpan(commandBytes.Length + 8 + Format.MaxInt32TextLen + Format.MaxInt32TextLen);
             span[0] = (byte)'*';
 
-            int offset = WriteRaw(span, arguments + 1, offset: 1);
+            int offset = PhysicalConnectionHelpers.WriteRaw(span, arguments + 1, offset: 1);
 
-            offset = AppendToSpanCommand(span, commandBytes, offset: offset);
+            offset = PhysicalConnectionHelpers.AppendToSpanCommand(span, commandBytes, offset: offset);
 
             writer.Advance(offset);
         }
 
-        internal void WriteRaw(ReadOnlySpan<byte> bytes) => _ioPipe?.Output?.Write(bytes);
+        public void WriteRaw(ReadOnlySpan<byte> bytes) => _ioPipe?.Output?.Write(bytes);
 
-        internal void RecordQuit()
+        public void RecordQuit()
         {
             // don't blame redis if we fired the first shot
             Thread.VolatileWrite(ref clientSentQuit, 1);
             (_ioPipe as SocketConnection)?.TrySetProtocolShutdown(PipeShutdownKind.ProtocolExitClient);
         }
 
-        internal static void WriteMultiBulkHeader(PipeWriter output, long count)
-        {
-            // *{count}\r\n         = 3 + MaxInt32TextLen
-            var span = output.GetSpan(3 + Format.MaxInt32TextLen);
-            span[0] = (byte)'*';
-            int offset = WriteRaw(span, count, offset: 1);
-            output.Advance(offset);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static int WriteCrlf(Span<byte> span, int offset)
-        {
-            span[offset++] = (byte)'\r';
-            span[offset++] = (byte)'\n';
-            return offset;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static void WriteCrlf(PipeWriter writer)
-        {
-            var span = writer.GetSpan(2);
-            span[0] = (byte)'\r';
-            span[1] = (byte)'\n';
-            writer.Advance(2);
-        }
-
-        internal static int WriteRaw(Span<byte> span, long value, bool withLengthPrefix = false, int offset = 0)
-        {
-            if (value >= 0 && value <= 9)
-            {
-                if (withLengthPrefix)
-                {
-                    span[offset++] = (byte)'1';
-                    offset = WriteCrlf(span, offset);
-                }
-                span[offset++] = (byte)((int)'0' + (int)value);
-            }
-            else if (value >= 10 && value < 100)
-            {
-                if (withLengthPrefix)
-                {
-                    span[offset++] = (byte)'2';
-                    offset = WriteCrlf(span, offset);
-                }
-                span[offset++] = (byte)((int)'0' + ((int)value / 10));
-                span[offset++] = (byte)((int)'0' + ((int)value % 10));
-            }
-            else if (value >= 100 && value < 1000)
-            {
-                int v = (int)value;
-                int units = v % 10;
-                v /= 10;
-                int tens = v % 10, hundreds = v / 10;
-                if (withLengthPrefix)
-                {
-                    span[offset++] = (byte)'3';
-                    offset = WriteCrlf(span, offset);
-                }
-                span[offset++] = (byte)((int)'0' + hundreds);
-                span[offset++] = (byte)((int)'0' + tens);
-                span[offset++] = (byte)((int)'0' + units);
-            }
-            else if (value < 0 && value >= -9)
-            {
-                if (withLengthPrefix)
-                {
-                    span[offset++] = (byte)'2';
-                    offset = WriteCrlf(span, offset);
-                }
-                span[offset++] = (byte)'-';
-                span[offset++] = (byte)((int)'0' - (int)value);
-            }
-            else if (value <= -10 && value > -100)
-            {
-                if (withLengthPrefix)
-                {
-                    span[offset++] = (byte)'3';
-                    offset = WriteCrlf(span, offset);
-                }
-                value = -value;
-                span[offset++] = (byte)'-';
-                span[offset++] = (byte)((int)'0' + ((int)value / 10));
-                span[offset++] = (byte)((int)'0' + ((int)value % 10));
-            }
-            else
-            {
-                // we're going to write it, but *to the wrong place*
-                var availableChunk = span.Slice(offset);
-                var formattedLength = Format.FormatInt64(value, availableChunk);
-                if (withLengthPrefix)
-                {
-                    // now we know how large the prefix is: write the prefix, then write the value
-                    var prefixLength = Format.FormatInt32(formattedLength, availableChunk);
-                    offset += prefixLength;
-                    offset = WriteCrlf(span, offset);
-
-                    availableChunk = span.Slice(offset);
-                    var finalLength = Format.FormatInt64(value, availableChunk);
-                    offset += finalLength;
-                    Debug.Assert(finalLength == formattedLength);
-                }
-                else
-                {
-                    offset += formattedLength;
-                }
-            }
-
-            return WriteCrlf(span, offset);
-        }
-
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Performance", "CA1822:Mark members as static", Justification = "DEBUG uses instance data")]
-        private async ValueTask<WriteResult> FlushAsync_Awaited(PhysicalConnection connection, ValueTask<FlushResult> flush, bool throwOnFailure)
+        private async ValueTask<WriteResult> FlushAsync_Awaited(IPhysicalConnection connection, ValueTask<FlushResult> flush, bool throwOnFailure)
         {
             try
             {
                 await flush.ForAwait();
-                connection._writeStatus = WriteStatus.Flushed;
+                connection.SetWriteStatus(WriteStatus.Flushed);
                 connection.UpdateLastWriteTime();
                 return WriteResult.Success;
             }
@@ -1048,7 +912,7 @@ namespace StackExchange.Redis
         private CancellationTokenSource? _reusableFlushSyncTokenSource;
         [Obsolete("this is an anti-pattern; work to reduce reliance on this is in progress")]
         [System.Diagnostics.CodeAnalysis.SuppressMessage("Style", "IDE0062:Make local function 'static'", Justification = "DEBUG uses instance data")]
-        internal WriteResult FlushSync(bool throwOnFailure, int millisecondsTimeout)
+        public WriteResult FlushSync(bool throwOnFailure, int millisecondsTimeout)
         {
             var cts = _reusableFlushSyncTokenSource ??= new CancellationTokenSource();
             var flush = FlushAsync(throwOnFailure, cts.Token);
@@ -1078,16 +942,16 @@ namespace StackExchange.Redis
                 throw new TimeoutException("timeout while synchronously flushing");
             }
         }
-        internal ValueTask<WriteResult> FlushAsync(bool throwOnFailure, CancellationToken cancellationToken = default)
+        public ValueTask<WriteResult> FlushAsync(bool throwOnFailure, CancellationToken cancellationToken = default)
         {
             var tmp = _ioPipe?.Output;
             if (tmp == null) return new ValueTask<WriteResult>(WriteResult.NoConnectionAvailable);
             try
             {
-                _writeStatus = WriteStatus.Flushing;
+                SetWriteStatus(WriteStatus.Flushing);
                 var flush = tmp.FlushAsync(cancellationToken);
                 if (!flush.IsCompletedSuccessfully) return FlushAsync_Awaited(this, flush, throwOnFailure);
-                _writeStatus = WriteStatus.Flushed;
+                SetWriteStatus(WriteStatus.Flushed);
                 UpdateLastWriteTime();
                 return new ValueTask<WriteResult>(WriteResult.Success);
             }
@@ -1097,72 +961,7 @@ namespace StackExchange.Redis
                 return new ValueTask<WriteResult>(WriteResult.WriteFailure);
             }
         }
-
-        private static readonly ReadOnlyMemory<byte> NullBulkString = Encoding.ASCII.GetBytes("$-1\r\n"), EmptyBulkString = Encoding.ASCII.GetBytes("$0\r\n\r\n");
-
-        private static void WriteUnifiedBlob(PipeWriter writer, byte[]? value)
-        {
-            if (value == null)
-            {
-                // special case:
-                writer.Write(NullBulkString.Span);
-            }
-            else
-            {
-                WriteUnifiedSpan(writer, new ReadOnlySpan<byte>(value));
-            }
-        }
-
-        private static void WriteUnifiedSpan(PipeWriter writer, ReadOnlySpan<byte> value)
-        {
-            // ${len}\r\n           = 3 + MaxInt32TextLen
-            // {value}\r\n          = 2 + value.Length
-            const int MaxQuickSpanSize = 512;
-            if (value.Length == 0)
-            {
-                // special case:
-                writer.Write(EmptyBulkString.Span);
-            }
-            else if (value.Length <= MaxQuickSpanSize)
-            {
-                var span = writer.GetSpan(5 + Format.MaxInt32TextLen + value.Length);
-                span[0] = (byte)'$';
-                int bytes = AppendToSpan(span, value, 1);
-                writer.Advance(bytes);
-            }
-            else
-            {
-                // too big to guarantee can do in a single span
-                var span = writer.GetSpan(3 + Format.MaxInt32TextLen);
-                span[0] = (byte)'$';
-                int bytes = WriteRaw(span, value.Length, offset: 1);
-                writer.Advance(bytes);
-
-                writer.Write(value);
-
-                WriteCrlf(writer);
-            }
-        }
-
-        private static int AppendToSpanCommand(Span<byte> span, in CommandBytes value, int offset = 0)
-        {
-            span[offset++] = (byte)'$';
-            int len = value.Length;
-            offset = WriteRaw(span, len, offset: offset);
-            value.CopyTo(span.Slice(offset, len));
-            offset += value.Length;
-            return WriteCrlf(span, offset);
-        }
-
-        private static int AppendToSpan(Span<byte> span, ReadOnlySpan<byte> value, int offset = 0)
-        {
-            offset = WriteRaw(span, value.Length, offset: offset);
-            value.CopyTo(span.Slice(offset, value.Length));
-            offset += value.Length;
-            return WriteCrlf(span, offset);
-        }
-
-        internal void WriteSha1AsHex(byte[] value)
+        public void WriteSha1AsHex(byte[] value)
         {
             if (_ioPipe?.Output is not PipeWriter writer)
             {
@@ -1171,7 +970,7 @@ namespace StackExchange.Redis
 
             if (value == null)
             {
-                writer.Write(NullBulkString.Span);
+                writer.Write(PhysicalConnectionHelpers.NullBulkString.Span);
             }
             else if (value.Length == ResultProcessor.ScriptLoadProcessor.Sha1HashLength)
             {
@@ -1188,8 +987,8 @@ namespace StackExchange.Redis
                 for (int i = 0; i < value.Length; i++)
                 {
                     var b = value[i];
-                    span[offset++] = ToHexNibble(b >> 4);
-                    span[offset++] = ToHexNibble(b & 15);
+                    span[offset++] = PhysicalConnectionHelpers.ToHexNibble(b >> 4);
+                    span[offset++] = PhysicalConnectionHelpers.ToHexNibble(b & 15);
                 }
                 span[offset++] = (byte)'\r';
                 span[offset++] = (byte)'\n';
@@ -1200,284 +999,6 @@ namespace StackExchange.Redis
             {
                 throw new InvalidOperationException("Invalid SHA1 length: " + value.Length);
             }
-        }
-
-        internal static byte ToHexNibble(int value)
-        {
-            return value < 10 ? (byte)('0' + value) : (byte)('a' - 10 + value);
-        }
-
-        internal static void WriteUnifiedPrefixedString(PipeWriter? maybeNullWriter, byte[]? prefix, string? value)
-        {
-            if (maybeNullWriter is not PipeWriter writer)
-            {
-                return; // Prevent null refs during disposal
-            }
-
-            if (value == null)
-            {
-                // special case
-                writer.Write(NullBulkString.Span);
-            }
-            else
-            {
-                // ${total-len}\r\n         3 + MaxInt32TextLen
-                // {prefix}{value}\r\n
-                int encodedLength = Encoding.UTF8.GetByteCount(value),
-                    prefixLength = prefix?.Length ?? 0,
-                    totalLength = prefixLength + encodedLength;
-
-                if (totalLength == 0)
-                {
-                    // special-case
-                    writer.Write(EmptyBulkString.Span);
-                }
-                else
-                {
-                    var span = writer.GetSpan(3 + Format.MaxInt32TextLen);
-                    span[0] = (byte)'$';
-                    int bytes = WriteRaw(span, totalLength, offset: 1);
-                    writer.Advance(bytes);
-
-                    if (prefixLength != 0) writer.Write(prefix);
-                    if (encodedLength != 0) WriteRaw(writer, value, encodedLength);
-                    WriteCrlf(writer);
-                }
-            }
-        }
-
-        [ThreadStatic]
-        private static Encoder? s_PerThreadEncoder;
-        internal static Encoder GetPerThreadEncoder()
-        {
-            var encoder = s_PerThreadEncoder;
-            if (encoder == null)
-            {
-                s_PerThreadEncoder = encoder = Encoding.UTF8.GetEncoder();
-            }
-            else
-            {
-                encoder.Reset();
-            }
-            return encoder;
-        }
-
-        internal static unsafe void WriteRaw(PipeWriter writer, string value, int expectedLength)
-        {
-            const int MaxQuickEncodeSize = 512;
-
-            fixed (char* cPtr = value)
-            {
-                int totalBytes;
-                if (expectedLength <= MaxQuickEncodeSize)
-                {
-                    // encode directly in one hit
-                    var span = writer.GetSpan(expectedLength);
-                    fixed (byte* bPtr = span)
-                    {
-                        totalBytes = Encoding.UTF8.GetBytes(cPtr, value.Length, bPtr, expectedLength);
-                    }
-                    writer.Advance(expectedLength);
-                }
-                else
-                {
-                    // use an encoder in a loop
-                    var encoder = GetPerThreadEncoder();
-                    int charsRemaining = value.Length, charOffset = 0;
-                    totalBytes = 0;
-
-                    bool final = false;
-                    while (true)
-                    {
-                        var span = writer.GetSpan(5); // get *some* memory - at least enough for 1 character (but hopefully lots more)
-
-                        int charsUsed, bytesUsed;
-                        bool completed;
-                        fixed (byte* bPtr = span)
-                        {
-                            encoder.Convert(cPtr + charOffset, charsRemaining, bPtr, span.Length, final, out charsUsed, out bytesUsed, out completed);
-                        }
-                        writer.Advance(bytesUsed);
-                        totalBytes += bytesUsed;
-                        charOffset += charsUsed;
-                        charsRemaining -= charsUsed;
-
-                        if (charsRemaining <= 0)
-                        {
-                            if (charsRemaining < 0) throw new InvalidOperationException("String encode went negative");
-                            if (completed) break; // fine
-                            if (final) throw new InvalidOperationException("String encode failed to complete");
-                            final = true; // flush the encoder to one more span, then exit
-                        }
-                    }
-                }
-                if (totalBytes != expectedLength) throw new InvalidOperationException("String encode length check failure");
-            }
-        }
-
-        private static void WriteUnifiedPrefixedBlob(PipeWriter? maybeNullWriter, byte[]? prefix, byte[]? value)
-        {
-            if (maybeNullWriter is not PipeWriter writer)
-            {
-                return; // Prevent null refs during disposal
-            }
-
-            // ${total-len}\r\n
-            // {prefix}{value}\r\n
-            if (prefix == null || prefix.Length == 0 || value == null)
-            {
-                // if no prefix, just use the non-prefixed version;
-                // even if prefixed, a null value writes as null, so can use the non-prefixed version
-                WriteUnifiedBlob(writer, value);
-            }
-            else
-            {
-                var span = writer.GetSpan(3 + Format.MaxInt32TextLen); // note even with 2 max-len, we're still in same text range
-                span[0] = (byte)'$';
-                int bytes = WriteRaw(span, prefix.LongLength + value.LongLength, offset: 1);
-                writer.Advance(bytes);
-
-                writer.Write(prefix);
-                writer.Write(value);
-
-                span = writer.GetSpan(2);
-                WriteCrlf(span, 0);
-                writer.Advance(2);
-            }
-        }
-
-        private static void WriteUnifiedInt64(PipeWriter writer, long value)
-        {
-            // note from specification: A client sends to the Redis server a RESP Array consisting of just Bulk Strings.
-            // (i.e. we can't just send ":123\r\n", we need to send "$3\r\n123\r\n"
-
-            // ${asc-len}\r\n           = 4/5 (asc-len at most 2 digits)
-            // {asc}\r\n                = MaxInt64TextLen + 2
-            var span = writer.GetSpan(7 + Format.MaxInt64TextLen);
-
-            span[0] = (byte)'$';
-            var bytes = WriteRaw(span, value, withLengthPrefix: true, offset: 1);
-            writer.Advance(bytes);
-        }
-
-        private static void WriteUnifiedUInt64(PipeWriter writer, ulong value)
-        {
-            // note from specification: A client sends to the Redis server a RESP Array consisting of just Bulk Strings.
-            // (i.e. we can't just send ":123\r\n", we need to send "$3\r\n123\r\n"
-            Span<byte> valueSpan = stackalloc byte[Format.MaxInt64TextLen];
-
-            var len = Format.FormatUInt64(value, valueSpan);
-            // ${asc-len}\r\n           = 4/5 (asc-len at most 2 digits)
-            // {asc}\r\n                = {len} + 2
-            var span = writer.GetSpan(7 + len);
-            span[0] = (byte)'$';
-            int offset = WriteRaw(span, len, withLengthPrefix: false, offset: 1);
-            valueSpan.Slice(0, len).CopyTo(span.Slice(offset));
-            offset += len;
-            offset = WriteCrlf(span, offset);
-            writer.Advance(offset);
-        }
-
-        private static void WriteUnifiedDouble(PipeWriter writer, double value)
-        {
-#if NET8_0_OR_GREATER
-            Span<byte> valueSpan = stackalloc byte[Format.MaxDoubleTextLen];
-            var len = Format.FormatDouble(value, valueSpan);
-
-            // ${asc-len}\r\n           = 4/5 (asc-len at most 2 digits)
-            // {asc}\r\n                = {len} + 2
-            var span = writer.GetSpan(7 + len);
-            span[0] = (byte)'$';
-            int offset = WriteRaw(span, len, withLengthPrefix: false, offset: 1);
-            valueSpan.Slice(0, len).CopyTo(span.Slice(offset));
-            offset += len;
-            offset = WriteCrlf(span, offset);
-            writer.Advance(offset);
-#else
-            // fallback: drop to string
-            WriteUnifiedPrefixedString(writer, null, Format.ToString(value));
-#endif
-        }
-
-        internal static void WriteInteger(PipeWriter writer, long value)
-        {
-            // note: client should never write integer; only server does this
-            // :{asc}\r\n                = MaxInt64TextLen + 3
-            var span = writer.GetSpan(3 + Format.MaxInt64TextLen);
-
-            span[0] = (byte)':';
-            var bytes = WriteRaw(span, value, withLengthPrefix: false, offset: 1);
-            writer.Advance(bytes);
-        }
-
-        internal readonly struct ConnectionStatus
-        {
-            /// <summary>
-            /// Number of messages sent outbound, but we don't yet have a response for.
-            /// </summary>
-            public int MessagesSentAwaitingResponse { get; init; }
-
-            /// <summary>
-            /// Bytes available on the socket, not yet read into the pipe.
-            /// </summary>
-            public long BytesAvailableOnSocket { get; init; }
-
-            /// <summary>
-            /// Bytes read from the socket, pending in the reader pipe.
-            /// </summary>
-            public long BytesInReadPipe { get; init; }
-
-            /// <summary>
-            /// Bytes in the writer pipe, waiting to be written to the socket.
-            /// </summary>
-            public long BytesInWritePipe { get; init; }
-
-            /// <summary>
-            /// Byte size of the last result we processed.
-            /// </summary>
-            public long BytesLastResult { get; init; }
-
-            /// <summary>
-            /// Byte size on the buffer that isn't processed yet.
-            /// </summary>
-            public long BytesInBuffer { get; init; }
-
-            /// <summary>
-            /// The inbound pipe reader status.
-            /// </summary>
-            public ReadStatus ReadStatus { get; init; }
-
-            /// <summary>
-            /// The outbound pipe writer status.
-            /// </summary>
-            public WriteStatus WriteStatus { get; init; }
-
-            public override string ToString() =>
-                $"SentAwaitingResponse: {MessagesSentAwaitingResponse}, AvailableOnSocket: {BytesAvailableOnSocket} byte(s), InReadPipe: {BytesInReadPipe} byte(s), InWritePipe: {BytesInWritePipe} byte(s), ReadStatus: {ReadStatus}, WriteStatus: {WriteStatus}";
-
-            /// <summary>
-            /// The default connection stats, notable *not* the same as <c>default</c> since initializers don't run.
-            /// </summary>
-            public static ConnectionStatus Default { get; } = new()
-            {
-                BytesAvailableOnSocket = -1,
-                BytesInReadPipe = -1,
-                BytesInWritePipe = -1,
-                ReadStatus = ReadStatus.NA,
-                WriteStatus = WriteStatus.NA,
-            };
-
-            /// <summary>
-            /// The zeroed connection stats, which we want to display as zero for default exception cases.
-            /// </summary>
-            public static ConnectionStatus Zero { get; } = new()
-            {
-                BytesAvailableOnSocket = 0,
-                BytesInReadPipe = 0,
-                BytesInWritePipe = 0,
-                ReadStatus = ReadStatus.NA,
-                WriteStatus = WriteStatus.NA,
-            };
         }
 
         public ConnectionStatus GetStatus()
@@ -1522,53 +1043,6 @@ namespace StackExchange.Redis
             };
         }
 
-        internal static RemoteCertificateValidationCallback? GetAmbientIssuerCertificateCallback()
-        {
-            try
-            {
-                var issuerPath = Environment.GetEnvironmentVariable("SERedis_IssuerCertPath");
-                if (!string.IsNullOrEmpty(issuerPath)) return ConfigurationOptions.TrustIssuerCallback(issuerPath);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-            }
-            return null;
-        }
-        internal static LocalCertificateSelectionCallback? GetAmbientClientCertificateCallback()
-        {
-            try
-            {
-                var certificatePath = Environment.GetEnvironmentVariable("SERedis_ClientCertPfxPath");
-                if (!string.IsNullOrEmpty(certificatePath) && File.Exists(certificatePath))
-                {
-                    var password = Environment.GetEnvironmentVariable("SERedis_ClientCertPassword");
-                    var pfxStorageFlags = Environment.GetEnvironmentVariable("SERedis_ClientCertStorageFlags");
-                    X509KeyStorageFlags storageFlags = X509KeyStorageFlags.DefaultKeySet;
-                    if (!string.IsNullOrEmpty(pfxStorageFlags) && Enum.TryParse<X509KeyStorageFlags>(pfxStorageFlags, true, out var typedFlags))
-                    {
-                        storageFlags = typedFlags;
-                    }
-
-                    return ConfigurationOptions.CreatePfxUserCertificateCallback(certificatePath, password, storageFlags);
-                }
-
-#if NET5_0_OR_GREATER
-                certificatePath = Environment.GetEnvironmentVariable("SERedis_ClientCertPemPath");
-                if (!string.IsNullOrEmpty(certificatePath) && File.Exists(certificatePath))
-                {
-                    var passwordPath = Environment.GetEnvironmentVariable("SERedis_ClientCertPasswordPath");
-                    return ConfigurationOptions.CreatePemUserCertificateCallback(certificatePath, passwordPath);
-                }
-#endif
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine(ex.Message);
-            }
-            return null;
-        }
-
         internal async ValueTask<bool> ConnectedAsync(Socket? socket, ILogger? log, SocketManager manager)
         {
             var bridge = BridgeCouldBeNull;
@@ -1605,8 +1079,8 @@ namespace StackExchange.Redis
                     var ssl = new SslStream(
                         innerStream: stream,
                         leaveInnerStreamOpen: false,
-                        userCertificateValidationCallback: config.CertificateValidationCallback ?? GetAmbientIssuerCertificateCallback(),
-                        userCertificateSelectionCallback: config.CertificateSelectionCallback ?? GetAmbientClientCertificateCallback(),
+                        userCertificateValidationCallback: config.CertificateValidationCallback ?? PhysicalConnectionHelpers.GetAmbientIssuerCertificateCallback(),
+                        userCertificateSelectionCallback: config.CertificateSelectionCallback ?? PhysicalConnectionHelpers.GetAmbientClientCertificateCallback(),
                         encryptionPolicy: EncryptionPolicy.RequireEncryption);
                     try
                     {
@@ -1679,9 +1153,9 @@ namespace StackExchange.Redis
 
                 // out of band message does not match to a queued message
                 var items = result.GetItems();
-                if (items.Length >= 3 && (items[0].IsEqual(message) || items[0].IsEqual(smessage)))
+                if (items.Length >= 3 && (items[0].IsEqual(PhysicalConnectionHelpers.message) || items[0].IsEqual(PhysicalConnectionHelpers.smessage)))
                 {
-                    _readStatus = items[0].IsEqual(message) ? ReadStatus.PubSubMessage : ReadStatus.PubSubSMessage;
+                    _readStatus = items[0].IsEqual(PhysicalConnectionHelpers.message) ? ReadStatus.PubSubMessage : ReadStatus.PubSubSMessage;
 
                     // special-case the configuration change broadcasts (we don't keep that in the usual pub/sub registry)
                     var configChanged = muxer.ConfigurationChangedChannel;
@@ -1704,14 +1178,14 @@ namespace StackExchange.Redis
 
                     // invoke the handlers
                     RedisChannel channel;
-                    if (items[0].IsEqual(message))
+                    if (items[0].IsEqual(PhysicalConnectionHelpers.message))
                     {
-                        channel = items[1].AsRedisChannel(ChannelPrefix, RedisChannel.RedisChannelOptions.None);
+                        channel = items[1].AsRedisChannel(_ChannelPrefix, RedisChannel.RedisChannelOptions.None);
                         Trace("MESSAGE: " + channel);
                     }
                     else // see check on outer-if that restricts to message / smessage
                     {
-                        channel = items[1].AsRedisChannel(ChannelPrefix, RedisChannel.RedisChannelOptions.Sharded);
+                        channel = items[1].AsRedisChannel(_ChannelPrefix, RedisChannel.RedisChannelOptions.Sharded);
                         Trace("SMESSAGE: " + channel);
                     }
                     if (!channel.IsNull)
@@ -1730,25 +1204,25 @@ namespace StackExchange.Redis
                     }
                     return; // AND STOP PROCESSING!
                 }
-                else if (items.Length >= 4 && items[0].IsEqual(pmessage))
+                else if (items.Length >= 4 && items[0].IsEqual(PhysicalConnectionHelpers.pmessage))
                 {
                     _readStatus = ReadStatus.PubSubPMessage;
 
-                    var channel = items[2].AsRedisChannel(ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
+                    var channel = items[2].AsRedisChannel(_ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
 
                     Trace("PMESSAGE: " + channel);
                     if (!channel.IsNull)
                     {
                         if (TryGetPubSubPayload(items[3], out var payload))
                         {
-                            var sub = items[1].AsRedisChannel(ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
+                            var sub = items[1].AsRedisChannel(_ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
 
                             _readStatus = ReadStatus.InvokePubSub;
                             muxer.OnMessage(sub, channel, payload);
                         }
                         else if (TryGetMultiPubSubPayload(items[3], out var payloads))
                         {
-                            var sub = items[1].AsRedisChannel(ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
+                            var sub = items[1].AsRedisChannel(_ChannelPrefix, RedisChannel.RedisChannelOptions.Pattern);
 
                             _readStatus = ReadStatus.InvokePubSub;
                             muxer.OnMessage(sub, channel, payloads);
@@ -1877,7 +1351,7 @@ namespace StackExchange.Redis
 
         private volatile Message? _activeMessage;
 
-        internal void GetHeadMessages(out Message? now, out Message? next)
+        public void GetHeadMessages(out Message? now, out Message? next)
         {
             now = _activeMessage;
             bool haveLock = false;
@@ -2002,7 +1476,7 @@ namespace StackExchange.Redis
             {
                 _readStatus = ReadStatus.TryParseResult;
                 var reader = new BufferReader(buffer);
-                var result = TryParseResult(_protocol >= RedisProtocol.Resp3, _arena, in buffer, ref reader, IncludeDetailInExceptions, this);
+                var result = PhysicalConnectionHelpers.TryParseResult(_protocol >= RedisProtocol.Resp3, _arena, in buffer, ref reader, IncludeDetailInExceptions, this);
                 try
                 {
                     if (result.HasValue)
@@ -2033,261 +1507,12 @@ namespace StackExchange.Redis
             return messageCount;
         }
 
-        private static RawResult.ResultFlags AsNull(RawResult.ResultFlags flags) => flags & ~RawResult.ResultFlags.NonNull;
-
-        private static RawResult ReadArray(ResultType resultType, RawResult.ResultFlags flags, Arena<RawResult> arena, in ReadOnlySequence<byte> buffer, ref BufferReader reader, bool includeDetailInExceptions, ServerEndPoint? server)
-        {
-            var itemCount = ReadLineTerminatedString(ResultType.Integer, flags, ref reader);
-            if (itemCount.HasValue)
-            {
-                if (!itemCount.TryGetInt64(out long i64))
-                {
-                    throw ExceptionFactory.ConnectionFailure(
-                        includeDetailInExceptions,
-                        ConnectionFailureType.ProtocolFailure,
-                        itemCount.Is('?') ? "Streamed aggregate types not yet implemented" : "Invalid array length",
-                        server);
-                }
-
-                int itemCountActual = checked((int)i64);
-
-                if (itemCountActual < 0)
-                {
-                    // for null response by command like EXEC, RESP array: *-1\r\n
-                    return new RawResult(resultType, items: default, AsNull(flags));
-                }
-                else if (itemCountActual == 0)
-                {
-                    // for zero array response by command like SCAN, Resp array: *0\r\n
-                    return new RawResult(resultType, items: default, flags);
-                }
-
-                if (resultType == ResultType.Map) itemCountActual <<= 1; // if it says "3", it means 3 pairs, i.e. 6 values
-
-                var oversized = arena.Allocate(itemCountActual);
-                var result = new RawResult(resultType, oversized, flags);
-
-                if (oversized.IsSingleSegment)
-                {
-                    var span = oversized.FirstSpan;
-                    for (int i = 0; i < span.Length; i++)
-                    {
-                        if (!(span[i] = TryParseResult(flags, arena, in buffer, ref reader, includeDetailInExceptions, server)).HasValue)
-                        {
-                            return RawResult.Nil;
-                        }
-                    }
-                }
-                else
-                {
-                    foreach (var span in oversized.Spans)
-                    {
-                        for (int i = 0; i < span.Length; i++)
-                        {
-                            if (!(span[i] = TryParseResult(flags, arena, in buffer, ref reader, includeDetailInExceptions, server)).HasValue)
-                            {
-                                return RawResult.Nil;
-                            }
-                        }
-                    }
-                }
-                return result;
-            }
-            return RawResult.Nil;
-        }
-
-        private static RawResult ReadBulkString(ResultType type, RawResult.ResultFlags flags, ref BufferReader reader, bool includeDetailInExceptions, ServerEndPoint? server)
-        {
-            var prefix = ReadLineTerminatedString(ResultType.Integer, flags, ref reader);
-            if (prefix.HasValue)
-            {
-                if (!prefix.TryGetInt64(out long i64))
-                {
-                    throw ExceptionFactory.ConnectionFailure(
-                        includeDetailInExceptions,
-                        ConnectionFailureType.ProtocolFailure,
-                        prefix.Is('?') ? "Streamed strings not yet implemented" : "Invalid bulk string length",
-                        server);
-                }
-                int bodySize = checked((int)i64);
-                if (bodySize < 0)
-                {
-                    return new RawResult(type, ReadOnlySequence<byte>.Empty, AsNull(flags));
-                }
-
-                if (reader.TryConsumeAsBuffer(bodySize, out var payload))
-                {
-                    switch (reader.TryConsumeCRLF())
-                    {
-                        case ConsumeResult.NeedMoreData:
-                            break; // see NilResult below
-                        case ConsumeResult.Success:
-                            return new RawResult(type, payload, flags);
-                        default:
-                            throw ExceptionFactory.ConnectionFailure(includeDetailInExceptions, ConnectionFailureType.ProtocolFailure, "Invalid bulk string terminator", server);
-                    }
-                }
-            }
-            return RawResult.Nil;
-        }
-
-        private static RawResult ReadLineTerminatedString(ResultType type, RawResult.ResultFlags flags, ref BufferReader reader)
-        {
-            int crlfOffsetFromCurrent = BufferReader.FindNextCrLf(reader);
-            if (crlfOffsetFromCurrent < 0) return RawResult.Nil;
-
-            var payload = reader.ConsumeAsBuffer(crlfOffsetFromCurrent);
-            reader.Consume(2);
-
-            return new RawResult(type, payload, flags);
-        }
-
-        internal enum ReadStatus
-        {
-            NotStarted,
-            Init,
-            RanToCompletion,
-            Faulted,
-            ReadSync,
-            ReadAsync,
-            UpdateWriteTime,
-            ProcessBuffer,
-            MarkProcessed,
-            TryParseResult,
-            MatchResult,
-            PubSubMessage,
-            PubSubPMessage,
-            PubSubSMessage,
-            Reconfigure,
-            InvokePubSub,
-            ResponseSequenceCheck, // high-integrity mode only
-            DequeueResult,
-            ComputeResult,
-            CompletePendingMessageSync,
-            CompletePendingMessageAsync,
-            MatchResultComplete,
-            ResetArena,
-            ProcessBufferComplete,
-            NA = -1,
-        }
         private volatile ReadStatus _readStatus;
-        internal ReadStatus GetReadStatus() => _readStatus;
+        public ReadStatus GetReadStatus() => _readStatus;
 
         internal void StartReading() => ReadFromPipe().RedisFireAndForget();
 
-        internal static RawResult TryParseResult(
-            bool isResp3,
-            Arena<RawResult> arena,
-            in ReadOnlySequence<byte> buffer,
-            ref BufferReader reader,
-            bool includeDetilInExceptions,
-            PhysicalConnection? connection,
-            bool allowInlineProtocol = false)
-        {
-            return TryParseResult(
-                isResp3 ? (RawResult.ResultFlags.Resp3 | RawResult.ResultFlags.NonNull) : RawResult.ResultFlags.NonNull,
-                arena,
-                buffer,
-                ref reader,
-                includeDetilInExceptions,
-                connection?.BridgeCouldBeNull?.ServerEndPoint,
-                allowInlineProtocol);
-        }
-
-        private static RawResult TryParseResult(
-            RawResult.ResultFlags flags,
-            Arena<RawResult> arena,
-            in ReadOnlySequence<byte> buffer,
-            ref BufferReader reader,
-            bool includeDetilInExceptions,
-            ServerEndPoint? server,
-            bool allowInlineProtocol = false)
-        {
-            int prefix;
-            do // this loop is just to allow us to parse (skip) attributes without doing a stack-dive
-            {
-                prefix = reader.PeekByte();
-                if (prefix < 0) return RawResult.Nil; // EOF
-                switch (prefix)
-                {
-                    // RESP2
-                    case '+': // simple string
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.SimpleString, flags, ref reader);
-                    case '-': // error
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.Error, flags, ref reader);
-                    case ':': // integer
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.Integer, flags, ref reader);
-                    case '$': // bulk string
-                        reader.Consume(1);
-                        return ReadBulkString(ResultType.BulkString, flags, ref reader, includeDetilInExceptions, server);
-                    case '*': // array
-                        reader.Consume(1);
-                        return ReadArray(ResultType.Array, flags, arena, in buffer, ref reader, includeDetilInExceptions, server);
-                    // RESP3
-                    case '_': // null
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.Null, flags, ref reader);
-                    case ',': // double
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.Double, flags, ref reader);
-                    case '#': // boolean
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.Boolean, flags, ref reader);
-                    case '!': // blob error
-                        reader.Consume(1);
-                        return ReadBulkString(ResultType.BlobError, flags, ref reader, includeDetilInExceptions, server);
-                    case '=': // verbatim string
-                        reader.Consume(1);
-                        return ReadBulkString(ResultType.VerbatimString, flags, ref reader, includeDetilInExceptions, server);
-                    case '(': // big number
-                        reader.Consume(1);
-                        return ReadLineTerminatedString(ResultType.BigInteger, flags, ref reader);
-                    case '%': // map
-                        reader.Consume(1);
-                        return ReadArray(ResultType.Map, flags, arena, in buffer, ref reader, includeDetilInExceptions, server);
-                    case '~': // set
-                        reader.Consume(1);
-                        return ReadArray(ResultType.Set, flags, arena, in buffer, ref reader, includeDetilInExceptions, server);
-                    case '|': // attribute
-                        reader.Consume(1);
-                        var arr = ReadArray(ResultType.Attribute, flags, arena, in buffer, ref reader, includeDetilInExceptions, server);
-                        if (!arr.HasValue) return RawResult.Nil; // failed to parse attribute data
-
-                        // for now, we want to just skip attribute data; so
-                        // drop whatever we parsed on the floor and keep looking
-                        break; // exits the SWITCH, not the DO/WHILE
-                    case '>': // push
-                        reader.Consume(1);
-                        return ReadArray(ResultType.Push, flags, arena, in buffer, ref reader, includeDetilInExceptions, server);
-                }
-            }
-            while (prefix == '|');
-
-            if (allowInlineProtocol) return ParseInlineProtocol(flags, arena, ReadLineTerminatedString(ResultType.SimpleString, flags, ref reader));
-            throw new InvalidOperationException("Unexpected response prefix: " + (char)prefix);
-        }
-
-        private static RawResult ParseInlineProtocol(RawResult.ResultFlags flags, Arena<RawResult> arena, in RawResult line)
-        {
-            if (!line.HasValue) return RawResult.Nil; // incomplete line
-
-            int count = 0;
-            foreach (var _ in line.GetInlineTokenizer()) count++;
-            var block = arena.Allocate(count);
-
-            var iter = block.GetEnumerator();
-            foreach (var token in line.GetInlineTokenizer())
-            {
-                // this assigns *via a reference*, returned via the iterator; just... sweet
-                iter.GetNext() = new RawResult(line.Resp3Type, token, flags); // spoof RESP2 from RESP1
-            }
-            return new RawResult(ResultType.Array, block, flags); // spoof RESP2 from RESP1
-        }
-
-        internal bool HasPendingCallerFacingItems()
+        public bool HasPendingCallerFacingItems()
         {
             bool lockTaken = false;
             try

@@ -322,7 +322,7 @@ namespace StackExchange.Redis.Server
             switch (value.Type.ToResp2())
             {
                 case ResultType.Integer:
-                    PhysicalConnection.WriteInteger(output, (long)value.AsRedisValue());
+                    IPhysicalConnection.WriteInteger(output, (long)value.AsRedisValue());
                     break;
                 case ResultType.Error:
                     prefix = '-';
@@ -333,21 +333,21 @@ namespace StackExchange.Redis.Server
                     WritePrefix(output, prefix);
                     var val = (string)value.AsRedisValue();
                     var expectedLength = Encoding.UTF8.GetByteCount(val);
-                    PhysicalConnection.WriteRaw(output, val, expectedLength);
-                    PhysicalConnection.WriteCrlf(output);
+                    IPhysicalConnection.WriteRaw(output, val, expectedLength);
+                    IPhysicalConnection.WriteCrlf(output);
                     break;
                 case ResultType.BulkString:
-                    PhysicalConnection.WriteBulkString(value.AsRedisValue(), output);
+                    IPhysicalConnection.WriteBulkString(value.AsRedisValue(), output);
                     break;
                 case ResultType.Array:
                     if (value.IsNullArray)
                     {
-                        PhysicalConnection.WriteMultiBulkHeader(output, -1);
+                        IPhysicalConnection.WriteMultiBulkHeader(output, -1);
                     }
                     else
                     {
                         var segment = value.Segment;
-                        PhysicalConnection.WriteMultiBulkHeader(output, segment.Count);
+                        IPhysicalConnection.WriteMultiBulkHeader(output, segment.Count);
                         var arr = segment.Array;
                         int offset = segment.Offset;
                         for (int i = 0; i < segment.Count; i++)
@@ -371,7 +371,7 @@ namespace StackExchange.Redis.Server
         private static bool TryParseRequest(Arena<RawResult> arena, ref ReadOnlySequence<byte> buffer, out RedisRequest request)
         {
             var reader = new BufferReader(buffer);
-            var raw = PhysicalConnection.TryParseResult(false, arena, in buffer, ref reader, false, null, true);
+            var raw = IPhysicalConnection.TryParseResult(false, arena, in buffer, ref reader, false, null, true);
             if (raw.HasValue)
             {
                 buffer = reader.SliceFromCurrent();

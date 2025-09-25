@@ -1323,7 +1323,7 @@ namespace StackExchange.Redis
                 this.migrateOptions = migrateOptions;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 bool isCopy = (migrateOptions & MigrateOptions.Copy) != 0;
                 bool isReplace = (migrateOptions & MigrateOptions.Replace) != 0;
@@ -4049,7 +4049,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, argCount);
                 physical.WriteBulkString(StreamConstants.Group);
@@ -4123,7 +4123,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, argCount);
 
@@ -4838,7 +4838,7 @@ namespace StackExchange.Redis
                 argCount = 6 + (count.HasValue ? 2 : 0) + (noAck ? 1 : 0);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, argCount);
                 physical.WriteBulkString(StreamConstants.Group);
@@ -4888,7 +4888,7 @@ namespace StackExchange.Redis
                 argCount = count.HasValue ? 5 : 3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, argCount);
 
@@ -5327,7 +5327,7 @@ namespace StackExchange.Redis
                 Script = script ?? throw new ArgumentNullException(nameof(script));
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.WriteBulkString(RedisLiterals.LOAD);
@@ -5348,7 +5348,7 @@ namespace StackExchange.Redis
         {
             protected abstract T[]? Parse(in RawResult result, out int count);
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(IPhysicalConnection connection, Message message, in RawResult result)
             {
                 switch (result.Resp2TypeArray)
                 {
@@ -5378,7 +5378,7 @@ namespace StackExchange.Redis
 
             public ExecuteMessage(CommandMap? map, int db, CommandFlags flags, string command, ICollection<object>? args) : base(db, flags, RedisCommand.UNKNOWN)
             {
-                if (args != null && args.Count >= PhysicalConnection.REDIS_MAX_ARGS) // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
+                if (args != null && args.Count >= PhysicalConnectionHelpers.REDIS_MAX_ARGS) // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
                 {
                     throw ExceptionFactory.TooManyArgs(command, args.Count);
                 }
@@ -5387,7 +5387,7 @@ namespace StackExchange.Redis
                 _args = args ?? Array.Empty<object>();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(RedisCommand.UNKNOWN, _args.Count, Command);
                 foreach (object arg in _args)
@@ -5472,7 +5472,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            public IEnumerable<Message> GetMessages(PhysicalConnection connection)
+            public IEnumerable<Message> GetMessages(IPhysicalConnection connection)
             {
                 PhysicalBridge? bridge;
                 if (script != null && (bridge = connection.BridgeCouldBeNull) != null
@@ -5493,7 +5493,7 @@ namespace StackExchange.Redis
                 yield return this;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 if (hexHash != null)
                 {
@@ -5626,7 +5626,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2 + keys.Length + values.Length);
                 physical.Write(Key);
@@ -5660,7 +5660,7 @@ namespace StackExchange.Redis
 
             public override string CommandAndKey => ttlCommand + "+" + RedisCommand.GET + " " + (string?)Key;
 
-            public IEnumerable<Message> GetMessages(PhysicalConnection connection)
+            public IEnumerable<Message> GetMessages(IPhysicalConnection connection)
             {
                 box = SimpleResultBox<TimeSpan?>.Create();
                 var ttl = Message.Create(Db, Flags, ttlCommand, Key);
@@ -5683,7 +5683,7 @@ namespace StackExchange.Redis
                 return false;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(command, 1);
                 physical.Write(Key);
@@ -5695,7 +5695,7 @@ namespace StackExchange.Redis
         {
             public static readonly ResultProcessor<RedisValueWithExpiry> Default = new StringGetWithExpiryProcessor();
             private StringGetWithExpiryProcessor() { }
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(IPhysicalConnection connection, Message message, in RawResult result)
             {
                 switch (result.Resp2TypeBulkString)
                 {

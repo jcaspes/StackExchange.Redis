@@ -12,7 +12,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Pipelines.Sockets.Unofficial;
 using Pipelines.Sockets.Unofficial.Arenas;
-using static StackExchange.Redis.PhysicalConnection;
 
 namespace StackExchange.Redis.Configuration;
 
@@ -189,7 +188,7 @@ public abstract class LoggingTunnel : Tunnel
             var reader = new BufferReader(buffer);
             try
             {
-                var result = TryParseResult(true, arena, in buffer, ref reader, true, null);
+                var result = PhysicalConnectionHelpers.TryParseResult(true, arena, in buffer, ref reader, true, null);
                 if (result.HasValue)
                 {
                     buffer = reader.SliceFromCurrent();
@@ -226,7 +225,7 @@ public abstract class LoggingTunnel : Tunnel
             var reader = new BufferReader(buffer);
             try
             {
-                var result = TryParseResult(true, arena, in buffer, ref reader, true, null);
+                var result = PhysicalConnectionHelpers.TryParseResult(true, arena, in buffer, ref reader, true, null);
                 bool isOutOfBand = result.Resp3Type == ResultType.Push
                     || (isInbound && result.Resp2TypeArray == ResultType.Array && IsArrayOutOfBand(result));
                 if (result.HasValue)
@@ -355,8 +354,8 @@ public abstract class LoggingTunnel : Tunnel
         var ssl = new SslStream(
             innerStream: stream,
             leaveInnerStreamOpen: false,
-            userCertificateValidationCallback: _options.CertificateValidationCallback ?? PhysicalConnection.GetAmbientIssuerCertificateCallback(),
-            userCertificateSelectionCallback: _options.CertificateSelectionCallback ?? PhysicalConnection.GetAmbientClientCertificateCallback(),
+            userCertificateValidationCallback: _options.CertificateValidationCallback ?? PhysicalConnectionHelpers.GetAmbientIssuerCertificateCallback(),
+            userCertificateSelectionCallback: _options.CertificateSelectionCallback ?? PhysicalConnectionHelpers.GetAmbientClientCertificateCallback(),
             encryptionPolicy: EncryptionPolicy.RequireEncryption);
 
 #if NETCOREAPP3_1_OR_GREATER

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 
 namespace StackExchange.Redis;
 
@@ -33,7 +33,7 @@ internal abstract class VectorSetSimilaritySearchMessage(
         internal override int GetSearchTargetArgCount(bool packed) =>
             packed ? 2 : 2 + vector.Length; // FP32 {vector} or VALUES {num} {vector}
 
-        internal override void WriteSearchTarget(bool packed, PhysicalConnection physical)
+        internal override void WriteSearchTarget(bool packed, IPhysicalConnection physical)
         {
             if (packed)
             {
@@ -68,7 +68,7 @@ internal abstract class VectorSetSimilaritySearchMessage(
     {
         internal override int GetSearchTargetArgCount(bool packed) => 2; // ELE {member}
 
-        internal override void WriteSearchTarget(bool packed, PhysicalConnection physical)
+        internal override void WriteSearchTarget(bool packed, IPhysicalConnection physical)
         {
             physical.WriteBulkString("ELE"u8);
             physical.WriteBulkString(member);
@@ -76,7 +76,7 @@ internal abstract class VectorSetSimilaritySearchMessage(
     }
 
     internal abstract int GetSearchTargetArgCount(bool packed);
-    internal abstract void WriteSearchTarget(bool packed, PhysicalConnection physical);
+    internal abstract void WriteSearchTarget(bool packed, IPhysicalConnection physical);
 
     public ResultProcessor<Lease<VectorSetSimilaritySearchResult>?> GetResultProcessor() =>
         VectorSetSimilaritySearchProcessor.Instance;
@@ -87,7 +87,7 @@ internal abstract class VectorSetSimilaritySearchMessage(
         public static readonly VectorSetSimilaritySearchProcessor Instance = new();
         private VectorSetSimilaritySearchProcessor() { }
 
-        protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+        protected override bool SetResultCore(IPhysicalConnection connection, Message message, in RawResult result)
         {
             if (result.Resp2TypeArray == ResultType.Array && message is VectorSetSimilaritySearchMessage vssm)
             {
@@ -194,7 +194,7 @@ internal abstract class VectorSetSimilaritySearchMessage(
         return argCount;
     }
 
-    protected override void WriteImpl(PhysicalConnection physical)
+    protected override void WriteImpl(IPhysicalConnection physical)
     {
         // snapshot to avoid race in debug scenarios
         bool packed = VectorSetAddMessage.UseFp32;

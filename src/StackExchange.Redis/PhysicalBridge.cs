@@ -52,7 +52,7 @@ namespace StackExchange.Redis
 
         // private volatile int missedHeartbeats;
         private long operationCount, socketCount;
-        private volatile PhysicalConnection? physical;
+        private volatile IPhysicalConnection? physical;
 
         private long profileLastLog;
         private int profileLogIndex;
@@ -328,14 +328,14 @@ namespace StackExchange.Redis
             public long TotalBacklogMessagesQueued { get; init; }
 
             /// <summary>
-            /// Status for the underlying <see cref="PhysicalConnection"/>.
+            /// Status for the underlying <see cref="IPhysicalConnection"/>.
             /// </summary>
-            public PhysicalConnection.ConnectionStatus Connection { get; init; }
+            public ConnectionStatus Connection { get; init; }
 
             /// <summary>
             /// The default bridge stats, notable *not* the same as <c>default</c> since initializers don't run.
             /// </summary>
-            public static BridgeStatus Zero { get; } = new() { Connection = PhysicalConnection.ConnectionStatus.Zero };
+            public static BridgeStatus Zero { get; } = new() { Connection = ConnectionStatus.Zero };
 
             public override string ToString() =>
                 $"MessagesSinceLastHeartbeat: {MessagesSinceLastHeartbeat}, ConnectedAt: {ConnectedAt?.ToString("u") ?? "n/a"}, Writer: {(IsWriterActive ? "Active" : "Inactive")}, BacklogStatus: {BacklogStatus}, BacklogMessagesPending: (Queue: {BacklogMessagesPending}, Counter: {BacklogMessagesPendingCounter}), TotalBacklogMessagesQueued: {TotalBacklogMessagesQueued}, Connection: ({Connection})";
@@ -354,7 +354,7 @@ namespace StackExchange.Redis
             BacklogMessagesPendingCounter = Volatile.Read(ref _backlogCurrentEnqueued),
             BacklogStatus = _backlogStatus,
             TotalBacklogMessagesQueued = _backlogTotalEnqueued,
-            Connection = physical?.GetStatus() ?? PhysicalConnection.ConnectionStatus.Default,
+            Connection = physical?.GetStatus() ?? ConnectionStatus.Default,
         };
 
         internal string GetStormLog()
@@ -424,7 +424,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal async Task OnConnectedAsync(PhysicalConnection connection, ILogger? log)
+        internal async Task OnConnectedAsync(IPhysicalConnection connection, ILogger? log)
         {
             Trace("OnConnected");
             if (physical == connection && !isDisposed && ChangeState(State.Connecting, State.ConnectedEstablishing))
@@ -453,7 +453,7 @@ namespace StackExchange.Redis
             TryConnect(null);
         }
 
-        internal void OnConnectionFailed(PhysicalConnection connection, ConnectionFailureType failureType, Exception innerException, bool wasRequested)
+        internal void OnConnectionFailed(IPhysicalConnection connection, ConnectionFailureType failureType, Exception innerException, bool wasRequested)
         {
             if (wasRequested)
             {
@@ -479,7 +479,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void OnDisconnected(ConnectionFailureType failureType, PhysicalConnection? connection, out bool isCurrent, out State oldState)
+        internal void OnDisconnected(ConnectionFailureType failureType, IPhysicalConnection? connection, out bool isCurrent, out State oldState)
         {
             Trace($"OnDisconnected: {failureType}");
 
@@ -525,7 +525,7 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void OnFullyEstablished(PhysicalConnection connection, string source)
+        internal void OnFullyEstablished(IPhysicalConnection connection, string source)
         {
             Trace("OnFullyEstablished");
             connection.SetIdle();
@@ -602,7 +602,7 @@ namespace StackExchange.Redis
                         // (Fall through) Happens when we successfully connected via TCP, but no Redis handshake completion yet.
                         // This can happen brief (usual) or when the server never answers (rare). When we're in this state,
                         // a socket is open and reader likely listening indefinitely for incoming data on an async background task.
-                        // We need to time that out and cleanup the PhysicalConnection if needed, otherwise that reader and socket will remain open
+                        // We need to time that out and cleanup the IPhysicalConnection if needed, otherwise that reader and socket will remain open
                         // for the lifetime of the application due to being orphaned, yet still referenced by the active task doing the pipe read.
                     case (int)State.ConnectedEstablished:
                         // Track that we should reset the count on the next disconnect, but not do so in a loop
@@ -749,7 +749,7 @@ namespace StackExchange.Redis
 
         private Message? _activeMessage;
 
-        private WriteResult WriteMessageInsideLock(PhysicalConnection physical, Message message)
+        private WriteResult WriteMessageInsideLock(IPhysicalConnection physical, Message message)
         {
             WriteResult result;
             var existingMessage = Interlocked.CompareExchange(ref _activeMessage, message, null);
@@ -794,7 +794,7 @@ namespace StackExchange.Redis
         }
 
         [Obsolete("prefer async")]
-        internal WriteResult WriteMessageTakingWriteLockSync(PhysicalConnection physical, Message message)
+        internal WriteResult WriteMessageTakingWriteLockSync(IPhysicalConnection physical, Message message)
         {
             Trace("Writing: " + message);
             message.SetEnqueued(physical); // this also records the read/write stats at this point
@@ -1236,7 +1236,7 @@ namespace StackExchange.Redis
         /// <param name="physical">The physical connection to write to.</param>
         /// <param name="message">The message to be written.</param>
         /// <param name="bypassBacklog">Whether this message should bypass the backlog, going straight to the pipe or failing.</param>
-        internal ValueTask<WriteResult> WriteMessageTakingWriteLockAsync(PhysicalConnection physical, Message message, bool bypassBacklog = false)
+        internal ValueTask<WriteResult> WriteMessageTakingWriteLockAsync(IPhysicalConnection physical, Message message, bool bypassBacklog = false)
         {
             Trace("Writing: " + message);
             message.SetEnqueued(physical); // this also records the read/write stats at this point
@@ -1343,7 +1343,7 @@ namespace StackExchange.Redis
 #else
             ValueTask<LockToken> pending,
 #endif
-            PhysicalConnection physical,
+            IPhysicalConnection physical,
             Message message)
         {
 #if NETCOREAPP
@@ -1445,7 +1445,7 @@ namespace StackExchange.Redis
             return result;
         }
 
-        public PhysicalConnection? TryConnect(ILogger? log)
+        public IPhysicalConnection? TryConnect(ILogger? log)
         {
             if (state == (int)State.Disconnected)
             {
@@ -1502,7 +1502,7 @@ namespace StackExchange.Redis
             Multiplexer.OnInternalError(exception, ServerEndPoint.EndPoint, ConnectionType, origin);
         }
 
-        private void SelectDatabaseInsideWriteLock(PhysicalConnection connection, Message message)
+        private void SelectDatabaseInsideWriteLock(IPhysicalConnection connection, Message message)
         {
             int db = message.Db;
             if (db >= 0)
@@ -1518,7 +1518,7 @@ namespace StackExchange.Redis
             }
         }
 
-        private WriteResult WriteMessageToServerInsideWriteLock(PhysicalConnection connection, Message message)
+        private WriteResult WriteMessageToServerInsideWriteLock(IPhysicalConnection connection, Message message)
         {
             if (message == null)
             {
