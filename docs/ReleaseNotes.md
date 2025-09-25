@@ -8,8 +8,44 @@ Current package versions:
 
 ## Unreleased
 
+- Fix [#2951](https://github.com/StackExchange/StackExchange.Redis/issues/2951) - sentinel reconnection failure ([#2956 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2956))
+
+## 2.9.17
+
+- Add vector-set support ([#2939 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2939))
+- Fix `RedisValue` special-value (NaN, Inf, etc) handling when casting from raw/string values to `double` ([#2950 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2950))
+- Internals:
+  - Use `sealed` classes where possible ([#2942 by Henr1k80](https://github.com/StackExchange/StackExchange.Redis/pull/2942))
+  - Add overlapped flushing in `LoggingTunnel` and avoid double-lookups ([#2943 by Henr1k80](https://github.com/StackExchange/StackExchange.Redis/pull/2943))
+
+## 2.9.11
+
+- Add `HGETDEL`, `HGETEX` and `HSETEX` support ([#2863 by atakavci](https://github.com/StackExchange/StackExchange.Redis/pull/2863))
+- Fix key-prefix omission in `SetIntersectionLength` and `SortedSet{Combine[WithScores]|IntersectionLength}` ([#2863 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2863))
+- Add `Condition.SortedSet[Not]ContainsStarting` condition for transactions ([#2638 by ArnoKoll](https://github.com/StackExchange/StackExchange.Redis/pull/2638))
+- Add support for XPENDING Idle time filter ([#2822 by david-brink-talogy](https://github.com/StackExchange/StackExchange.Redis/pull/2822))
+- Improve `double` formatting performance on net8+ ([#2928 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2928))
+- Add `GetServer(RedisKey, ...)` API ([#2936 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2936))
+- Fix error constructing `StreamAdd` message ([#2941 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2941)) 
+
+## 2.8.58
+
+- Fix [#2679](https://github.com/StackExchange/StackExchange.Redis/issues/2679) - blocking call in long-running connects ([#2680 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2680))
+- Support async cancellation of `SCAN` enumeration ([#2911 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2911)) 
+- Add `XTRIM MINID` support ([#2842 by kijanawoodard](https://github.com/StackExchange/StackExchange.Redis/pull/2842))
+- Add new CE 8.2 stream support - `XDELEX`, `XACKDEL`, `{XADD|XTRIM} [KEEPREF|DELREF|ACKED]` ([#2912 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2912))
+- Fix `ZREVRANGEBYLEX` open-ended commands ([#2636 by ArnoKoll](https://github.com/StackExchange/StackExchange.Redis/pull/2636))
+- Fix `StreamGroupInfo.Lag` when `null` ([#2902 by robhop](https://github.com/StackExchange/StackExchange.Redis/pull/2902))
+- Internals
+  - Logging improvements ([#2903 by Meir017](https://github.com/StackExchange/StackExchange.Redis/pull/2903) and [#2917 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2917))
+  - Update tests to xUnit v3 ([#2907 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2907))
+  - Avoid `CLIENT PAUSE` in CI tests ([#2916 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2916))
+
+## 2.8.47
+
 - Add support for new `BITOP` operations in CE 8.2 ([#2900 by atakavci](https://github.com/StackExchange/StackExchange.Redis/pull/2900))
 - Package updates ([#2906 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2906))
+- Docs: added [guidance on async timeouts](https://stackexchange.github.io/StackExchange.Redis/AsyncTimeouts) ([#2910 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2910))
 - Fix handshake error with `CLIENT ID` ([#2909 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2909))
 
 ## 2.8.41

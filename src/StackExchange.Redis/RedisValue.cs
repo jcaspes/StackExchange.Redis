@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Buffers.Text;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -148,7 +149,7 @@ namespace StackExchange.Redis
         /// <param name="y">The second <see cref="RedisValue"/> to compare.</param>
         public static bool operator !=(RedisValue x, RedisValue y) => !(x == y);
 
-        private double OverlappedValueDouble
+        internal double OverlappedValueDouble
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get => BitConverter.Int64BitsToDouble(_overlappedBits64);
@@ -655,6 +656,10 @@ namespace StackExchange.Redis
                 StorageType.Int64 => value.OverlappedValueInt64,
                 StorageType.UInt64 => value.OverlappedValueUInt64,
                 StorageType.Double => value.OverlappedValueDouble,
+                // special values like NaN/Inf are deliberately not handled by Simplify, but need to be considered for casting
+                StorageType.String when Format.TryParseDouble((string)value._objectOrSentinel!, out var d) => d,
+                StorageType.Raw when TryParseDouble(value._memory.Span, out var d) => d,
+                // anything else: fail
                 _ => throw new InvalidCastException($"Unable to cast from {value.Type} to double: '{value}'"),
             };
         }
@@ -841,21 +846,76 @@ namespace StackExchange.Redis
 
                     return value._memory.ToArray();
                 case StorageType.Int64:
-                    Span<byte> span = stackalloc byte[Format.MaxInt64TextLen + 2];
-                    int len = PhysicalConnection.WriteRaw(span, value.OverlappedValueInt64, false, 0);
-                    arr = new byte[len - 2]; // don't need the CRLF
-                    span.Slice(0, arr.Length).CopyTo(arr);
-                    return arr;
+                    Debug.Assert(Format.MaxInt64TextLen <= 24);
+                    Span<byte> span = stackalloc byte[24];
+                    int len = Format.FormatInt64(value.OverlappedValueInt64, span);
+                    return span.Slice(0, len).ToArray();
                 case StorageType.UInt64:
-                    // we know it is a huge value - just jump straight to Utf8Formatter
-                    span = stackalloc byte[Format.MaxInt64TextLen];
+                    Debug.Assert(Format.MaxInt64TextLen <= 24);
+                    span = stackalloc byte[24];
                     len = Format.FormatUInt64(value.OverlappedValueUInt64, span);
-                    arr = new byte[len];
-                    span.Slice(0, len).CopyTo(arr);
-                    return arr;
+                    return span.Slice(0, len).ToArray();
+                case StorageType.Double:
+                    span = stackalloc byte[Format.MaxDoubleTextLen];
+                    len = Format.FormatDouble(value.OverlappedValueDouble, span);
+                    return span.Slice(0, len).ToArray();
+                case StorageType.String:
+                    return Encoding.UTF8.GetBytes((string)value._objectOrSentinel!);
             }
             // fallback: stringify and encode
             return Encoding.UTF8.GetBytes((string)value!);
+        }
+
+        /// <summary>
+        /// Gets the length of the value in bytes.
+        /// </summary>
+        public int GetByteCount()
+        {
+            switch (Type)
+            {
+                case StorageType.Null: return 0;
+                case StorageType.Raw: return _memory.Length;
+                case StorageType.String: return Encoding.UTF8.GetByteCount((string)_objectOrSentinel!);
+                case StorageType.Int64: return Format.MeasureInt64(OverlappedValueInt64);
+                case StorageType.UInt64: return Format.MeasureUInt64(OverlappedValueUInt64);
+                case StorageType.Double: return Format.MeasureDouble(OverlappedValueDouble);
+                default: return ThrowUnableToMeasure();
+            }
+        }
+
+        private int ThrowUnableToMeasure() => throw new InvalidOperationException("Unable to compute length of type: " + Type);
+
+        /// <summary>
+        /// Gets the length of the value in bytes.
+        /// </summary>
+        /* right now, we only support int lengths, but adding this now so that
+         there are no surprises if/when we add support for discontiguous buffers */
+        public long GetLongByteCount() => GetByteCount();
+
+        /// <summary>
+        /// Copy the value as bytes to the provided <paramref name="destination"/>.
+        /// </summary>
+        public int CopyTo(Span<byte> destination)
+        {
+            switch (Type)
+            {
+                case StorageType.Null:
+                    return 0;
+                case StorageType.Raw:
+                    var srcBytes = _memory.Span;
+                    srcBytes.CopyTo(destination);
+                    return srcBytes.Length;
+                case StorageType.String:
+                    return Encoding.UTF8.GetBytes(((string)_objectOrSentinel!).AsSpan(), destination);
+                case StorageType.Int64:
+                    return Format.FormatInt64(OverlappedValueInt64, destination);
+                case StorageType.UInt64:
+                    return Format.FormatUInt64(OverlappedValueUInt64, destination);
+                case StorageType.Double:
+                    return Format.FormatDouble(OverlappedValueDouble, destination);
+                default:
+                    return ThrowUnableToMeasure();
+            }
         }
 
         /// <summary>
@@ -933,7 +993,8 @@ namespace StackExchange.Redis
                         if (Format.TryParseInt64(s, out i64)) return i64;
                         if (Format.TryParseUInt64(s, out u64)) return u64;
                     }
-                    if (Format.TryParseDouble(s, out var f64)) return f64;
+                    // note: don't simplify inf/nan, as that causes equality semantic problems
+                    if (Format.TryParseDouble(s, out var f64) && !IsSpecialDouble(f64)) return f64;
                     break;
                 case StorageType.Raw:
                     var b = _memory.Span;
@@ -942,7 +1003,8 @@ namespace StackExchange.Redis
                         if (Format.TryParseInt64(b, out i64)) return i64;
                         if (Format.TryParseUInt64(b, out u64)) return u64;
                     }
-                    if (TryParseDouble(b, out f64)) return f64;
+                    // note: don't simplify inf/nan, as that causes equality semantic problems
+                    if (TryParseDouble(b, out f64) && !IsSpecialDouble(f64)) return f64;
                     break;
                 case StorageType.Double:
                     // is the double actually an integer?
@@ -952,6 +1014,8 @@ namespace StackExchange.Redis
             }
             return this;
         }
+
+        private static bool IsSpecialDouble(double d) => double.IsNaN(d) || double.IsInfinity(d);
 
         /// <summary>
         /// Convert to a signed <see cref="long"/> if possible.

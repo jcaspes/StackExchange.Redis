@@ -4,7 +4,7 @@ using System.Net;
 
 namespace StackExchange.Redis.KeyspaceIsolation
 {
-    internal sealed class KeyPrefixedDatabase : KeyPrefixed<IDatabase>, IDatabase
+    internal sealed partial class KeyPrefixedDatabase : KeyPrefixed<IDatabase>, IDatabase
     {
         public KeyPrefixedDatabase(IDatabase inner, byte[] prefix) : base(inner, prefix)
         {
@@ -80,6 +80,45 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public bool HashExists(RedisKey key, RedisValue hashField, CommandFlags flags = CommandFlags.None) =>
             Inner.HashExists(ToInner(key), hashField, flags);
+
+        public RedisValue HashFieldGetAndDelete(RedisKey key, RedisValue hashField, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndDelete(ToInner(key), hashField, flags);
+
+        public Lease<byte>? HashFieldGetLeaseAndDelete(RedisKey key, RedisValue hashField, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetLeaseAndDelete(ToInner(key), hashField, flags);
+
+        public RedisValue[] HashFieldGetAndDelete(RedisKey key, RedisValue[] hashFields, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndDelete(ToInner(key), hashFields, flags);
+
+        public RedisValue HashFieldGetAndSetExpiry(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndSetExpiry(ToInner(key), hashField, expiry, persist, flags);
+
+        public RedisValue HashFieldGetAndSetExpiry(RedisKey key, RedisValue hashField, DateTime expiry, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndSetExpiry(ToInner(key), hashField, expiry, flags);
+
+        public Lease<byte>? HashFieldGetLeaseAndSetExpiry(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetLeaseAndSetExpiry(ToInner(key), hashField, expiry, persist, flags);
+
+        public Lease<byte>? HashFieldGetLeaseAndSetExpiry(RedisKey key, RedisValue hashField, DateTime expiry, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetLeaseAndSetExpiry(ToInner(key), hashField, expiry, flags);
+
+        public RedisValue[] HashFieldGetAndSetExpiry(RedisKey key, RedisValue[] hashFields, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndSetExpiry(ToInner(key), hashFields, expiry, persist, flags);
+
+        public RedisValue[] HashFieldGetAndSetExpiry(RedisKey key, RedisValue[] hashFields, DateTime expiry, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldGetAndSetExpiry(ToInner(key), hashFields, expiry, flags);
+
+        public RedisValue HashFieldSetAndSetExpiry(RedisKey key, RedisValue field, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldSetAndSetExpiry(ToInner(key), field, value, expiry, keepTtl, when, flags);
+
+        public RedisValue HashFieldSetAndSetExpiry(RedisKey key, RedisValue field, RedisValue value, DateTime expiry, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldSetAndSetExpiry(ToInner(key), field, value, expiry, when, flags);
+
+        public RedisValue HashFieldSetAndSetExpiry(RedisKey key, HashEntry[] hashFields, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldSetAndSetExpiry(ToInner(key), hashFields, expiry, keepTtl, when, flags);
+
+        public RedisValue HashFieldSetAndSetExpiry(RedisKey key, HashEntry[] hashFields, DateTime expiry, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashFieldSetAndSetExpiry(ToInner(key), hashFields, expiry, when, flags);
 
         public ExpireResult[] HashFieldExpire(RedisKey key, RedisValue[] hashFields, TimeSpan expiry, ExpireWhen when = ExpireWhen.Always, CommandFlags flags = CommandFlags.None) =>
             Inner.HashFieldExpire(ToInner(key), hashFields, expiry, when, flags);
@@ -381,7 +420,7 @@ namespace StackExchange.Redis.KeyspaceIsolation
             Inner.SetContains(ToInner(key), values, flags);
 
         public long SetIntersectionLength(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None) =>
-            Inner.SetIntersectionLength(keys, limit, flags);
+            Inner.SetIntersectionLength(ToInner(keys), limit, flags);
 
         public long SetLength(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.SetLength(ToInner(key), flags);
@@ -435,10 +474,10 @@ namespace StackExchange.Redis.KeyspaceIsolation
             Inner.SortedSetAdd(ToInner(key), member, score, when, flags);
 
         public RedisValue[] SortedSetCombine(SetOperation operation, RedisKey[] keys, double[]? weights = null, Aggregate aggregate = Aggregate.Sum, CommandFlags flags = CommandFlags.None) =>
-            Inner.SortedSetCombine(operation, keys, weights, aggregate, flags);
+            Inner.SortedSetCombine(operation, ToInner(keys), weights, aggregate, flags);
 
         public SortedSetEntry[] SortedSetCombineWithScores(SetOperation operation, RedisKey[] keys, double[]? weights = null, Aggregate aggregate = Aggregate.Sum, CommandFlags flags = CommandFlags.None) =>
-            Inner.SortedSetCombineWithScores(operation, keys, weights, aggregate, flags);
+            Inner.SortedSetCombineWithScores(operation, ToInner(keys), weights, aggregate, flags);
 
         public long SortedSetCombineAndStore(SetOperation operation, RedisKey destination, RedisKey[] keys, double[]? weights = null, Aggregate aggregate = Aggregate.Sum, CommandFlags flags = CommandFlags.None) =>
             Inner.SortedSetCombineAndStore(operation, ToInner(destination), ToInner(keys), weights, aggregate, flags);
@@ -453,7 +492,7 @@ namespace StackExchange.Redis.KeyspaceIsolation
             Inner.SortedSetIncrement(ToInner(key), member, value, flags);
 
         public long SortedSetIntersectionLength(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None) =>
-            Inner.SortedSetIntersectionLength(keys, limit, flags);
+            Inner.SortedSetIntersectionLength(ToInner(keys), limit, flags);
 
         public long SortedSetLength(RedisKey key, double min = -1.0 / 0.0, double max = 1.0 / 0.0, Exclude exclude = Exclude.None, CommandFlags flags = CommandFlags.None) =>
             Inner.SortedSetLength(ToInner(key), min, max, exclude, flags);
@@ -546,11 +585,23 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public long StreamAcknowledge(RedisKey key, RedisValue groupName, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAcknowledge(ToInner(key), groupName, messageIds, flags);
 
-        public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId = null, int? maxLength = null, bool useApproximateMaxLength = false, CommandFlags flags = CommandFlags.None) =>
+        public StreamTrimResult StreamAcknowledgeAndDelete(RedisKey key, RedisValue groupName, StreamTrimMode mode, RedisValue messageId, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAcknowledgeAndDelete(ToInner(key), groupName, mode, messageId, flags);
+
+        public StreamTrimResult[] StreamAcknowledgeAndDelete(RedisKey key, RedisValue groupName, StreamTrimMode mode, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAcknowledgeAndDelete(ToInner(key), groupName, mode, messageIds, flags);
+
+        public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId, int? maxLength, bool useApproximateMaxLength, CommandFlags flags) =>
             Inner.StreamAdd(ToInner(key), streamField, streamValue, messageId, maxLength, useApproximateMaxLength, flags);
 
-        public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, int? maxLength = null, bool useApproximateMaxLength = false, CommandFlags flags = CommandFlags.None) =>
+        public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId, int? maxLength, bool useApproximateMaxLength, CommandFlags flags) =>
             Inner.StreamAdd(ToInner(key), streamPairs, messageId, maxLength, useApproximateMaxLength, flags);
+
+        public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAdd(ToInner(key), streamField, streamValue, messageId, maxLength, useApproximateMaxLength, limit, mode, flags);
+
+        public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAdd(ToInner(key), streamPairs, messageId, maxLength, useApproximateMaxLength, limit, mode, flags);
 
         public StreamAutoClaimResult StreamAutoClaim(RedisKey key, RedisValue consumerGroup, RedisValue claimingConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count = null, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAutoClaim(ToInner(key), consumerGroup, claimingConsumer, minIdleTimeInMs, startAtId, count, flags);
@@ -588,6 +639,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public long StreamDelete(RedisKey key, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamDelete(ToInner(key), messageIds, flags);
 
+        public StreamTrimResult[] StreamDelete(RedisKey key, RedisValue[] messageIds, StreamTrimMode mode, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamDelete(ToInner(key), messageIds, mode, flags);
+
         public long StreamDeleteConsumer(RedisKey key, RedisValue groupName, RedisValue consumerName, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamDeleteConsumer(ToInner(key), groupName, consumerName, flags);
 
@@ -597,8 +651,11 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public StreamPendingInfo StreamPending(RedisKey key, RedisValue groupName, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamPending(ToInner(key), groupName, flags);
 
-        public StreamPendingMessageInfo[] StreamPendingMessages(RedisKey key, RedisValue groupName, int count, RedisValue consumerName, RedisValue? minId = null, RedisValue? maxId = null, CommandFlags flags = CommandFlags.None) =>
+        public StreamPendingMessageInfo[] StreamPendingMessages(RedisKey key, RedisValue groupName, int count, RedisValue consumerName, RedisValue? minId, RedisValue? maxId, CommandFlags flags) =>
             Inner.StreamPendingMessages(ToInner(key), groupName, count, consumerName, minId, maxId, flags);
+
+        public StreamPendingMessageInfo[] StreamPendingMessages(RedisKey key, RedisValue groupName, int count, RedisValue consumerName, RedisValue? minId = null, RedisValue? maxId = null, long? minIdleTimeInMs = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamPendingMessages(ToInner(key), groupName, count, consumerName, minId, maxId, minIdleTimeInMs, flags);
 
         public StreamEntry[] StreamRange(RedisKey key, RedisValue? minId = null, RedisValue? maxId = null, int? count = null, Order messageOrder = Order.Ascending, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamRange(ToInner(key), minId, maxId, count, messageOrder, flags);
@@ -621,8 +678,14 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamReadGroup(streamPositions, groupName, consumerName, countPerStream, noAck, flags);
 
-        public long StreamTrim(RedisKey key, int maxLength, bool useApproximateMaxLength = false, CommandFlags flags = CommandFlags.None) =>
+        public long StreamTrim(RedisKey key, int maxLength, bool useApproximateMaxLength, CommandFlags flags) =>
             Inner.StreamTrim(ToInner(key), maxLength, useApproximateMaxLength, flags);
+
+        public long StreamTrim(RedisKey key, long maxLength, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamTrim(ToInner(key), maxLength, useApproximateMaxLength, limit, mode, flags);
+
+        public long StreamTrimByMinId(RedisKey key, RedisValue minId, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamTrimByMinId(ToInner(key), minId, useApproximateMaxLength, limit, mode, flags);
 
         public long StringAppend(RedisKey key, RedisValue value, CommandFlags flags = CommandFlags.None) =>
             Inner.StringAppend(ToInner(key), value, flags);

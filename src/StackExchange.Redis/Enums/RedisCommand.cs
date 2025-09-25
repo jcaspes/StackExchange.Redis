@@ -70,6 +70,8 @@ internal enum RedisCommand
     HEXPIREAT,
     HEXPIRETIME,
     HGET,
+    HGETEX,
+    HGETDEL,
     HGETALL,
     HINCRBY,
     HINCRBYFLOAT,
@@ -85,6 +87,7 @@ internal enum RedisCommand
     HRANDFIELD,
     HSCAN,
     HSET,
+    HSETEX,
     HSETNX,
     HSTRLEN,
     HVALS,
@@ -203,13 +206,28 @@ internal enum RedisCommand
     UNSUBSCRIBE,
     UNWATCH,
 
+    VADD,
+    VCARD,
+    VDIM,
+    VEMB,
+    VGETATTR,
+    VINFO,
+    VISMEMBER,
+    VLINKS,
+    VRANDMEMBER,
+    VREM,
+    VSETATTR,
+    VSIM,
+
     WATCH,
 
     XACK,
+    XACKDEL,
     XADD,
     XAUTOCLAIM,
     XCLAIM,
     XDEL,
+    XDELEX,
     XGROUP,
     XINFO,
     XLEN,
@@ -292,6 +310,8 @@ internal static class RedisCommandExtensions
             case RedisCommand.HDEL:
             case RedisCommand.HEXPIRE:
             case RedisCommand.HEXPIREAT:
+            case RedisCommand.HGETDEL:
+            case RedisCommand.HGETEX:
             case RedisCommand.HINCRBY:
             case RedisCommand.HINCRBYFLOAT:
             case RedisCommand.HMSET:
@@ -299,6 +319,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.HPEXPIRE:
             case RedisCommand.HPEXPIREAT:
             case RedisCommand.HSET:
+            case RedisCommand.HSETEX:
             case RedisCommand.HSETNX:
             case RedisCommand.INCR:
             case RedisCommand.INCRBY:
@@ -344,6 +365,9 @@ internal static class RedisCommandExtensions
             case RedisCommand.SWAPDB:
             case RedisCommand.TOUCH:
             case RedisCommand.UNLINK:
+            case RedisCommand.VADD:
+            case RedisCommand.VREM:
+            case RedisCommand.VSETATTR:
             case RedisCommand.XAUTOCLAIM:
             case RedisCommand.ZADD:
             case RedisCommand.ZDIFFSTORE:
@@ -491,14 +515,25 @@ internal static class RedisCommandExtensions
             case RedisCommand.ZSCORE:
             case RedisCommand.ZUNION:
             case RedisCommand.UNKNOWN:
+            case RedisCommand.VCARD:
+            case RedisCommand.VDIM:
+            case RedisCommand.VEMB:
+            case RedisCommand.VGETATTR:
+            case RedisCommand.VINFO:
+            case RedisCommand.VISMEMBER:
+            case RedisCommand.VLINKS:
+            case RedisCommand.VRANDMEMBER:
+            case RedisCommand.VSIM:
             // Writable commands, but allowed for the writable-replicas scenario
             case RedisCommand.COPY:
             case RedisCommand.GEOADD:
             case RedisCommand.SORT:
             case RedisCommand.XACK:
+            case RedisCommand.XACKDEL:
             case RedisCommand.XADD:
             case RedisCommand.XCLAIM:
             case RedisCommand.XDEL:
+            case RedisCommand.XDELEX:
             case RedisCommand.XGROUP:
             case RedisCommand.XREADGROUP:
             case RedisCommand.XTRIM:
