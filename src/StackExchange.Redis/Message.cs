@@ -34,7 +34,7 @@ namespace StackExchange.Redis
 
         public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => tail.GetHashSlot(serverSelectionStrategy);
 
-        protected override void WriteImpl(PhysicalConnection physical)
+        protected override void WriteImpl(IPhysicalConnection physical)
         {
             try
             {
@@ -596,7 +596,7 @@ namespace StackExchange.Redis
         internal void Cancel() => resultBox?.Cancel();
 
         // true if ready to be completed (i.e. false if re-issued to another server)
-        internal bool ComputeResult(PhysicalConnection connection, in RawResult result)
+        internal bool ComputeResult(IPhysicalConnection connection, in RawResult result)
         {
             var box = resultBox;
             try
@@ -618,7 +618,7 @@ namespace StackExchange.Redis
 
         internal void Fail(ConnectionFailureType failure, Exception? innerException, string? annotation, ConnectionMultiplexer? muxer)
         {
-            PhysicalConnection.IdentifyFailureType(innerException, ref failure);
+            PhysicalConnectionHelpers.IdentifyFailureType(innerException, ref failure);
             resultProcessor?.ConnectionFail(this, failure, innerException, annotation, muxer);
         }
 
@@ -638,7 +638,7 @@ namespace StackExchange.Redis
             return false;
         }
 
-        internal void SetEnqueued(PhysicalConnection? connection)
+        internal void SetEnqueued(IPhysicalConnection? connection)
         {
             SetWriteTime();
             performance?.SetEnqueued(connection?.BridgeCouldBeNull?.ConnectionType);
@@ -660,8 +660,8 @@ namespace StackExchange.Redis
         }
 
         internal bool TryGetPhysicalState(
-            out PhysicalConnection.WriteStatus ws,
-            out PhysicalConnection.ReadStatus rs,
+            out WriteStatus ws,
+            out ReadStatus rs,
             out long sentDelta,
             out long receivedDelta)
         {
@@ -678,8 +678,8 @@ namespace StackExchange.Redis
             }
             else
             {
-                ws = PhysicalConnection.WriteStatus.NA;
-                rs = PhysicalConnection.ReadStatus.NA;
+                ws = WriteStatus.NA;
+                rs = ReadStatus.NA;
                 return false;
             }
         }
@@ -689,7 +689,7 @@ namespace StackExchange.Redis
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void SetBacklogged() => Status = CommandStatus.WaitingInBacklog;
 
-        private PhysicalConnection? _enqueuedTo;
+        private IPhysicalConnection? _enqueuedTo;
         private long _queuedStampReceived, _queuedStampSent;
 
         internal void SetRequestSent()
@@ -770,9 +770,9 @@ namespace StackExchange.Redis
             this.resultProcessor = resultProcessor;
         }
 
-        protected abstract void WriteImpl(PhysicalConnection physical);
+        protected abstract void WriteImpl(IPhysicalConnection physical);
 
-        internal void WriteTo(PhysicalConnection physical)
+        internal void WriteTo(IPhysicalConnection physical)
         {
             try
             {
@@ -787,7 +787,7 @@ namespace StackExchange.Redis
 
         private static ReadOnlySpan<byte> ChecksumTemplate => "$4\r\nXXXX\r\n"u8;
 
-        internal void WriteHighIntegrityChecksumRequest(PhysicalConnection physical)
+        internal void WriteHighIntegrityChecksumRequest(IPhysicalConnection physical)
         {
             Debug.Assert(IsHighIntegrity, "should only be used for high-integrity");
             try
@@ -836,7 +836,7 @@ namespace StackExchange.Redis
                     return count;
                 }
             }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.WriteBulkString(_protocolVersion);
@@ -888,7 +888,7 @@ namespace StackExchange.Redis
         {
             public CommandChannelMessage(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel) : base(db, flags, command, channel)
             { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 1);
                 physical.Write(Channel);
@@ -905,7 +905,7 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.Write(Channel);
@@ -932,7 +932,7 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key2);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 3);
                 physical.Write(Key);
@@ -957,7 +957,7 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key1);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.Write(Key);
@@ -988,7 +988,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(command, keys.Length + 1);
                 physical.Write(Key);
@@ -1009,7 +1009,7 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 3);
                 physical.Write(Key);
@@ -1024,7 +1024,7 @@ namespace StackExchange.Redis
         {
             public CommandKeyMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key) : base(db, flags, command, key)
             { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 1);
                 physical.Write(Key);
@@ -1044,7 +1044,7 @@ namespace StackExchange.Redis
                 this.values = values;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(command, values.Length);
                 for (int i = 0; i < values.Length; i++)
@@ -1077,7 +1077,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(command, keys.Length);
                 for (int i = 0; i < keys.Length; i++)
@@ -1097,7 +1097,7 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.Write(Key);
@@ -1127,7 +1127,7 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key1);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, values.Length + 2);
                 physical.Write(Key);
@@ -1149,7 +1149,7 @@ namespace StackExchange.Redis
                 this.values = values;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, values.Length + 1);
                 physical.Write(Key);
@@ -1174,7 +1174,7 @@ namespace StackExchange.Redis
                 this.values = values;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, values.Length + 2);
                 physical.Write(Key);
@@ -1203,7 +1203,7 @@ namespace StackExchange.Redis
                 this.values = values;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, values.Length + 3);
                 physical.Write(Key);
@@ -1225,7 +1225,7 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 3);
                 physical.Write(Key);
@@ -1248,7 +1248,7 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 4);
                 physical.Write(Key);
@@ -1274,7 +1274,7 @@ namespace StackExchange.Redis
                 this.value3 = value3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 5);
                 physical.Write(Key);
@@ -1303,7 +1303,7 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 6);
                 physical.Write(Key);
@@ -1336,7 +1336,7 @@ namespace StackExchange.Redis
                 this.value5 = value5;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1372,7 +1372,7 @@ namespace StackExchange.Redis
                 this.value6 = value6;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1409,7 +1409,7 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1446,7 +1446,7 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1487,7 +1487,7 @@ namespace StackExchange.Redis
                 this.value3 = value3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1532,7 +1532,7 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1581,7 +1581,7 @@ namespace StackExchange.Redis
                 this.value5 = value5;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1634,7 +1634,7 @@ namespace StackExchange.Redis
                 this.value6 = value6;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, ArgCount);
                 physical.Write(Key);
@@ -1654,7 +1654,7 @@ namespace StackExchange.Redis
         private sealed class CommandMessage : Message
         {
             public CommandMessage(int db, CommandFlags flags, RedisCommand command) : base(db, flags, command) { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 0);
             }
@@ -1679,7 +1679,7 @@ namespace StackExchange.Redis
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => slot;
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(command, values.Length);
                 for (int i = 0; i < values.Length; i++)
@@ -1699,7 +1699,7 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.WriteBulkString(value);
@@ -1724,7 +1724,7 @@ namespace StackExchange.Redis
                 sb.Append(" (").Append((string?)value).Append(')');
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.WriteBulkString(value);
@@ -1742,7 +1742,7 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 1);
                 physical.WriteBulkString(value);
@@ -1761,7 +1761,7 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 2);
                 physical.WriteBulkString(value0);
@@ -1783,7 +1783,7 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 3);
                 physical.WriteBulkString(value0);
@@ -1810,7 +1810,7 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 5);
                 physical.WriteBulkString(value0);
@@ -1828,7 +1828,7 @@ namespace StackExchange.Redis
             {
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 physical.WriteHeader(Command, 1);
                 physical.WriteBulkString(Db);
@@ -1843,7 +1843,7 @@ namespace StackExchange.Redis
             public static UnknownMessage Instance { get; } = new();
             private UnknownMessage() : base(0, CommandFlags.None, RedisCommand.UNKNOWN) { }
             public override int ArgCount => 0;
-            protected override void WriteImpl(PhysicalConnection physical) => throw new InvalidOperationException("This message cannot be written");
+            protected override void WriteImpl(IPhysicalConnection physical) => throw new InvalidOperationException("This message cannot be written");
         }
     }
 }

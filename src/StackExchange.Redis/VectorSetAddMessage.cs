@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -60,9 +60,9 @@ internal abstract class VectorSetAddMessage(
     internal static void RestoreFp32() { }
 #endif
 
-    protected abstract void WriteElement(bool packed, PhysicalConnection physical);
+    protected abstract void WriteElement(bool packed, IPhysicalConnection physical);
 
-    protected override void WriteImpl(PhysicalConnection physical)
+    protected override void WriteImpl(IPhysicalConnection physical)
     {
         bool packed = UseFp32; // snapshot to avoid race in debug scenarios
         physical.WriteHeader(Command, GetArgCount(packed));
@@ -105,7 +105,7 @@ internal abstract class VectorSetAddMessage(
         }
     }
 
-    protected abstract void WriteAttributes(PhysicalConnection physical);
+    protected abstract void WriteAttributes(IPhysicalConnection physical);
 
     internal sealed class VectorSetAddMemberMessage(
         int db,
@@ -136,7 +136,7 @@ internal abstract class VectorSetAddMessage(
         public override int GetAttributeArgCount()
             => _attributesJson is null ? 0 : 2; // [SETATTR {attributes}]
 
-        protected override void WriteElement(bool packed, PhysicalConnection physical)
+        protected override void WriteElement(bool packed, IPhysicalConnection physical)
         {
             if (packed)
             {
@@ -156,7 +156,7 @@ internal abstract class VectorSetAddMessage(
             physical.WriteBulkString(element);
         }
 
-        protected override void WriteAttributes(PhysicalConnection physical)
+        protected override void WriteAttributes(IPhysicalConnection physical)
         {
             if (_attributesJson is not null)
             {

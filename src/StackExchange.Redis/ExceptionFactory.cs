@@ -28,7 +28,7 @@ namespace StackExchange.Redis
             => new RedisCommandException("This operation has been disabled in the command-map and cannot be used: " + command);
 
         internal static Exception TooManyArgs(string command, int argCount)
-            => new RedisCommandException($"This operation would involve too many arguments ({argCount + 1} vs the redis limit of {PhysicalConnection.REDIS_MAX_ARGS}): {command}");
+            => new RedisCommandException($"This operation would involve too many arguments ({argCount + 1} vs the redis limit of {PhysicalConnectionHelpers.REDIS_MAX_ARGS}): {command}");
 
         internal static Exception ConnectionFailure(bool includeDetail, ConnectionFailureType failureType, string message, ServerEndPoint? server)
         {
@@ -328,8 +328,8 @@ namespace StackExchange.Redis
 
                 switch (bs.Connection.ReadStatus)
                 {
-                    case PhysicalConnection.ReadStatus.CompletePendingMessageAsync:
-                    case PhysicalConnection.ReadStatus.CompletePendingMessageSync:
+                    case ReadStatus.CompletePendingMessageAsync:
+                    case ReadStatus.CompletePendingMessageSync:
                         sb.Append(" ** possible thread-theft indicated; see https://stackexchange.github.io/StackExchange.Redis/ThreadTheft ** ");
                         break;
                 }
@@ -338,8 +338,8 @@ namespace StackExchange.Redis
                 Add(data, sb, "Queue-Awaiting-Response", "qs", bs.Connection.MessagesSentAwaitingResponse.ToString());
                 Add(data, sb, "Active-Writer", "aw", bs.IsWriterActive.ToString());
                 Add(data, sb, "Backlog-Writer", "bw", bs.BacklogStatus.ToString());
-                if (bs.Connection.ReadStatus != PhysicalConnection.ReadStatus.NA) Add(data, sb, "Read-State", "rs", bs.Connection.ReadStatus.ToString());
-                if (bs.Connection.WriteStatus != PhysicalConnection.WriteStatus.NA) Add(data, sb, "Write-State", "ws", bs.Connection.WriteStatus.ToString());
+                if (bs.Connection.ReadStatus != ReadStatus.NA) Add(data, sb, "Read-State", "rs", bs.Connection.ReadStatus.ToString());
+                if (bs.Connection.WriteStatus != WriteStatus.NA) Add(data, sb, "Write-State", "ws", bs.Connection.WriteStatus.ToString());
 
                 if (bs.Connection.BytesAvailableOnSocket >= 0) Add(data, sb, "Inbound-Bytes", "in", bs.Connection.BytesAvailableOnSocket.ToString());
                 if (bs.Connection.BytesInReadPipe >= 0) Add(data, sb, "Inbound-Pipe-Bytes", "in-pipe", bs.Connection.BytesInReadPipe.ToString());

@@ -127,7 +127,7 @@ namespace StackExchange.Redis
                             // people can do very naughty things in an EVAL
                             // including change the DB; change it back to what we
                             // think it should be!
-                            var sel = PhysicalConnection.GetSelectDatabaseCommand(message.Db);
+                            var sel = PhysicalConnectionHelpers.GetSelectDatabaseCommand(message.Db);
                             queued = new QueuedMessage(sel);
                             wasQueued = SimpleResultBox<bool>.Create();
                             queued.SetSource(wasQueued, QueuedProcessor.Default);
@@ -186,7 +186,7 @@ namespace StackExchange.Redis
                 set => wasQueued = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(IPhysicalConnection physical)
             {
                 Wrapped.WriteTo(physical);
                 Wrapped.SetRequestSent();
@@ -201,7 +201,7 @@ namespace StackExchange.Redis
         {
             public static readonly ResultProcessor<bool> Default = new QueuedProcessor();
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(IPhysicalConnection connection, Message message, in RawResult result)
             {
                 if (result.Resp2TypeBulkString == ResultType.SimpleString && result.IsEqual(CommonReplies.QUEUED))
                 {
@@ -272,7 +272,7 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            public IEnumerable<Message> GetMessages(PhysicalConnection connection)
+            public IEnumerable<Message> GetMessages(IPhysicalConnection connection)
             {
                 IResultBox? lastBox = null;
                 var bridge = connection.BridgeCouldBeNull ?? throw new ObjectDisposedException(connection.ToString());
@@ -441,7 +441,7 @@ namespace StackExchange.Redis
                 }
             }
 
-            protected override void WriteImpl(PhysicalConnection physical) => physical.WriteHeader(Command, 0);
+            protected override void WriteImpl(IPhysicalConnection physical) => physical.WriteHeader(Command, 0);
 
             public override int ArgCount => 0;
 
@@ -469,7 +469,7 @@ namespace StackExchange.Redis
         {
             public static readonly TransactionProcessor Default = new();
 
-            public override bool SetResult(PhysicalConnection connection, Message message, in RawResult result)
+            public override bool SetResult(IPhysicalConnection connection, Message message, in RawResult result)
             {
                 if (result.IsError && message is TransactionMessage tran)
                 {
@@ -484,7 +484,7 @@ namespace StackExchange.Redis
                 return base.SetResult(connection, message, result);
             }
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(IPhysicalConnection connection, Message message, in RawResult result)
             {
                 var muxer = connection.BridgeCouldBeNull?.Multiplexer;
                 muxer?.OnTransactionLog($"got {result} for {message.CommandAndKey}");
