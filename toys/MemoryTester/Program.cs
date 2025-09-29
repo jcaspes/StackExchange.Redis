@@ -65,6 +65,7 @@ namespace MemoryTester
                 AbortOnConnectFail = true,
                 SyncTimeout = 5000,
                 HighIntegrity = highIntegrity,
+                CommandMap = CommandMap.Create(new Dictionary<string, string> { { "SUBSCRIBE", string.Empty } }),
             };
 
             Console.WriteLine(configuration);
