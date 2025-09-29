@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO.Pipelines;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
@@ -10,6 +11,8 @@ namespace StackExchange.Redis
 {
     internal interface IPhysicalConnection : IDisposable
     {
+        Socket? VolatileSocket { get; }
+
         byte[]? ChannelPrefix { get; }
 
         bool MultiDatabasesOverride { get; set; }
@@ -28,7 +31,7 @@ namespace StackExchange.Redis
         Task FlushAsync();
         ConnectionStatus GetStatus();
         void RecordConnectionFailed(ConnectionFailureType failureType, Exception? innerException = null, [CallerMemberName] string? origin = null, bool isInitialConnect = false, IDuplexPipe? connectingPipe = null);
-        void SetWriteStatus(WriteStatus flushed);
+        void SetWriteStatus(WriteStatus status);
         void UpdateLastWriteTime();
         void OnInternalError(Exception exception, [CallerMemberName] string? origin = null);
         void WriteHeader(RedisCommand command, int arguments, CommandBytes commandBytes = default);

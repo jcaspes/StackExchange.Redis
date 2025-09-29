@@ -308,7 +308,7 @@ namespace StackExchange.Redis
 
         internal static readonly CommandBytes message = "message", pmessage = "pmessage", smessage = "smessage";
 
-        internal static readonly Message[] ReusableChangeDatabaseCommands = Enumerable.Range(0, PhysicalConnectionHelpers.DefaultRedisDatabaseCount).Select(
+        internal static readonly Message[] ReusableChangeDatabaseCommands = Enumerable.Range(0, DefaultRedisDatabaseCount).Select(
             i => Message.Create(i, CommandFlags.FireAndForget, RedisCommand.SELECT)).ToArray();
 
         internal static readonly Message
@@ -445,7 +445,7 @@ namespace StackExchange.Redis
                 else
                 {
                     // use an encoder in a loop
-                    var encoder = PhysicalConnectionHelpers.GetPerThreadEncoder();
+                    var encoder = GetPerThreadEncoder();
                     int charsRemaining = value.Length, charOffset = 0;
                     totalBytes = 0;
 
@@ -481,18 +481,18 @@ namespace StackExchange.Redis
         {
             span[offset++] = (byte)'$';
             int len = value.Length;
-            offset = PhysicalConnectionHelpers.WriteRaw(span, len, offset: offset);
+            offset = WriteRaw(span, len, offset: offset);
             value.CopyTo(span.Slice(offset, len));
             offset += value.Length;
-            return PhysicalConnectionHelpers.WriteCrlf(span, offset);
+            return WriteCrlf(span, offset);
         }
 
         private static int AppendToSpan(Span<byte> span, ReadOnlySpan<byte> value, int offset = 0)
         {
-            offset = PhysicalConnectionHelpers.WriteRaw(span, value.Length, offset: offset);
+            offset = WriteRaw(span, value.Length, offset: offset);
             value.CopyTo(span.Slice(offset, value.Length));
             offset += value.Length;
-            return PhysicalConnectionHelpers.WriteCrlf(span, offset);
+            return WriteCrlf(span, offset);
         }
 
         internal static void IdentifyFailureType(Exception? exception, ref ConnectionFailureType failureType)
@@ -550,12 +550,12 @@ namespace StackExchange.Redis
                 {
                     var span = writer.GetSpan(3 + Format.MaxInt32TextLen);
                     span[0] = (byte)'$';
-                    int bytes = PhysicalConnectionHelpers.WriteRaw(span, totalLength, offset: 1);
+                    int bytes = WriteRaw(span, totalLength, offset: 1);
                     writer.Advance(bytes);
 
                     if (prefixLength != 0) writer.Write(prefix);
-                    if (encodedLength != 0) PhysicalConnectionHelpers.WriteRaw(writer, value, encodedLength);
-                    PhysicalConnectionHelpers.WriteCrlf(writer);
+                    if (encodedLength != 0) WriteRaw(writer, value, encodedLength);
+                    WriteCrlf(writer);
                 }
             }
         }
@@ -579,14 +579,14 @@ namespace StackExchange.Redis
             {
                 var span = writer.GetSpan(3 + Format.MaxInt32TextLen); // note even with 2 max-len, we're still in same text range
                 span[0] = (byte)'$';
-                int bytes = PhysicalConnectionHelpers.WriteRaw(span, prefix.LongLength + value.LongLength, offset: 1);
+                int bytes = WriteRaw(span, prefix.LongLength + value.LongLength, offset: 1);
                 writer.Advance(bytes);
 
                 writer.Write(prefix);
                 writer.Write(value);
 
                 span = writer.GetSpan(2);
-                PhysicalConnectionHelpers.WriteCrlf(span, 0);
+                WriteCrlf(span, 0);
                 writer.Advance(2);
             }
         }
@@ -601,7 +601,7 @@ namespace StackExchange.Redis
             var span = writer.GetSpan(5 + Format.MaxInt32TextLen + Format.MaxInt64TextLen);
 
             span[0] = (byte)'$';
-            var bytes = PhysicalConnectionHelpers.WriteRaw(span, value, withLengthPrefix: true, offset: 1);
+            var bytes = WriteRaw(span, value, withLengthPrefix: true, offset: 1);
             writer.Advance(bytes);
         }
 
@@ -617,10 +617,10 @@ namespace StackExchange.Redis
             Span<byte> valueSpan = stackalloc byte[Format.MaxInt64TextLen];
             var len = Format.FormatUInt64(value, valueSpan);
             span[0] = (byte)'$';
-            int offset = PhysicalConnectionHelpers.WriteRaw(span, len, withLengthPrefix: false, offset: 1);
+            int offset = WriteRaw(span, len, withLengthPrefix: false, offset: 1);
             valueSpan.Slice(0, len).CopyTo(span.Slice(offset));
             offset += len;
-            offset = PhysicalConnectionHelpers.WriteCrlf(span, offset);
+            offset = WriteCrlf(span, offset);
             writer.Advance(offset);
         }
         internal static void WriteInteger(PipeWriter writer, long value)
@@ -630,7 +630,7 @@ namespace StackExchange.Redis
             var span = writer.GetSpan(3 + Format.MaxInt64TextLen);
 
             span[0] = (byte)':';
-            var bytes = PhysicalConnectionHelpers.WriteRaw(span, value, withLengthPrefix: false, offset: 1);
+            var bytes = WriteRaw(span, value, withLengthPrefix: false, offset: 1);
             writer.Advance(bytes);
         }
         internal static void WriteUnifiedBlob(PipeWriter writer, byte[]? value)
@@ -668,12 +668,12 @@ namespace StackExchange.Redis
                 // too big to guarantee can do in a single span
                 var span = writer.GetSpan(3 + Format.MaxInt32TextLen);
                 span[0] = (byte)'$';
-                int bytes = PhysicalConnectionHelpers.WriteRaw(span, value.Length, offset: 1);
+                int bytes = WriteRaw(span, value.Length, offset: 1);
                 writer.Advance(bytes);
 
                 writer.Write(value);
 
-                PhysicalConnectionHelpers.WriteCrlf(writer);
+                WriteCrlf(writer);
             }
         }
 
@@ -696,6 +696,37 @@ namespace StackExchange.Redis
             // fallback: drop to string
             WriteUnifiedPrefixedString(writer, null, Format.ToString(value));
 #endif
+        }
+        public static void WriteBulkString(in RedisValue value, PipeWriter? maybeNullWriter)
+        {
+            if (maybeNullWriter is not PipeWriter writer)
+            {
+                return; // Prevent null refs during disposal
+            }
+
+            switch (value.Type)
+            {
+                case RedisValue.StorageType.Null:
+                    WriteUnifiedBlob(writer, (byte[]?)null);
+                    break;
+                case RedisValue.StorageType.Int64:
+                    WriteUnifiedInt64(writer, value.OverlappedValueInt64);
+                    break;
+                case RedisValue.StorageType.UInt64:
+                    WriteUnifiedUInt64(writer, value.OverlappedValueUInt64);
+                    break;
+                case RedisValue.StorageType.Double:
+                    WriteUnifiedDouble(writer, value.OverlappedValueDouble);
+                    break;
+                case RedisValue.StorageType.String:
+                    WriteUnifiedPrefixedString(writer, null, (string?)value);
+                    break;
+                case RedisValue.StorageType.Raw:
+                    WriteUnifiedSpan(writer, ((ReadOnlyMemory<byte>)value).Span);
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unexpected {value.Type} value: '{value}'");
+            }
         }
     }
 }

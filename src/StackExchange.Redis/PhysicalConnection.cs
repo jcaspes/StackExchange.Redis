@@ -74,7 +74,7 @@ namespace StackExchange.Redis
         public bool HasOutputPipe => _ioPipe?.Output != null;
 
         private Socket? _socket;
-        internal Socket? VolatileSocket => Volatile.Read(ref _socket);
+        public Socket? VolatileSocket => Volatile.Read(ref _socket);
 
         public PhysicalConnection(PhysicalBridge bridge)
         {
@@ -383,7 +383,7 @@ namespace StackExchange.Redis
         {
             bool weAskedForThis;
             Exception? outerException = innerException;
-            IdentifyFailureType(innerException, ref failureType);
+            PhysicalConnectionHelpers.IdentifyFailureType(innerException, ref failureType);
             var bridge = BridgeCouldBeNull;
             Message? nextMessage;
 
@@ -564,25 +564,6 @@ namespace StackExchange.Redis
         /// <summary>Returns a string that represents the current object.</summary>
         /// <returns>A string that represents the current object.</returns>
         public override string ToString() => $"{_physicalName} ({_writeStatus})";
-
-        internal static void IdentifyFailureType(Exception? exception, ref ConnectionFailureType failureType)
-        {
-            if (exception != null && failureType == ConnectionFailureType.InternalFailure)
-            {
-                if (exception is AggregateException)
-                {
-                    exception = exception.InnerException ?? exception;
-                }
-
-                failureType = exception switch
-                {
-                    AuthenticationException => ConnectionFailureType.AuthenticationFailure,
-                    EndOfStreamException or ObjectDisposedException => ConnectionFailureType.SocketClosed,
-                    SocketException or IOException => ConnectionFailureType.SocketFailure,
-                    _ => failureType,
-                };
-            }
-        }
 
         public void EnqueueInsideWriteLock(Message next)
         {
@@ -802,38 +783,7 @@ namespace StackExchange.Redis
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void WriteBulkString(in RedisValue value)
-            => WriteBulkString(value, _ioPipe?.Output);
-        public static void WriteBulkString(in RedisValue value, PipeWriter? maybeNullWriter)
-        {
-            if (maybeNullWriter is not PipeWriter writer)
-            {
-                return; // Prevent null refs during disposal
-            }
-
-            switch (value.Type)
-            {
-                case RedisValue.StorageType.Null:
-                    PhysicalConnectionHelpers.WriteUnifiedBlob(writer, (byte[]?)null);
-                    break;
-                case RedisValue.StorageType.Int64:
-                    PhysicalConnectionHelpers.WriteUnifiedInt64(writer, value.OverlappedValueInt64);
-                    break;
-                case RedisValue.StorageType.UInt64:
-                    PhysicalConnectionHelpers.WriteUnifiedUInt64(writer, value.OverlappedValueUInt64);
-                    break;
-                case RedisValue.StorageType.Double:
-                    PhysicalConnectionHelpers.WriteUnifiedDouble(writer, value.OverlappedValueDouble);
-                    break;
-                case RedisValue.StorageType.String:
-                    PhysicalConnectionHelpers.WriteUnifiedPrefixedString(writer, null, (string?)value);
-                    break;
-                case RedisValue.StorageType.Raw:
-                    PhysicalConnectionHelpers.WriteUnifiedSpan(writer, ((ReadOnlyMemory<byte>)value).Span);
-                    break;
-                default:
-                    throw new InvalidOperationException($"Unexpected {value.Type} value: '{value}'");
-            }
-        }
+            => PhysicalConnectionHelpers.WriteBulkString(value, _ioPipe?.Output);
 
         public void WriteBulkString(ReadOnlySpan<byte> value)
         {
@@ -1043,7 +993,7 @@ namespace StackExchange.Redis
             };
         }
 
-        internal async ValueTask<bool> ConnectedAsync(Socket? socket, ILogger? log, SocketManager manager)
+        private async ValueTask<bool> ConnectedAsync(Socket? socket, ILogger? log, SocketManager manager)
         {
             var bridge = BridgeCouldBeNull;
             if (bridge == null) return false;
@@ -1389,7 +1339,7 @@ namespace StackExchange.Redis
 
         partial void OnWrapForLogging(ref IDuplexPipe pipe, string name, SocketManager mgr);
 
-        internal void UpdateLastReadTime() => Interlocked.Exchange(ref lastReadTickCount, Environment.TickCount);
+        private void UpdateLastReadTime() => Interlocked.Exchange(ref lastReadTickCount, Environment.TickCount);
         private async Task ReadFromPipe()
         {
             bool allowSyncRead = true, isReading = false;
@@ -1510,7 +1460,7 @@ namespace StackExchange.Redis
         private volatile ReadStatus _readStatus;
         public ReadStatus GetReadStatus() => _readStatus;
 
-        internal void StartReading() => ReadFromPipe().RedisFireAndForget();
+        private void StartReading() => ReadFromPipe().RedisFireAndForget();
 
         public bool HasPendingCallerFacingItems()
         {
