@@ -1,25 +1,30 @@
 ﻿using System;
-using System.Buffers;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.IO.Pipelines;
-using System.Runtime.CompilerServices;
-using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
 
 namespace StackExchange.Redis
 {
     internal class DebugException : Exception
     {
-        public DebugException() : base()
+        public DebugException(string identifier, int currentconnectionIndex) : base()
         {
-            Console.WriteLine($"DebugException: {Environment.StackTrace.ToString()}");
+            try
+            {
+                Console.WriteLine($"Trace(Th:{identifier}:Cx{currentconnectionIndex}) DebugException: {Environment.StackTrace.ToString()}");
+            }
+            catch (OutOfMemoryException)
+            {
+                // we don't want to perturbate test is an outofmemory exception occure here
+            }
         }
-        public DebugException(string message) : base()
+        public DebugException(string identifier, int currentconnectionIndex, string message) : base()
         {
-            Console.WriteLine($"DebugException '{message}': {Environment.StackTrace.ToString()}");
+            try
+            {
+                Console.WriteLine($"Trace(Th:{identifier}:Cx{currentconnectionIndex}) DebugException '{message}': {Environment.StackTrace.ToString()}");
+            }
+            catch (OutOfMemoryException)
+            {
+                // we don't want to perturbate test is an outofmemory exception occure here
+            }
         }
     }
 }
