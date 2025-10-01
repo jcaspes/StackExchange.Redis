@@ -1,6 +1,11 @@
-﻿using System.Buffers;
+﻿using System;
+using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Pipelines.Sockets.Unofficial.Arenas;
 
 namespace StackExchange.Redis
 {
@@ -11,6 +16,7 @@ namespace StackExchange.Redis
         internal List<RedisValue> values = new List<RedisValue>();
         internal RedisKey key;
         internal bool simulated = false;
+        private static readonly ConcurrentDictionary<string, string> _hashStorage = new ConcurrentDictionary<string, string>();
 
         internal ReadStatus SimulateCompleteMessage(IPhysicalConnection connection)
         {
@@ -38,10 +44,75 @@ namespace StackExchange.Redis
                 RedisCommand.INFO => CreateINFOStringResult(),
                 RedisCommand.CLUSTER => CreateSimpleStringResult("ERR This instance has cluster support disabled"),
                 RedisCommand.GET => CreateSimpleGETResult(),
-                RedisCommand.ECHO => CreateSimpleStringResult(values[0]!),
+                RedisCommand.ECHO => CreateEchoResult(values[0]!),
                 RedisCommand.SUBSCRIBE => CreateSimpleStringResult("__Booksleeve_MasterChanged"),
+                RedisCommand.PING => CreateSimpleStringResult("PONG"),
+                RedisCommand.SCAN => CreateScanResult(),
+                RedisCommand.HMSET => CreateHMSETResult(),
+                RedisCommand.EXPIRE => CreateSimpleIntegerResult(1),
+                RedisCommand.HGETALL => CreateHGetHALLResult(),
                 _ => throw new DebugException($"No simulation for command {header.command}"),
             };
+        }
+
+        private RawResult CreateHMSETResult()
+        {
+            if (values.Count % 2 != 0)
+            {
+                throw new DebugException("HMSET requires an even number of values");
+            }
+
+            for (int i = 0; i < values.Count; i += 2)
+            {
+                string dictKey = GetDictKeyForHset(values[i]!);
+                _hashStorage.TryAdd(dictKey, values[i + 1]!);
+            }
+
+            return CreateSimpleStringResult("OK");
+        }
+
+        private string GetDictKeyForHset(string value) => $"{key}|{value}";
+
+        private RawResult CreateSimpleIntegerResult(long value)
+        {
+            ReadOnlySequence<byte> readOnlySequenceBytes = new ReadOnlySequence<byte>(Encoding.UTF8.GetBytes(value.ToString()));
+            RawResult result = new RawResult(ResultType.Integer, readOnlySequenceBytes, RawResult.ResultFlags.None);
+            return result;
+        }
+
+        private RawResult CreateScanResult(string cursor, List<string> elements)
+        {
+            Sequence<RawResult> seq;
+            {
+                var array = new RawResult[2];
+                {
+                    array[0] = CreateSimpleStringResult(cursor);
+                }
+                {
+                    var itemsSeq = new Sequence<RawResult>(new RawResult[0]);
+                    array[1] = new RawResult(ResultType.Array, itemsSeq, RawResult.ResultFlags.None);
+                }
+                seq = new Sequence<RawResult>(array);
+            }
+
+            RawResult result = new RawResult(ResultType.Array, seq, RawResult.ResultFlags.None);
+            return result;
+        }
+
+        private RawResult CreateScanResult()
+        {
+            if (values[2] == "MemoryTester:*")
+            {
+                return CreateScanResult("0", new List<string> { "MemoryTester:1" });
+            }
+            throw new DebugException($"No simulation for SCAN with args {string.Join(", ", values)}");
+        }
+
+        private RawResult CreateEchoResult(RedisValue value)
+        {
+            ReadOnlySequence<byte> readOnlySequenceBytes = new ReadOnlySequence<byte>((byte[])value.DirectObject!);
+            RawResult result = new RawResult(ResultType.BulkString, readOnlySequenceBytes, RawResult.ResultFlags.None);
+            return result;
         }
 
         private RawResult CreateSimpleStringResult(string wantedResultString)
@@ -132,6 +203,25 @@ io_threads_active:0";
                 throw new DebugException($"No simulation for INFO {values[0]}");
             }
             return CreateSimpleStringResult(wantedResultString);
+        }
+
+        private RawResult CreateHGetHALLResult()
+        {
+            // Simulate HGETALL by returning all key-value pairs for the given hash key
+            var results = new List<RawResult>();
+            string prefix = $"{key}|";
+            foreach (var kvp in _hashStorage)
+            {
+                if (kvp.Key.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    // Extract the field name from the composite key
+                    string field = kvp.Key.Substring(prefix.Length);
+                    results.Add(CreateSimpleStringResult(field));
+                    results.Add(CreateSimpleStringResult(kvp.Value));
+                }
+            }
+            var seq = new Sequence<RawResult>(results.ToArray());
+            return new RawResult(ResultType.Array, seq, RawResult.ResultFlags.None);
         }
     }
 }
