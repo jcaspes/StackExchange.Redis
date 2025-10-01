@@ -22,7 +22,18 @@ namespace StackExchange.Redis
         private int currentconnectionIndex;
         private readonly ConcurrentDictionary<string, MessageSimulator> _simulatedConnection = new ConcurrentDictionary<string, MessageSimulator>();
 
-        private string Identifier => Thread.CurrentThread.Name!;
+        private string Identifier
+        {
+            get
+            {
+                string identifier = Thread.CurrentThread.Name!;
+                if (string.IsNullOrEmpty(identifier))
+                {
+                    identifier = $"Th{Thread.CurrentThread.ManagedThreadId}";
+                }
+                return identifier;
+            }
+        }
 
         public Socket? VolatileSocket => throw new DebugException();
 
