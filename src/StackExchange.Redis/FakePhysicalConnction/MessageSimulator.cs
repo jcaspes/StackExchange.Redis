@@ -80,7 +80,7 @@ namespace StackExchange.Redis
         private RawResult CreateSimpleIntegerResult(long value)
         {
             ReadOnlySequence<byte> readOnlySequenceBytes = new ReadOnlySequence<byte>(Encoding.UTF8.GetBytes(value.ToString()));
-            RawResult result = new RawResult(ResultType.Integer, readOnlySequenceBytes, RawResult.ResultFlags.None);
+            RawResult result = new RawResult(ResultType.Integer, readOnlySequenceBytes, RawResult.ResultFlags.HasValue | RawResult.ResultFlags.NonNull);
             return result;
         }
 
@@ -115,14 +115,14 @@ namespace StackExchange.Redis
         private RawResult CreateEchoResult(RedisValue value)
         {
             ReadOnlySequence<byte> readOnlySequenceBytes = new ReadOnlySequence<byte>((byte[])value.DirectObject!);
-            RawResult result = new RawResult(ResultType.BulkString, readOnlySequenceBytes, RawResult.ResultFlags.None);
+            RawResult result = new RawResult(ResultType.BulkString, readOnlySequenceBytes, RawResult.ResultFlags.HasValue | RawResult.ResultFlags.NonNull);
             return result;
         }
 
         private RawResult CreateSimpleStringResult(string wantedResultString)
         {
             ReadOnlySequence<byte> readOnlySequenceBytes = new ReadOnlySequence<byte>(Encoding.UTF8.GetBytes(wantedResultString));
-            RawResult result = new RawResult(ResultType.SimpleString, readOnlySequenceBytes, RawResult.ResultFlags.None);
+            RawResult result = new RawResult(ResultType.SimpleString, readOnlySequenceBytes, RawResult.ResultFlags.HasValue | RawResult.ResultFlags.NonNull);
             return result;
         }
 
@@ -225,7 +225,7 @@ io_threads_active:0";
                 }
             }
             var seq = new Sequence<RawResult>(results.ToArray());
-            return new RawResult(ResultType.Array, seq, RawResult.ResultFlags.None);
+            return new RawResult(ResultType.Array, seq, RawResult.ResultFlags.HasValue | RawResult.ResultFlags.NonNull);
         }
     }
 }
