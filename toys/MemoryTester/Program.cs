@@ -96,6 +96,8 @@ namespace MemoryTester
 
             IDatabase redisDbForClean = connection.GetDatabase();
             IEnumerable<RedisKey> resultKeysEnumerable;
+            TimeSpan duration = redisDbForClean.Ping();
+            Threads.TraceConsole($"Ping duration {duration.TotalMilliseconds} ms");
 
             if (cleanPreviousRun)
             {
