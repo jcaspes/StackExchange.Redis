@@ -66,6 +66,7 @@ namespace MemoryTester
                 SyncTimeout = 5000,
                 HighIntegrity = highIntegrity,
                 CommandMap = CommandMap.Create(new Dictionary<string, string> { { "SUBSCRIBE", string.Empty } }),
+                HeartbeatInterval = TimeSpan.FromHours(24), // so no heartbeat
             };
 
             Console.WriteLine(configuration);
