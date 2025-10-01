@@ -21,6 +21,7 @@ namespace StackExchange.Redis
         private static int connectionIndex = 0;
         private int currentconnectionIndex;
         private readonly ConcurrentDictionary<string, MessageSimulator> _simulatedConnection = new ConcurrentDictionary<string, MessageSimulator>();
+        private int lastWriteTickCount, lastReadTickCount;
 
         private string Identifier
         {
@@ -41,9 +42,9 @@ namespace StackExchange.Redis
 
         public PhysicalBridge? BridgeCouldBeNull => _physicalBridge;
 
-        public long LastReadSecondsAgo => throw new DebugException();
-
-        public long LastWriteSecondsAgo => throw new DebugException();
+        public long LastReadSecondsAgo => unchecked(Environment.TickCount - Thread.VolatileRead(ref lastReadTickCount)) / 1000;
+        public long LastWriteSecondsAgo => unchecked(Environment.TickCount - Thread.VolatileRead(ref lastWriteTickCount)) / 1000;
+        public void UpdateLastWriteTime() => Interlocked.Exchange(ref lastWriteTickCount, Environment.TickCount);
 
         public RedisProtocol? Protocol => _redisProtocol;
 
@@ -114,14 +115,40 @@ namespace StackExchange.Redis
             }
         }
 
-        public WriteResult FlushSync(bool throwOnFailure, int millisecondsTimeout) => throw new DebugException();
+        public WriteResult FlushSync(bool throwOnFailure, int millisecondsTimeout)
+        {
+            Trace("FlushSyncValueTask");
+            if (_simulatedConnection.TryGetValue(Identifier, out MessageSimulator? im))
+            {
+                _readStatus = im.SimulateCompleteMessage(this);
+                return WriteResult.Success;
+            }
+            else
+            {
+                throw new DebugException("No message queued for this thread");
+            }
+        }
+
         public void GetBytes(out long sent, out long received)
         {
             sent = received = 0;
             Trace($"GetBytes s{sent}r{received}");
         }
         public void GetCounters(ConnectionCounters counters) => throw new DebugException();
-        public void GetHeadMessages(out Message? now, out Message? next) => throw new DebugException();
+        public void GetHeadMessages(out Message? now, out Message? next)
+        {
+            next = now = null;
+            if (_simulatedConnection.TryGetValue(Identifier, out MessageSimulator? im))
+            {
+                Trace($"GetHeadMessages {im.header!.command}");
+                now = im.message;
+            }
+            else
+            {
+                throw new DebugException("No message queued for this thread");
+            }
+        }
+
         public Message? GetReadModeCommand(bool isPrimaryOnly)
         {
             Trace($"GetReadModeCommand");
@@ -158,8 +185,11 @@ namespace StackExchange.Redis
         public WriteStatus GetWriteStatus() => _writeStatus;
         public bool HasPendingCallerFacingItems() => throw new DebugException();
 
-        public int OnBridgeHeartbeat() => throw new DebugException();
-        public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null) => throw new DebugException();
+        public int OnBridgeHeartbeat()
+        {
+            return 0;
+        }
+        public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null) => throw new DebugException(exception.Message);
         public void RecordConnectionFailed(ConnectionFailureType failureType, Exception? innerException = null, [CallerMemberName] string? origin = null, bool isInitialConnect = false, IDuplexPipe? connectingPipe = null)
         {
             // OKfailed
