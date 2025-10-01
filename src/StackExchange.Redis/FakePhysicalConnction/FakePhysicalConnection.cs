@@ -14,7 +14,6 @@ namespace StackExchange.Redis
     internal class FakePhysicalConnection : IDisposable, IPhysicalConnection
     {
         private readonly PhysicalBridge _physicalBridge;
-        private int _currentDataBase = 0;
         private RedisProtocol _redisProtocol;
         private WriteStatus _writeStatus = WriteStatus.NA;
         private ReadStatus _readStatus = ReadStatus.NA;
@@ -36,7 +35,7 @@ namespace StackExchange.Redis
             }
         }
 
-        public Socket? VolatileSocket => throw new DebugException();
+        public Socket? VolatileSocket => throw new DebugException(Identifier, currentconnectionIndex);
 
         public FakePhysicalConnection(PhysicalBridge physicalBridge) => _physicalBridge = physicalBridge;
 
@@ -48,15 +47,22 @@ namespace StackExchange.Redis
 
         public RedisProtocol? Protocol => _redisProtocol;
 
-        public long SubscriptionCount { get => throw new DebugException(); set => throw new DebugException(); }
+        public long SubscriptionCount { get => throw new DebugException(Identifier, currentconnectionIndex); set => throw new DebugException(Identifier, currentconnectionIndex); }
         public bool TransactionActive { get; set; }
-        public long? ConnectionId { get => throw new DebugException(); set => throw new DebugException(); }
+        public long? ConnectionId { get => throw new DebugException(Identifier, currentconnectionIndex); set => throw new DebugException(Identifier, currentconnectionIndex); }
 
-        public bool HasOutputPipe => throw new DebugException();
+        public bool HasOutputPipe
+        {
+            get
+            {
+                Trace("HasOutputPipe");
+                return true;
+            }
+        }
 
-        public bool MultiDatabasesOverride { get => throw new DebugException(); set => throw new DebugException(); }
+        public bool MultiDatabasesOverride { get => throw new DebugException(Identifier, currentconnectionIndex); set => throw new DebugException(Identifier, currentconnectionIndex); }
 
-        public byte[]? ChannelPrefix => throw new DebugException();
+        public byte[]? ChannelPrefix => throw new DebugException(Identifier, currentconnectionIndex);
 
         public async Task BeginConnectAsync(ILogger? log)
         {
@@ -66,7 +72,7 @@ namespace StackExchange.Redis
             Trace("Connecting...END");
         }
 
-        public void Dispose() => throw new DebugException();
+        public void Dispose() => throw new DebugException(Identifier, currentconnectionIndex);
 
         public void EnqueueInsideWriteLock(Message next)
         {
@@ -82,7 +88,7 @@ namespace StackExchange.Redis
             {
                 if (!v.simulated)
                 {
-                    throw new DebugException("Message not simulated ! can not update");
+                    Trace("Message not simulated ! should not update");
                 }
                 return im;
             });
@@ -97,7 +103,7 @@ namespace StackExchange.Redis
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
@@ -106,12 +112,12 @@ namespace StackExchange.Redis
             Trace("FlushAsyncValueTask");
             if (_simulatedConnection.TryGetValue(Identifier, out MessageSimulator? im))
             {
-                _readStatus = im.SimulateCompleteMessage(this);
+                _readStatus = im.SimulateCompleteMessage(this, Identifier, currentconnectionIndex);
                 return new ValueTask<WriteResult>(WriteResult.Success);
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
@@ -120,12 +126,12 @@ namespace StackExchange.Redis
             Trace("FlushSyncValueTask");
             if (_simulatedConnection.TryGetValue(Identifier, out MessageSimulator? im))
             {
-                _readStatus = im.SimulateCompleteMessage(this);
+                _readStatus = im.SimulateCompleteMessage(this, Identifier, currentconnectionIndex);
                 return WriteResult.Success;
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
@@ -134,7 +140,7 @@ namespace StackExchange.Redis
             sent = received = 0;
             Trace($"GetBytes s{sent}r{received}");
         }
-        public void GetCounters(ConnectionCounters counters) => throw new DebugException();
+        public void GetCounters(ConnectionCounters counters) => throw new DebugException(Identifier, currentconnectionIndex);
         public void GetHeadMessages(out Message? now, out Message? next)
         {
             next = now = null;
@@ -145,7 +151,7 @@ namespace StackExchange.Redis
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
@@ -162,11 +168,10 @@ namespace StackExchange.Redis
 
         public Message? GetSelectDatabaseCommand(int targetDatabase, Message message)
         {
-            Trace($"GetSelectDatabaseCommand");
-            _currentDataBase = targetDatabase; // test do not change database, fake database is the same has wanted
+            Trace($"GetSelectDatabaseCommand {targetDatabase}");
             return null;
         }
-        public int GetSentAwaitingResponseCount() => throw new DebugException();
+        public int GetSentAwaitingResponseCount() => throw new DebugException(Identifier, currentconnectionIndex);
         public ConnectionStatus GetStatus()
         {
             Trace($"GetStatus {Environment.StackTrace}");
@@ -181,21 +186,29 @@ namespace StackExchange.Redis
                 BytesInBuffer = -1,
             };
         }
-        public void GetStormLog(StringBuilder sb) => throw new DebugException();
+        public void GetStormLog(StringBuilder sb) => throw new DebugException(Identifier, currentconnectionIndex);
         public WriteStatus GetWriteStatus() => _writeStatus;
-        public bool HasPendingCallerFacingItems() => throw new DebugException();
+        public bool HasPendingCallerFacingItems() => throw new DebugException(Identifier, currentconnectionIndex);
 
         public int OnBridgeHeartbeat()
         {
             return 0;
         }
-        public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null) => throw new DebugException(exception.Message);
+        public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null)
+        {
+            Trace($"OnInternalError: {origin} {exception.Message}");
+            if (BridgeCouldBeNull is PhysicalBridge bridge)
+            {
+                bridge.Multiplexer.OnInternalError(exception, bridge.ServerEndPoint.EndPoint, ConnectionType.Interactive, origin);
+            }
+        }
+
         public void RecordConnectionFailed(ConnectionFailureType failureType, Exception? innerException = null, [CallerMemberName] string? origin = null, bool isInitialConnect = false, IDuplexPipe? connectingPipe = null)
         {
             string message = innerException?.Message ?? "<null>";
             Trace($"RecordConnectionFailed: {failureType} \r\n exception:{message}");
         }
-        public void RecordQuit() => throw new DebugException();
+        public void RecordQuit() => throw new DebugException(Identifier, currentconnectionIndex);
 
         public bool IsIdle()
         {
@@ -213,7 +226,7 @@ namespace StackExchange.Redis
             Trace($"SetProtocol {value}");
             _redisProtocol = value;
         }
-        public void SetUnknownDatabase() => throw new DebugException();
+        public void SetUnknownDatabase() => throw new DebugException(Identifier, currentconnectionIndex);
 
         public void SetWriteStatus(WriteStatus status)
         {
@@ -222,8 +235,8 @@ namespace StackExchange.Redis
         }
         public void SetWriting() => SetWriteStatus(WriteStatus.Writing);
         public void Shutdown() => Trace($"Shutdown...");
-        public void SimulateConnectionFailure(SimulatedFailureType failureType) => throw new DebugException();
-        private readonly bool trace = true;
+        public void SimulateConnectionFailure(SimulatedFailureType failureType) => throw new DebugException(Identifier, currentconnectionIndex);
+        private readonly bool trace = false;
         public void Trace(string message)
         {
             if (trace)
@@ -252,7 +265,7 @@ namespace StackExchange.Redis
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
@@ -278,10 +291,10 @@ namespace StackExchange.Redis
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
-        public void WriteBulkString(ReadOnlySpan<byte> value) => throw new DebugException();
+        public void WriteBulkString(ReadOnlySpan<byte> value) => throw new DebugException(Identifier, currentconnectionIndex);
 
         public void WriteHeader(RedisCommand command, int arguments, CommandBytes commandBytes = default)
         {
@@ -292,11 +305,11 @@ namespace StackExchange.Redis
             }
             else
             {
-                throw new DebugException("No message queued for this thread");
+                throw new DebugException(Identifier, currentconnectionIndex, "No message queued for this thread");
             }
         }
 
-        public void WriteRaw(ReadOnlySpan<byte> chk) => throw new DebugException();
-        public void WriteSha1AsHex(byte[] value) => throw new DebugException();
+        public void WriteRaw(ReadOnlySpan<byte> chk) => throw new DebugException(Identifier, currentconnectionIndex);
+        public void WriteSha1AsHex(byte[] value) => throw new DebugException(Identifier, currentconnectionIndex);
     }
 }

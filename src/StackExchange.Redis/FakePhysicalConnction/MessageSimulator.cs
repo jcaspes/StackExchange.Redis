@@ -17,9 +17,13 @@ namespace StackExchange.Redis
         internal RedisKey key;
         internal bool simulated = false;
         private static readonly ConcurrentDictionary<string, string> _hashStorage = new ConcurrentDictionary<string, string>();
+        private string identifier = string.Empty;
+        private int connectionIndex;
 
-        internal ReadStatus SimulateCompleteMessage(IPhysicalConnection connection)
+        internal ReadStatus SimulateCompleteMessage(IPhysicalConnection connection, string identifier, int connectionIndex)
         {
+            this.identifier = identifier;
+            this.connectionIndex = connectionIndex;
             simulated = true;
             RawResult result = GenerateResult();
             message!.ComputeResult(connection, result);
@@ -51,7 +55,7 @@ namespace StackExchange.Redis
                 RedisCommand.HMSET => CreateHMSETResult(),
                 RedisCommand.EXPIRE => CreateSimpleIntegerResult(1),
                 RedisCommand.HGETALL => CreateHGetHALLResult(),
-                _ => throw new DebugException($"No simulation for command {header.command}"),
+                _ => throw new DebugException(identifier, connectionIndex, $"No simulation for command {header.command}"),
             };
         }
 
@@ -59,7 +63,7 @@ namespace StackExchange.Redis
         {
             if (values.Count % 2 != 0)
             {
-                throw new DebugException("HMSET requires an even number of values");
+                throw new DebugException(identifier, connectionIndex, "HMSET requires an even number of values");
             }
 
             for (int i = 0; i < values.Count; i += 2)
@@ -105,7 +109,7 @@ namespace StackExchange.Redis
             {
                 return CreateScanResult("0", new List<string> { "MemoryTester:1" });
             }
-            throw new DebugException($"No simulation for SCAN with args {string.Join(", ", values)}");
+            throw new DebugException(identifier, connectionIndex, $"No simulation for SCAN with args {string.Join(", ", values)}");
         }
 
         private RawResult CreateEchoResult(RedisValue value)
@@ -127,7 +131,7 @@ namespace StackExchange.Redis
             return (string?)key switch
             {
                 "__Booksleeve_TieBreak" => CreateSimpleStringResult("null"),
-                _ => throw new DebugException($"No simulation for GET {key}"),
+                _ => throw new DebugException(identifier, connectionIndex, $"No simulation for GET {key}"),
             };
         }
 
@@ -146,13 +150,13 @@ namespace StackExchange.Redis
                 }
                 else
                 {
-                    throw new DebugException($"No simulation for CONFIG GET {values[1]}");
+                    throw new DebugException(identifier, connectionIndex, $"No simulation for CONFIG GET {values[1]}");
                 }
                 return CreateSimpleStringResult(wantedResultString);
             }
             else
             {
-                throw new DebugException($"No simulation for CONFIG {values[0]}");
+                throw new DebugException(identifier, connectionIndex, $"No simulation for CONFIG {values[0]}");
             }
         }
 
@@ -200,7 +204,7 @@ io_threads_active:0";
             }
             else
             {
-                throw new DebugException($"No simulation for INFO {values[0]}");
+                throw new DebugException(identifier, connectionIndex, $"No simulation for INFO {values[0]}");
             }
             return CreateSimpleStringResult(wantedResultString);
         }
