@@ -192,8 +192,8 @@ namespace StackExchange.Redis
         public void OnInternalError(Exception exception, [CallerMemberName] string? origin = null) => throw new DebugException(exception.Message);
         public void RecordConnectionFailed(ConnectionFailureType failureType, Exception? innerException = null, [CallerMemberName] string? origin = null, bool isInitialConnect = false, IDuplexPipe? connectingPipe = null)
         {
-            // OKfailed
-            Trace($"RecordConnectionFailed: {failureType}");
+            string message = innerException?.Message ?? "<null>";
+            Trace($"RecordConnectionFailed: {failureType} \r\n exception:{message}");
         }
         public void RecordQuit() => throw new DebugException();
 
@@ -223,11 +223,15 @@ namespace StackExchange.Redis
         public void SetWriting() => SetWriteStatus(WriteStatus.Writing);
         public void Shutdown() => Trace($"Shutdown...");
         public void SimulateConnectionFailure(SimulatedFailureType failureType) => throw new DebugException();
+        private readonly bool trace = true;
         public void Trace(string message)
         {
-            Console.WriteLine($"Trace(Th:{Identifier}:Cx{currentconnectionIndex}): {message}");
+            if (trace)
+            {
+                Console.WriteLine($"Trace(Th:{Identifier}:Cx{currentconnectionIndex}): {message}");
+            }
         }
-        public void UpdateLastWriteTime() => throw new DebugException();
+
         public void Write(in RedisChannel channel)
         {
             // don't care about channels
@@ -254,7 +258,20 @@ namespace StackExchange.Redis
 
         public void WriteBulkString(in RedisValue value)
         {
-            Trace($"WriteBulkString: {value}");
+            string sValue;
+            if (value.DirectObject is string)
+            {
+                sValue = (string)value.DirectObject!;
+                if (sValue.Length > 23)
+                {
+                    sValue = $"{sValue.Substring(0, 10)}...{sValue.Substring(sValue.Length - 10)}";
+                }
+            }
+            else
+            {
+                sValue = $"{value}";
+            }
+            Trace($"WriteBulkString: {sValue}");
             if (_simulatedConnection.TryGetValue(Identifier, out MessageSimulator? im))
             {
                 im.values.Add(value);
