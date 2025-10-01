@@ -175,7 +175,7 @@ namespace StackExchange.Redis
                 BytesAvailableOnSocket = -1,
                 BytesInReadPipe = -1,
                 BytesInWritePipe = -1,
-                ReadStatus = ReadStatus.Reconfigure,
+                ReadStatus = ReadStatus.MarkProcessed,
                 WriteStatus = WriteStatus.Flushed,
                 BytesLastResult = -1,
                 BytesInBuffer = -1,
