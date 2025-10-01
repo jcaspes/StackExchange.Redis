@@ -17,7 +17,12 @@ namespace StackExchange.Redis
             simulated = true;
             RawResult result = GenerateResult();
             message!.ComputeResult(connection, result);
-            message.Complete();
+            // Method should be async becasue of caller thread will call Monitor.Wait on the message source
+            Task.Run(() =>
+            {
+                Thread.Sleep(1);
+                message.Complete();
+            });
             return message.ResultBoxIsAsync ? ReadStatus.CompletePendingMessageAsync : ReadStatus.CompletePendingMessageSync;
         }
 
