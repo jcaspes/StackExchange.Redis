@@ -1601,6 +1601,10 @@ namespace StackExchange.Redis
                 }
                 connection.EnqueueInsideWriteLock(message);
                 isQueued = true;
+                if (!exceptionDone && message.CommandAndKey == "GET key1")
+                {
+                    throw new Exception("oops");
+                }
                 message.WriteTo(connection);
 
                 if (message.IsHighIntegrity)
@@ -1655,11 +1659,18 @@ namespace StackExchange.Redis
                 message.Fail(ConnectionFailureType.InternalFailure, ex, null, Multiplexer);
                 message.Complete();
 
+                if (!exceptionDone && message.CommandAndKey == "GET key1")
+                {
+                    exceptionDone = true;
+                    throw new Exception("oops");
+                }
                 // We're not sure *what* happened here - probably an IOException; kill the connection
                 connection?.RecordConnectionFailed(ConnectionFailureType.InternalFailure, ex);
                 return WriteResult.WriteFailure;
             }
         }
+
+        private static bool exceptionDone = false;
 
         private uint NextHighIntegrityTokenInsideLock()
         {
