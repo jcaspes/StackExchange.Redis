@@ -13,6 +13,7 @@ public class Program
             AllowAdmin = true,
             AbortOnConnectFail = true,
             SyncTimeout = 5000,
+            HighIntegrity = false, // Set to true to prevent the first type of corruption
         };
 
         ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
@@ -26,7 +27,13 @@ public class Program
         IDatabase redisDb = connection.GetDatabase();
         redisDb.StringSet("key1", "value1");
         redisDb.StringSet("key2", "value2");
+        redisDb.StringSet("key3", "value3");
 
+        Corruption1(redisDb);
+    }
+
+    private static void Corruption1(IDatabase redisDb)
+    {
         // 2 exceptions are explicitly triggered during the read of key1:
         //  - The first occurs after the message being added in PhysicalConnection._writtenAwaitingResponse but
         //    before the message being written on the physical socket.
@@ -35,13 +42,15 @@ public class Program
         //
         // The result is that:
         //  - StringGet("key1") ends in error and corrupts the queue.
-        //  - StringGet("key3") adds its message to PhysicalConnection._writtenAwaitingResponse and writes it
+        //  - StringGet("key2") adds its message to PhysicalConnection._writtenAwaitingResponse and writes it
         //    on the physical socket.
-        //  - The redis answer ("key3 does not exist") is read and matched to the first message of the queue, "GET key1" (INCORRECT).
+        //  - The redis answer ("value2") is read and matched to the first message of the queue, "GET key1" (INCORRECT).
         //    AS key1 is already in error, the result is ignored.
-        //  - StringGet("key2") (1 second later in another thread) adds its message to PhysicalConnection._writtenAwaitingResponse
+        //  - StringGet("key3") (1 second later in another thread) adds its message to PhysicalConnection._writtenAwaitingResponse
         //    and writes it on the physical socket (normal).
-        //  - The redis answer ("value2") is read and matched to the first message of the queue, "GET key3" (INCORRECT).
+        //  - The redis answer ("value3") is read and matched to the first message of the queue, "GET key2" (INCORRECT).
+        //
+        // This specific corruption is prevented by setting the flag HighIntegrity to true in ConfigurationOptions.
         try
         {
             string? value1 = redisDb.StringGet("key1");
@@ -54,11 +63,11 @@ public class Program
 
         Thread t = new Thread(() =>
         {
-            Thread.Sleep(1000); // Ensure this runs after the method call StringGet("key3") below
+            Thread.Sleep(1000); // Ensure this runs after the method call StringGet("key2") below
             try
             {
-                string? value2 = redisDb.StringGet("key2");
-                Console.WriteLine($"key2 from thread: {value2}");
+                string? value3 = redisDb.StringGet("key3");
+                Console.WriteLine($"key3: {value3}");
             }
             catch (RedisTimeoutException)
             {
@@ -67,8 +76,15 @@ public class Program
         });
         t.Start();
 
-        string? value3 = redisDb.StringGet("key3"); // Key does not exist, but it does not matter
-        Console.WriteLine($"key3: {value3}");
+        try
+        {
+            string? value2 = redisDb.StringGet("key2");
+            Console.WriteLine($"key2: {value2}");
+        }
+        catch (RedisTimeoutException)
+        {
+            Console.WriteLine($"Timeout exception during StringGet of key2");
+        }
         t.Join();
     }
 }
