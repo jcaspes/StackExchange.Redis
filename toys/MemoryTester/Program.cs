@@ -67,8 +67,6 @@ namespace MemoryTester
                 HighIntegrity = highIntegrity,
             };
 
-            Console.WriteLine(configuration);
-
             ExceptionStats exceptionStats = new ExceptionStats();
 
             ConnectionMultiplexer connection = ConnectionMultiplexer.Connect(configuration);
