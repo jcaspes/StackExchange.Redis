@@ -1,5 +1,7 @@
 ﻿using System;
+using System.CodeDom.Compiler;
 using System.Collections.Generic;
+using System.Diagnostics;
 using StackExchange.Redis;
 
 namespace MemoryTester
@@ -14,6 +16,8 @@ namespace MemoryTester
         private static int threadCount = 200;
         private static bool highIntegrity = false;
         private static bool cleanPreviousRun = true;
+        private static bool generateOOM = true;
+        private static TimeSpan testDuration = TimeSpan.FromHours(24);
 
         private static void Main(string[] args)
         {
@@ -39,6 +43,14 @@ namespace MemoryTester
                         string[] argSplit = arg.Split('=');
                         threadCount = int.Parse(argSplit[1]);
                     }
+                    if (arg.Equals("noOOM", StringComparison.OrdinalIgnoreCase))
+                        generateOOM = false;
+
+                    if (arg.StartsWith("duration", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string[] argSplit = arg.Split('=');
+                        testDuration = TimeSpan.FromSeconds(int.Parse(argSplit[1]));
+                    }
                 }
             }
 
@@ -54,6 +66,8 @@ namespace MemoryTester
             Threads.TraceConsole($"\tHighIntegrity   : {highIntegrity}");
             Threads.TraceConsole($"\tCleanPreviousRun: {cleanPreviousRun}");
             Threads.TraceConsole($"\tThreads         : {threadCount}");
+            Threads.TraceConsole($"\tOOM             : {generateOOM}");
+            Threads.TraceConsole($"\tduration        : {testDuration.TotalSeconds}");
             Threads.TraceConsole("-----------------------------------------------");
 
             ConfigurationOptions configuration = new ConfigurationOptions()
@@ -106,6 +120,8 @@ namespace MemoryTester
                 }
             }
 
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
             threads.Loop((int threadIndex) =>
             {
                 // A list to memoryse loop data and consume memory
@@ -137,7 +153,7 @@ namespace MemoryTester
                     {
                         if (!threads.stopAllThreads)
                         {
-                            if (Console.KeyAvailable)
+                            if (Console.KeyAvailable || stopwatch.Elapsed > testDuration)
                             {
                                 Console.WriteLine("Exiting the test loop.");
                                 threads.stopAllThreads = true;
@@ -193,11 +209,14 @@ namespace MemoryTester
                             catch { }
                         }
 
-                        // generate a big string to consume memory and generate out of memory exceptions
-                        // this string will be freed by GC so we can continue to run
-                        bigString = string.Join("-", results);
-                        // if we have no OutOfMemory exception, we can add the value to results
-                        results.Add(props["Value"]);
+                        if (generateOOM)
+                        {
+                            // generate a big string to consume memory and generate out of memory exceptions
+                            // this string will be freed by GC so we can continue to run
+                            bigString = string.Join("-", results);
+                            // if we have no OutOfMemory exception, we can add the value to results
+                            results.Add(props["Value"]);
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -206,12 +225,15 @@ namespace MemoryTester
                 }
             });
 
+            stopwatch.Stop();
+
             // Wait for all threads to end to avoid conflict in Exceptions stats dictionnary
             threads.WaitAll();
 
             Threads.TraceConsole("");
             Threads.TraceConsole("-------------------------------");
             exceptionStats.TraceStats();
+            Threads.TraceConsole($"Total duration:{stopwatch.Elapsed}");
             Threads.TraceConsole($"Total redis calls:{Threads.redisCallsCount}");
             Threads.TraceConsole($"Total redis calls without exception:{Threads.redisCallsCount - ExceptionStats.ExceptionCount}");
             Threads.TraceConsole($"Success redis calls (without exception and with correct data):{Threads.redisCallsCount - ExceptionStats.ExceptionCount - corruptedDataCount - corruptedDataSizeCount - keyNotFoundCount}");
