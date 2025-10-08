@@ -65,6 +65,8 @@ namespace MemoryTester
                 AbortOnConnectFail = true,
                 SyncTimeout = 5000,
                 HighIntegrity = highIntegrity,
+                HeartbeatInterval = TimeSpan.FromHours(24), // so no heartbeat
+                CommandMap = CommandMap.Create(new Dictionary<string, string> { { "SUBSCRIBE", string.Empty } }),
             };
 
             ExceptionStats exceptionStats = new ExceptionStats();
@@ -92,6 +94,8 @@ namespace MemoryTester
 
             IDatabase redisDbForClean = connection.GetDatabase();
             IEnumerable<RedisKey> resultKeysEnumerable;
+            TimeSpan duration = redisDbForClean.Ping();
+            Threads.TraceConsole($"Ping duration {duration.TotalMilliseconds} ms");
 
             if (cleanPreviousRun)
             {
