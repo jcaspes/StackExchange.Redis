@@ -10,20 +10,23 @@ namespace MemoryTester
 
         internal void Add(Exception ex)
         {
-            System.Threading.Interlocked.Increment(ref ExceptionCount);
-            string exceptionName = ex.GetType().Name;
-            string stackHash = ex.StackTrace?.GetHashCode().ToString() ?? "NoStackTrace";
-            string key = $"{exceptionName}_{stackHash}";
-            if (_exceptionCounts.ContainsKey(key))
+            lock (_exceptionCounts)
             {
-                _exceptionCounts[key]++;
-                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
-            }
-            else
-            {
-                _exceptionCounts[key] = 1;
-                Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
-                Threads.TraceConsole(ex.StackTrace, inConsole: false);
+                System.Threading.Interlocked.Increment(ref ExceptionCount);
+                string exceptionName = ex.GetType().Name;
+                string stackHash = ex.StackTrace?.GetHashCode().ToString() ?? "NoStackTrace";
+                string key = $"{exceptionName}_{stackHash}";
+                if (_exceptionCounts.ContainsKey(key))
+                {
+                    _exceptionCounts[key]++;
+                    Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
+                }
+                else
+                {
+                    _exceptionCounts[key] = 1;
+                    Threads.TraceConsole($"Th:{System.Threading.Thread.CurrentThread.Name} Key:{key}", inConsole: false);
+                    Threads.TraceConsole(ex.StackTrace, inConsole: false);
+                }
             }
         }
 
