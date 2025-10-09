@@ -9,40 +9,40 @@ internal sealed class Program
     private static volatile bool _shouldExit = false;
     private static readonly string LogFileName = $"watchdog_log_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
 
-    // Variables pour la détection de blocage
+    // Variables for blockage detection
     private static int _consecutiveBlockedLogs = 0;
     private static readonly int MaxConsecutiveBlockedLogs = 10;
 
-    // Variable pour stocker la référence du processus actuel
+    // Variable to store current process reference
     private static Process? _currentProcess = null;
     private static readonly object _processLock = new object();
 
     public static async Task Main(string[] args)
     {
-        Console.WriteLine("MemoryTesterWatchdog - Surveillance de processus");
+        Console.WriteLine("MemoryTesterWatchdog - Process Monitoring");
         Console.WriteLine("=========================================");
 
-        // Configuration du gestionnaire de signal Ctrl+C
+        // Configure Ctrl+C signal handler
         Console.CancelKeyPress += (sender, e) =>
         {
             e.Cancel = true;
             _shouldExit = true;
-            Console.WriteLine("\nArrêt demandé. Fermeture en cours...");
+            Console.WriteLine("\nShutdown requested. Closing...");
 
-            // Tuer le processus enfant immédiatement
+            // Kill child process immediately
             KillCurrentProcess();
         };
 
-        // Configuration par défaut - peut être modifiée selon les besoins
+        // Default configuration - can be modified as needed
         string processName = "cmd.exe";
         string processArguments = @"/c ""E:\DEV\StackExchange.Redis\toys\MemoryTester\bin\Debug\MemoryTester.exe"" HighIntegrity";
 
-        Console.WriteLine($"Fichier de log: {LogFileName}");
-        Console.WriteLine($"Processus surveillé: {processName} {processArguments}");
-        Console.WriteLine($"Détection de blocage: {MaxConsecutiveBlockedLogs} logs consécutifs sans progression");
-        Console.WriteLine("Appuyez sur Ctrl+C pour arrêter le watchdog\n");
+        Console.WriteLine($"Log file: {LogFileName}");
+        Console.WriteLine($"Monitored process: {processName} {processArguments}");
+        Console.WriteLine($"Blockage detection: {MaxConsecutiveBlockedLogs} consecutive logs without progress");
+        Console.WriteLine("Press Ctrl+C to stop the watchdog\n");
 
-        await WriteToLogAsync($"[{DateTime.Now}] Démarrage du watchdog");
+        await WriteToLogAsync($"[{DateTime.Now}] Watchdog startup");
 
         while (!_shouldExit)
         {
@@ -53,11 +53,11 @@ internal sealed class Program
             }
             catch (Exception ex)
             {
-                var errorMessage = $"[{DateTime.Now}] ERREUR: {ex.Message}";
+                var errorMessage = $"[{DateTime.Now}] ERROR: {ex.Message}";
                 Console.WriteLine(errorMessage);
                 await WriteToLogAsync(errorMessage);
 
-                // Attendre avant de redémarrer en cas d'erreur
+                // Wait before restarting in case of error
                 if (!_shouldExit)
                 {
                     await Task.Delay(5000);
@@ -66,15 +66,15 @@ internal sealed class Program
 
             if (!_shouldExit)
             {
-                var restartMessage = $"[{DateTime.Now}] Redémarrage du processus dans 2 secondes...";
+                var restartMessage = $"[{DateTime.Now}] Restarting process in 2 seconds...";
                 Console.WriteLine(restartMessage);
                 await WriteToLogAsync(restartMessage);
                 await Task.Delay(2000);
             }
         }
 
-        await WriteToLogAsync($"[{DateTime.Now}] Arrêt du watchdog");
-        Console.WriteLine("Watchdog arrêté.");
+        await WriteToLogAsync($"[{DateTime.Now}] Watchdog shutdown");
+        Console.WriteLine("Watchdog stopped.");
     }
 
     private static void KillCurrentProcess()
@@ -85,12 +85,12 @@ internal sealed class Program
             {
                 try
                 {
-                    _currentProcess.Kill(true); // true pour tuer aussi les processus enfants
-                    Console.WriteLine("Processus enfant arrêté avec succès.");
+                    _currentProcess.Kill(true); // true to also kill child processes
+                    Console.WriteLine("Child process stopped successfully.");
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Erreur lors de l'arrêt du processus: {ex.Message}");
+                    Console.WriteLine($"Error stopping process: {ex.Message}");
                 }
             }
         }
@@ -110,17 +110,17 @@ internal sealed class Program
 
         using var process = new Process { StartInfo = startInfo };
 
-        // Stocker la référence du processus actuel
+        // Store current process reference
         lock (_processLock)
         {
             _currentProcess = process;
         }
 
-        var startMessage = $"[{DateTime.Now}] Démarrage du processus: {processName} {arguments}";
+        var startMessage = $"[{DateTime.Now}] Starting process: {processName} {arguments}";
         Console.WriteLine(startMessage);
         await WriteToLogAsync(startMessage);
 
-        // Gestionnaires pour capturer la sortie en temps réel
+        // Handlers to capture real-time output
         process.OutputDataReceived += async (sender, e) =>
         {
             if (!string.IsNullOrEmpty(e.Data))
@@ -129,7 +129,7 @@ internal sealed class Program
                 Console.WriteLine(outputMessage);
                 await WriteToLogAsync(outputMessage);
 
-                // Analyser le log pour détecter un blocage
+                // Analyze log to detect blockage
                 await AnalyzeLogForBlockage(e.Data, process);
             }
         };
@@ -150,7 +150,7 @@ internal sealed class Program
             process.BeginOutputReadLine();
             process.BeginErrorReadLine();
 
-            // Attendre la fin du processus ou l'arrêt demandé
+            // Wait for process to end or shutdown requested
             while (!process.HasExited && !_shouldExit)
             {
                 await Task.Delay(100);
@@ -158,33 +158,33 @@ internal sealed class Program
 
             if (!process.HasExited)
             {
-                // Arrêt forcé demandé
-                var killMessage = $"[{DateTime.Now}] Arrêt forcé du processus";
+                // Forced shutdown requested
+                var killMessage = $"[{DateTime.Now}] Forced process shutdown";
                 Console.WriteLine(killMessage);
                 await WriteToLogAsync(killMessage);
 
                 try
                 {
-                    process.Kill(true); // true pour tuer aussi les processus enfants
+                    process.Kill(true); // true to also kill child processes
                     await process.WaitForExitAsync();
                 }
                 catch (Exception ex)
                 {
-                    var errorMessage = $"[{DateTime.Now}] Erreur lors de l'arrêt du processus: {ex.Message}";
+                    var errorMessage = $"[{DateTime.Now}] Error during process shutdown: {ex.Message}";
                     Console.WriteLine(errorMessage);
                     await WriteToLogAsync(errorMessage);
                 }
             }
             else
             {
-                var exitMessage = $"[{DateTime.Now}] Processus terminé avec le code de sortie: {process.ExitCode}";
+                var exitMessage = $"[{DateTime.Now}] Process terminated with exit code: {process.ExitCode}";
                 Console.WriteLine(exitMessage);
                 await WriteToLogAsync(exitMessage);
             }
         }
         finally
         {
-            // Nettoyer la référence du processus
+            // Clean up process reference
             lock (_processLock)
             {
                 if (_currentProcess == process)
@@ -199,8 +199,8 @@ internal sealed class Program
     {
         try
         {
-            // Pattern pour détecter les logs de MemoryTester
-            // Exemple: "Main : ===> Threads loop, count: 186, redis calls: 50234, exceptions: 41156(+242), succeed calls: 137<==="
+            // Pattern to detect MemoryTester logs
+            // Example: "Main : ===> Threads loop, count: 186, redis calls: 50234, exceptions: 41156(+242), succeed calls: 137<==="
             var pattern = @"Main : ===> Threads loop, count: \d+, redis calls: (\d+)\(\+(\d+)\), exceptions: \d+\(\+\d+\), succeed calls: \d+<===";
             var match = Regex.Match(logLine, pattern);
 
@@ -209,40 +209,40 @@ internal sealed class Program
                 int currentCalls = int.Parse(match.Groups[1].Value);
                 int newCalls = int.Parse(match.Groups[2].Value);
 
-                // Détection de blocage: Redis calls ne progressent pas, 0 nouvelles exceptions, 0 appels réussis
+                // Blockage detection: Redis calls not progressing, 0 new exceptions, 0 successful calls
                 bool isBlocked = currentCalls != 0 && newCalls == 0;
                 if (isBlocked)
                 {
                     _consecutiveBlockedLogs++;
-                    var blockMessage = $"[{DateTime.Now}] DÉTECTION BLOCAGE: Log bloqué #{_consecutiveBlockedLogs}/{MaxConsecutiveBlockedLogs}";
+                    var blockMessage = $"[{DateTime.Now}] BLOCKAGE DETECTION: Blocked log #{_consecutiveBlockedLogs}/{MaxConsecutiveBlockedLogs}";
                     Console.WriteLine(blockMessage);
                     await WriteToLogAsync(blockMessage);
 
                     if (_consecutiveBlockedLogs >= MaxConsecutiveBlockedLogs)
                     {
-                        var killMessage = $"[{DateTime.Now}] BLOCAGE DÉTECTÉ: {MaxConsecutiveBlockedLogs} logs consécutifs sans progression - Arrêt forcé du processus MemoryTester";
+                        var killMessage = $"[{DateTime.Now}] BLOCKAGE DETECTED: {MaxConsecutiveBlockedLogs} consecutive logs without progress - Forcing MemoryTester shutdown";
                         Console.WriteLine(killMessage);
 
                         try
                         {
                             if (!process.HasExited)
                             {
-                                process.Kill(true); // true pour tuer aussi les processus enfants
-                                await WriteToLogAsync($"[{DateTime.Now}] Processus MemoryTester tué avec succès");
+                                process.Kill(true); // true to also kill child processes
+                                await WriteToLogAsync($"[{DateTime.Now}] MemoryTester process killed successfully");
                             }
                         }
                         catch (Exception ex)
                         {
-                            await WriteToLogAsync($"[{DateTime.Now}] Erreur lors de l'arrêt forcé: {ex.Message}");
+                            await WriteToLogAsync($"[{DateTime.Now}] Error during forced shutdown: {ex.Message}");
                         }
                     }
                 }
                 else
                 {
-                    // Reset du compteur si le processus n'est pas bloqué
+                    // Reset counter if process is not blocked
                     if (_consecutiveBlockedLogs > 0)
                     {
-                        var recoveryMessage = $"[{DateTime.Now}] RÉCUPÉRATION: Le processus progresse à nouveau - Redis calls: {currentCalls}";
+                        var recoveryMessage = $"[{DateTime.Now}] RECOVERY: Process is progressing again - Redis calls: {currentCalls}";
                         Console.WriteLine(recoveryMessage);
                         await WriteToLogAsync(recoveryMessage);
                     }
@@ -252,7 +252,7 @@ internal sealed class Program
         }
         catch (Exception ex)
         {
-            await WriteToLogAsync($"[{DateTime.Now}] Erreur lors de l'analyse du log: {ex.Message}");
+            await WriteToLogAsync($"[{DateTime.Now}] Error during log analysis: {ex.Message}");
         }
     }
 
@@ -264,7 +264,7 @@ internal sealed class Program
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Erreur lors de l'écriture dans le fichier de log: {ex.Message}");
+            Console.WriteLine($"Error writing to log file: {ex.Message}");
         }
     }
 }
