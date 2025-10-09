@@ -34,8 +34,20 @@ internal sealed class Program
         };
 
         // Default configuration - can be modified as needed
+        List<string> parameters = new();
+        foreach (int threadsCount in new[] { 1, 2, 4, 8, 16, 32, 64, 128, 256 })
+        {
+            foreach (int maxSize in new[] { 100, 1000, 10000, 100000, 1000000 })
+            {
+                for (int i = 0; i < 10; i++)
+                {
+                    parameters.Add($"nooom duration=10 threads={threadsCount} maxSize={maxSize}");
+                    parameters.Add($"nooom duration=10 threads={threadsCount} maxSize={maxSize} HighIntegrity");
+                }
+            }
+        }
         string processName = "cmd.exe";
-        string processArguments = @"/c ""E:\DEV\StackExchange.Redis\toys\MemoryTester\bin\Debug\MemoryTester.exe"" HighIntegrity";
+        string processArguments = @"/c ""E:\DEV\StackExchange.Redis\toys\MemoryTester\bin\Debug\MemoryTester.exe"" ";
 
         Console.WriteLine($"Log file: {LogFileName}");
         Console.WriteLine($"Monitored process: {processName} {processArguments}");
@@ -44,12 +56,12 @@ internal sealed class Program
 
         await WriteToLogAsync($"[{DateTime.Now}] Watchdog startup");
 
-        while (!_shouldExit)
+        foreach (string parameter in parameters)
         {
             try
             {
                 _consecutiveBlockedLogs = 0;
-                await RunProcessWithMonitoring(processName, processArguments);
+                await RunProcessWithMonitoring(processName, processArguments + parameter);
             }
             catch (Exception ex)
             {
@@ -66,10 +78,10 @@ internal sealed class Program
 
             if (!_shouldExit)
             {
-                var restartMessage = $"[{DateTime.Now}] Restarting process in 2 seconds...";
+                var restartMessage = $"[{DateTime.Now}] Restarting process in 1 seconds...";
                 Console.WriteLine(restartMessage);
                 await WriteToLogAsync(restartMessage);
-                await Task.Delay(2000);
+                await Task.Delay(1000);
             }
         }
 

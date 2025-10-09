@@ -2,6 +2,7 @@
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
@@ -2074,6 +2075,7 @@ namespace StackExchange.Redis
 
                 bool timeout = false;
                 WriteResult result;
+                Stopwatch stopWatch = new Stopwatch();
                 lock (source)
                 {
 #pragma warning disable CS0618 // Type or member is obsolete
@@ -2086,6 +2088,7 @@ namespace StackExchange.Redis
                             throw GetException(result, message, server);
                         }
 
+                        stopWatch.Start();
                         if (Monitor.Wait(source, TimeoutMilliseconds))
                         {
                             Trace("Timely response to " + message);
@@ -2095,9 +2098,11 @@ namespace StackExchange.Redis
                             Trace("Timeout performing " + message);
                             timeout = true;
                         }
+                        stopWatch.Stop();
                     }
                 }
 
+                Interlocked.Add(ref elapsedMilliSecondsInWait, (int)stopWatch.Elapsed.TotalMilliseconds);
                 if (timeout) // note we throw *outside* of the main lock to avoid deadlock scenarios (#2376)
                 {
                     Interlocked.Increment(ref syncTimeouts);
@@ -2112,6 +2117,10 @@ namespace StackExchange.Redis
                 return val;
             }
         }
+
+#pragma warning disable
+        public static int elapsedMilliSecondsInWait = 0;
+#pragma warning restore
 
         internal Task<T> ExecuteAsyncImpl<T>(Message? message, ResultProcessor<T>? processor, object? state, ServerEndPoint? server, T defaultValue)
         {

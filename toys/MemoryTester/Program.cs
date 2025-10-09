@@ -243,6 +243,7 @@ namespace MemoryTester
                 Threads.TraceConsole($"Corrupted redis commands data size: {corruptedDataSizeCount}");
             }
             Threads.TraceConsole($"Key not found unexpected errors {keyNotFoundCount}");
+            Threads.TraceConsole($"Time in wait: {ConnectionMultiplexer.elapsedMilliSecondsInWait} ms");
         }
     }
 }
