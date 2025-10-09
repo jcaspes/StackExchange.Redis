@@ -11,8 +11,11 @@ internal sealed class Program
 
     // Variables pour la détection de blocage
     private static int _consecutiveBlockedLogs = 0;
-    private static int _lastRedisCallsCount = -1;
     private static readonly int MaxConsecutiveBlockedLogs = 10;
+
+    // Variable pour stocker la référence du processus actuel
+    private static Process? _currentProcess = null;
+    private static readonly object _processLock = new object();
 
     public static async Task Main(string[] args)
     {
@@ -25,6 +28,9 @@ internal sealed class Program
             e.Cancel = true;
             _shouldExit = true;
             Console.WriteLine("\nArrêt demandé. Fermeture en cours...");
+
+            // Tuer le processus enfant immédiatement
+            KillCurrentProcess();
         };
 
         // Configuration par défaut - peut être modifiée selon les besoins
@@ -43,7 +49,6 @@ internal sealed class Program
             try
             {
                 _consecutiveBlockedLogs = 0;
-                _lastRedisCallsCount = -1;
                 await RunProcessWithMonitoring(processName, processArguments);
             }
             catch (Exception ex)
@@ -53,7 +58,10 @@ internal sealed class Program
                 await WriteToLogAsync(errorMessage);
 
                 // Attendre avant de redémarrer en cas d'erreur
-                await Task.Delay(5000);
+                if (!_shouldExit)
+                {
+                    await Task.Delay(5000);
+                }
             }
 
             if (!_shouldExit)
@@ -69,6 +77,25 @@ internal sealed class Program
         Console.WriteLine("Watchdog arrêté.");
     }
 
+    private static void KillCurrentProcess()
+    {
+        lock (_processLock)
+        {
+            if (_currentProcess != null && !_currentProcess.HasExited)
+            {
+                try
+                {
+                    _currentProcess.Kill(true); // true pour tuer aussi les processus enfants
+                    Console.WriteLine("Processus enfant arrêté avec succès.");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Erreur lors de l'arrêt du processus: {ex.Message}");
+                }
+            }
+        }
+    }
+
     private static async Task RunProcessWithMonitoring(string processName, string arguments)
     {
         var startInfo = new ProcessStartInfo
@@ -82,6 +109,12 @@ internal sealed class Program
         };
 
         using var process = new Process { StartInfo = startInfo };
+
+        // Stocker la référence du processus actuel
+        lock (_processLock)
+        {
+            _currentProcess = process;
+        }
 
         var startMessage = $"[{DateTime.Now}] Démarrage du processus: {processName} {arguments}";
         Console.WriteLine(startMessage);
@@ -111,40 +144,54 @@ internal sealed class Program
             }
         };
 
-        process.Start();
-        process.BeginOutputReadLine();
-        process.BeginErrorReadLine();
-
-        // Attendre la fin du processus ou l'arrêt demandé
-        while (!process.HasExited && !_shouldExit)
+        try
         {
-            await Task.Delay(100);
-        }
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
 
-        if (!process.HasExited)
-        {
-            // Arrêt forcé demandé
-            var killMessage = $"[{DateTime.Now}] Arrêt forcé du processus";
-            Console.WriteLine(killMessage);
-            await WriteToLogAsync(killMessage);
-
-            try
+            // Attendre la fin du processus ou l'arrêt demandé
+            while (!process.HasExited && !_shouldExit)
             {
-                process.Kill();
-                await process.WaitForExitAsync();
+                await Task.Delay(100);
             }
-            catch (Exception ex)
+
+            if (!process.HasExited)
             {
-                var errorMessage = $"[{DateTime.Now}] Erreur lors de l'arrêt du processus: {ex.Message}";
-                Console.WriteLine(errorMessage);
-                await WriteToLogAsync(errorMessage);
+                // Arrêt forcé demandé
+                var killMessage = $"[{DateTime.Now}] Arrêt forcé du processus";
+                Console.WriteLine(killMessage);
+                await WriteToLogAsync(killMessage);
+
+                try
+                {
+                    process.Kill(true); // true pour tuer aussi les processus enfants
+                    await process.WaitForExitAsync();
+                }
+                catch (Exception ex)
+                {
+                    var errorMessage = $"[{DateTime.Now}] Erreur lors de l'arrêt du processus: {ex.Message}";
+                    Console.WriteLine(errorMessage);
+                    await WriteToLogAsync(errorMessage);
+                }
+            }
+            else
+            {
+                var exitMessage = $"[{DateTime.Now}] Processus terminé avec le code de sortie: {process.ExitCode}";
+                Console.WriteLine(exitMessage);
+                await WriteToLogAsync(exitMessage);
             }
         }
-        else
+        finally
         {
-            var exitMessage = $"[{DateTime.Now}] Processus terminé avec le code de sortie: {process.ExitCode}";
-            Console.WriteLine(exitMessage);
-            await WriteToLogAsync(exitMessage);
+            // Nettoyer la référence du processus
+            lock (_processLock)
+            {
+                if (_currentProcess == process)
+                {
+                    _currentProcess = null;
+                }
+            }
         }
     }
 
@@ -154,31 +201,20 @@ internal sealed class Program
         {
             // Pattern pour détecter les logs de MemoryTester
             // Exemple: "Main : ===> Threads loop, count: 186, redis calls: 50234, exceptions: 41156(+242), succeed calls: 137<==="
-            var pattern = @"Main\s*:\s*===>\s*Threads loop,\s*count:\s*(\d+),\s*redis calls:\s*(\d+),\s*exceptions:\s*\d+\(\+(\d+)\),\s*succeed calls:\s*(\d+)<===";
+            var pattern = @"Main : ===> Threads loop, count: \d+, redis calls: (\d+)\(\+(\d+)\), exceptions: \d+\(\+\d+\), succeed calls: \d+<===";
             var match = Regex.Match(logLine, pattern);
 
             if (match.Success)
             {
-                int currentRedisCallsCount = int.Parse(match.Groups[2].Value);
-                int newExceptions = int.Parse(match.Groups[3].Value);
-                int succeedCalls = int.Parse(match.Groups[4].Value);
+                int currentCalls = int.Parse(match.Groups[1].Value);
+                int newCalls = int.Parse(match.Groups[2].Value);
 
                 // Détection de blocage: Redis calls ne progressent pas, 0 nouvelles exceptions, 0 appels réussis
-                bool isBlocked = false;
-
-                if (_lastRedisCallsCount != -1) // Pas le premier log
-                {
-                    bool redisCallsNotProgressing = currentRedisCallsCount == _lastRedisCallsCount;
-                    bool noNewExceptions = newExceptions == 0;
-                    bool noSuccessfulCalls = succeedCalls == 0;
-
-                    isBlocked = redisCallsNotProgressing && noNewExceptions && noSuccessfulCalls;
-                }
-
+                bool isBlocked = currentCalls != 0 && newCalls == 0;
                 if (isBlocked)
                 {
                     _consecutiveBlockedLogs++;
-                    var blockMessage = $"[{DateTime.Now}] DÉTECTION BLOCAGE: Log bloqué #{_consecutiveBlockedLogs}/{MaxConsecutiveBlockedLogs} - Redis calls: {currentRedisCallsCount} (pas de progression), Nouvelles exceptions: {newExceptions}, Appels réussis: {succeedCalls}";
+                    var blockMessage = $"[{DateTime.Now}] DÉTECTION BLOCAGE: Log bloqué #{_consecutiveBlockedLogs}/{MaxConsecutiveBlockedLogs}";
                     Console.WriteLine(blockMessage);
                     await WriteToLogAsync(blockMessage);
 
@@ -186,13 +222,12 @@ internal sealed class Program
                     {
                         var killMessage = $"[{DateTime.Now}] BLOCAGE DÉTECTÉ: {MaxConsecutiveBlockedLogs} logs consécutifs sans progression - Arrêt forcé du processus MemoryTester";
                         Console.WriteLine(killMessage);
-                        await WriteToLogAsync(killMessage);
 
                         try
                         {
                             if (!process.HasExited)
                             {
-                                process.Kill();
+                                process.Kill(true); // true pour tuer aussi les processus enfants
                                 await WriteToLogAsync($"[{DateTime.Now}] Processus MemoryTester tué avec succès");
                             }
                         }
@@ -207,14 +242,12 @@ internal sealed class Program
                     // Reset du compteur si le processus n'est pas bloqué
                     if (_consecutiveBlockedLogs > 0)
                     {
-                        var recoveryMessage = $"[{DateTime.Now}] RÉCUPÉRATION: Le processus progresse à nouveau - Redis calls: {currentRedisCallsCount}, Nouvelles exceptions: {newExceptions}, Appels réussis: {succeedCalls}";
+                        var recoveryMessage = $"[{DateTime.Now}] RÉCUPÉRATION: Le processus progresse à nouveau - Redis calls: {currentCalls}";
                         Console.WriteLine(recoveryMessage);
                         await WriteToLogAsync(recoveryMessage);
                     }
                     _consecutiveBlockedLogs = 0;
                 }
-
-                _lastRedisCallsCount = currentRedisCallsCount;
             }
         }
         catch (Exception ex)
