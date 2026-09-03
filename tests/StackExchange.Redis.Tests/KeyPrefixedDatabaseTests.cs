@@ -65,13 +65,6 @@ public sealed class KeyPrefixedDatabaseTests
     }
 
     [Fact]
-    public void Get_Database()
-    {
-        mock.Database.Returns(123);
-        Assert.Equal(123, prefixed.Database);
-    }
-
-    [Fact]
     public void HashDecrement_1()
     {
         prefixed.HashDecrement("key", "hashField", 123, CommandFlags.None);
@@ -680,6 +673,13 @@ public sealed class KeyPrefixedDatabaseTests
     }
 
     [Fact]
+    public void SetCombineLength()
+    {
+        prefixed.SetCombineLength(SetOperation.Union, ["key1", "key2"]);
+        mock.Received().SetCombineLength(SetOperation.Union, IsKeys(["prefix:key1", "prefix:key2"]), 0, false, CommandFlags.None);
+    }
+
+    [Fact]
     public void SetLength()
     {
         prefixed.SetLength("key", CommandFlags.None);
@@ -849,6 +849,13 @@ public sealed class KeyPrefixedDatabaseTests
     {
         prefixed.SortedSetIncrement("key", "member", 1.23, CommandFlags.None);
         mock.Received().SortedSetIncrement("prefix:key", "member", 1.23, CommandFlags.None);
+    }
+
+    [Fact]
+    public void SortedSetIncrement_When()
+    {
+        prefixed.SortedSetIncrement("key", "member", 1.23, ValueCondition.Exists, CommandFlags.None);
+        mock.Received().SortedSetIncrement("prefix:key", "member", 1.23, ValueCondition.Exists, CommandFlags.None);
     }
 
     [Fact]
@@ -1028,6 +1035,21 @@ public sealed class KeyPrefixedDatabaseTests
         var messageIds = new RedisValue[] { "0-0", "0-1", "0-2" };
         prefixed.StreamAcknowledge("key", "group", messageIds, CommandFlags.None);
         mock.Received().StreamAcknowledge("prefix:key", "group", messageIds, CommandFlags.None);
+    }
+
+    [Fact]
+    public void StreamNegativeAcknowledge_1()
+    {
+        prefixed.StreamNegativeAcknowledge("key", "group", StreamNackMode.Fail, "0-0", CommandFlags.None);
+        mock.Received().StreamNegativeAcknowledge("prefix:key", "group", StreamNackMode.Fail, "0-0", CommandFlags.None);
+    }
+
+    [Fact]
+    public void StreamNegativeAcknowledge_2()
+    {
+        var messageIds = new RedisValue[] { "0-0", "0-1", "0-2" };
+        prefixed.StreamNegativeAcknowledge("key", "group", StreamNackMode.Fail, messageIds, CommandFlags.None);
+        mock.Received().StreamNegativeAcknowledge("prefix:key", "group", StreamNackMode.Fail, messageIds, CommandFlags.None);
     }
 
     [Fact]
@@ -1376,6 +1398,20 @@ public sealed class KeyPrefixedDatabaseTests
     {
         prefixed.StringIncrement("key", 1.23, CommandFlags.None);
         mock.Received().StringIncrement("prefix:key", 1.23, CommandFlags.None);
+    }
+
+    [Fact]
+    public void StringIncrement_3()
+    {
+        prefixed.StringIncrement("key", 123L, TimeSpan.FromSeconds(5), lowerBound: 10, upperBound: 200, flags: CommandFlags.None, options: IncrementOptions.None);
+        mock.Received().StringIncrement("prefix:key", 123L, TimeSpan.FromSeconds(5), 10, 200, IncrementOptions.None, CommandFlags.None);
+    }
+
+    [Fact]
+    public void StringIncrement_4()
+    {
+        prefixed.StringIncrement("key", 1.23, TimeSpan.FromSeconds(5), lowerBound: -1.0, upperBound: 2.0, flags: CommandFlags.None, options: IncrementOptions.Saturate);
+        mock.Received().StringIncrement("prefix:key", 1.23, TimeSpan.FromSeconds(5), -1.0, 2.0, IncrementOptions.Saturate, CommandFlags.None);
     }
 
     [Fact]
@@ -1739,6 +1775,23 @@ public sealed class KeyPrefixedDatabaseTests
         var fields = new NameValueEntry[] { new NameValueEntry("field", "value") };
         prefixed.StreamAdd("key", fields, "*", 1000, false, 100, StreamTrimMode.KeepReferences, CommandFlags.None);
         mock.Received().StreamAdd("prefix:key", fields, "*", 1000, false, 100, StreamTrimMode.KeepReferences, CommandFlags.None);
+    }
+
+    [Fact]
+    public void StreamAdd_WithOptions_1()
+    {
+        var options = new StreamAddOptions { MaxLength = 1000, CreateStream = false };
+        prefixed.StreamAdd("key", "field", "value", options, CommandFlags.None);
+        mock.Received().StreamAdd("prefix:key", "field", "value", options, CommandFlags.None);
+    }
+
+    [Fact]
+    public void StreamAdd_WithOptions_2()
+    {
+        var fields = new NameValueEntry[] { new NameValueEntry("field", "value") };
+        var options = new StreamAddOptions { MinId = "5-5", CreateStream = false };
+        prefixed.StreamAdd("key", fields, options, CommandFlags.None);
+        mock.Received().StreamAdd("prefix:key", fields, options, CommandFlags.None);
     }
 
     [Fact]

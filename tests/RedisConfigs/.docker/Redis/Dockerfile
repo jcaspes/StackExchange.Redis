@@ -1,4 +1,5 @@
-FROM redis:8.2.0
+ARG CLIENT_LIBS_TEST_IMAGE=redislabs/client-libs-test:custom-30445126297-debian
+FROM ${CLIENT_LIBS_TEST_IMAGE}
 
 COPY --from=configs ./Basic /data/Basic/
 COPY --from=configs ./Failover /data/Failover/

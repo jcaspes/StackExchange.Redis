@@ -8,9 +8,10 @@ namespace StackExchange.Redis.Tests;
 public class ConnectionShutdownTests(ITestOutputHelper output) : TestBase(output)
 {
     [Fact(Skip = "Unfriendly")]
-    public async Task ShutdownRaisesConnectionFailedAndRestore()
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
+    public async Task ShutdownRaisesConnectionFailureAndRestore()
     {
-        await using var conn = Create(allowAdmin: true, shared: false);
+        await using var conn = Create(allowAdmin: true, allowSimulateConnectionFailure: true);
 
         int failed = 0, restored = 0;
         Stopwatch watch = Stopwatch.StartNew();
@@ -26,8 +27,8 @@ public class ConnectionShutdownTests(ITestOutputHelper output) : TestBase(output
         };
         var db = conn.GetDatabase();
         await db.PingAsync();
-        Assert.Equal(0, Interlocked.CompareExchange(ref failed, 0, 0));
-        Assert.Equal(0, Interlocked.CompareExchange(ref restored, 0, 0));
+        Assert.Equal(0, Volatile.Read(ref failed));
+        Assert.Equal(0, Volatile.Read(ref restored));
         await Task.Delay(1).ForAwait(); // To make compiler happy in Release
 
         conn.AllowConnect = false;
@@ -38,13 +39,13 @@ public class ConnectionShutdownTests(ITestOutputHelper output) : TestBase(output
 
         db.Ping(CommandFlags.FireAndForget);
         await Task.Delay(250).ForAwait();
-        Assert.Equal(2, Interlocked.CompareExchange(ref failed, 0, 0));
-        Assert.Equal(0, Interlocked.CompareExchange(ref restored, 0, 0));
+        Assert.Equal(2, Volatile.Read(ref failed));
+        Assert.Equal(0, Volatile.Read(ref restored));
         conn.AllowConnect = true;
         db.Ping(CommandFlags.FireAndForget);
         await Task.Delay(1500).ForAwait();
-        Assert.Equal(2, Interlocked.CompareExchange(ref failed, 0, 0));
-        Assert.Equal(2, Interlocked.CompareExchange(ref restored, 0, 0));
+        Assert.Equal(2, Volatile.Read(ref failed));
+        Assert.Equal(2, Volatile.Read(ref restored));
         watch.Stop();
     }
 }

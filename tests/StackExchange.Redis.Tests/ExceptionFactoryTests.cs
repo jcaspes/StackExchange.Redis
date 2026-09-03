@@ -4,7 +4,7 @@ using Xunit;
 
 namespace StackExchange.Redis.Tests;
 
-public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
+public class ExceptionFactoryTests(ITestOutputHelper output, InProcServerFixture fixture) : TestBase(output, fixture)
 {
     [Fact]
     public async Task NullLastException()
@@ -21,23 +21,26 @@ public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
     public void CanGetVersion()
     {
         var libVer = Utils.GetLibVersion();
-        Assert.Matches(@"2\.[0-9]+\.[0-9]+(\.[0-9]+)?", libVer);
+        Assert.Matches(@"[2-3]\.[0-9]+\.[0-9]+(\.[0-9]+)?", libVer);
     }
 
 #if DEBUG
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task MultipleEndpointsThrowConnectionException()
     {
         try
         {
-            await using var conn = Create(keepAlive: 1, connectTimeout: 10000, allowAdmin: true, shared: false);
+            await using var conn = Create(keepAlive: 1, connectTimeout: 10000, allowAdmin: true, allowSimulateConnectionFailure: true);
 
             conn.GetDatabase();
             conn.AllowConnect = false;
 
             foreach (var endpoint in conn.GetEndPoints())
             {
-                conn.GetServer(endpoint).SimulateConnectionFailure(SimulatedFailureType.All);
+                var server = conn.GetServer(endpoint);
+                Assert.SkipUnless(server.CanSimulateConnectionFailure(), "Skipping because server cannot simulate connection failure");
+                server.SimulateConnectionFailure(SimulatedFailureType.All);
             }
 
             var ex = ExceptionFactory.NoConnectionAvailable(conn.UnderlyingMultiplexer, null, null);
@@ -55,16 +58,19 @@ public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
 #endif
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task ServerTakesPrecendenceOverSnapshot()
     {
         try
         {
-            await using var conn = Create(keepAlive: 1, connectTimeout: 10000, allowAdmin: true, shared: false, backlogPolicy: BacklogPolicy.FailFast);
+            await using var conn = Create(keepAlive: 1, connectTimeout: 10000, allowAdmin: true, backlogPolicy: BacklogPolicy.FailFast, allowSimulateConnectionFailure: true);
 
             conn.GetDatabase();
             conn.AllowConnect = false;
 
-            conn.GetServer(conn.GetEndPoints()[0]).SimulateConnectionFailure(SimulatedFailureType.All);
+            var server = conn.GetServer(conn.GetEndPoints()[0]);
+            Assert.SkipUnless(server.CanSimulateConnectionFailure(), "Skipping because server cannot simulate connection failure");
+            server.SimulateConnectionFailure(SimulatedFailureType.All);
 
             var ex = ExceptionFactory.NoConnectionAvailable(conn.UnderlyingMultiplexer, null, conn.GetServerSnapshot()[0]);
             Assert.IsType<RedisConnectionException>(ex);
@@ -110,7 +116,7 @@ public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
             var ex = Assert.IsType<RedisTimeoutException>(rawEx);
             Log("Exception: " + ex.Message);
 
-            // Example format: "Test Timeout, command=PING, inst: 0, qu: 0, qs: 0, aw: False, in: 0, in-pipe: 0, out-pipe: 0, last-in: 0, cur-in: 0, serverEndpoint: 127.0.0.1:6379, mgr: 10 of 10 available, clientName: TimeoutException, IOCP: (Busy=0,Free=1000,Min=8,Max=1000), WORKER: (Busy=2,Free=2045,Min=8,Max=2047), v: 2.1.0 (Please take a look at this article for some common client-side issues that can cause timeouts: https://stackexchange.github.io/StackExchange.Redis/Timeouts)";
+            // Example format: "Test Timeout, command=PING, inst: 0, qu: 0, qs: 0, aw: False, in: 0, in-pipe: 0, out-pipe: 0, last-in: 0, cur-in: 0, serverEndpoint: 127.0.0.1:6379, mgr: 10 of 10 available, clientName: TimeoutException, IOCP: (Busy=0,Free=1000,Min=8,Max=1000), WORKER: (Busy=2,Free=2045,Min=8,Max=2047), v: 2.1.0 (Please take a look at this article for some common client-side issues that can cause timeouts: https://seredis.dev/Timeouts)";
             Assert.StartsWith("Test Timeout, command=PING", ex.Message);
             Assert.Contains("clientName: " + nameof(TimeoutException), ex.Message);
             // Ensure our pipe numbers are in place
@@ -122,8 +128,8 @@ public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
             Assert.Contains("sync-ops: ", ex.Message);
             Assert.Contains("async-ops: ", ex.Message);
             Assert.Contains("conn-sec: n/a", ex.Message);
-            Assert.Contains("aoc: 1", ex.Message);
-#if NETCOREAPP
+            Assert.Contains("aoc: 0", ex.Message);
+#if NET
             // ...POOL: (Threads=33,QueuedItems=0,CompletedItems=5547,Timers=60)...
             Assert.Contains("POOL: ", ex.Message);
             Assert.Contains("Threads=", ex.Message);
@@ -132,7 +138,7 @@ public class ExceptionFactoryTests(ITestOutputHelper output) : TestBase(output)
             Assert.Contains("Timers=", ex.Message);
 #endif
             Assert.DoesNotContain("Unspecified/", ex.Message);
-            Assert.EndsWith(" (Please take a look at this article for some common client-side issues that can cause timeouts: https://stackexchange.github.io/StackExchange.Redis/Timeouts)", ex.Message);
+            Assert.EndsWith(" (Please take a look at this article for some common client-side issues that can cause timeouts: https://seredis.dev/Timeouts)", ex.Message);
             Assert.Null(ex.InnerException);
         }
         finally

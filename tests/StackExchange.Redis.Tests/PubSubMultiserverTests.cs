@@ -8,7 +8,7 @@ namespace StackExchange.Redis.Tests;
 [RunPerProtocol]
 public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFixture fixture) : TestBase(output, fixture)
 {
-    protected override string GetConfiguration() => TestConfig.Current.ClusterServersAndPorts + ",connectTimeout=10000";
+    protected override string GetConfiguration() => GetClusterConfiguration();
 
     [Fact]
     public async Task ChannelSharding()
@@ -25,12 +25,13 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
     }
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task ClusterNodeSubscriptionFailover()
     {
         Skip.UnlessLongRunning();
         Log("Connecting...");
 
-        await using var conn = Create(allowAdmin: true, shared: false);
+        await using var conn = Create(allowAdmin: true, allowSimulateConnectionFailure: true);
 
         var sub = conn.GetSubscriber();
         var channel = RedisChannel.Literal(Me());
@@ -63,7 +64,7 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
         Assert.True(subscribedServerEndpoint.IsSubscriberConnected, "subscribedServerEndpoint.IsSubscriberConnected");
 
         Assert.True(conn.GetSubscriptions().TryGetValue(channel, out var subscription));
-        var initialServer = subscription.GetCurrentServer();
+        var initialServer = subscription.GetAnyCurrentServer();
         Assert.NotNull(initialServer);
         Assert.True(initialServer.IsConnected);
         Log("Connected to: " + initialServer);
@@ -83,10 +84,10 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
             Assert.True(subscribedServerEndpoint.IsConnected, "subscribedServerEndpoint.IsConnected");
             Assert.False(subscribedServerEndpoint.IsSubscriberConnected, "subscribedServerEndpoint.IsSubscriberConnected");
         }
-        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnected);
-        Assert.True(subscription.IsConnected);
+        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnectedAny());
+        Assert.True(subscription.IsConnectedAny());
 
-        var newServer = subscription.GetCurrentServer();
+        var newServer = subscription.GetAnyCurrentServer();
         Assert.NotNull(newServer);
         Assert.NotEqual(newServer, initialServer);
         Log("Now connected to: " + newServer);
@@ -104,6 +105,7 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
     }
 
     [Theory(Skip="TODO: Hostile")]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     [InlineData(CommandFlags.PreferMaster, true)]
     [InlineData(CommandFlags.PreferReplica, true)]
     [InlineData(CommandFlags.DemandMaster, false)]
@@ -113,7 +115,7 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
         var config = TestConfig.Current.PrimaryServerAndPort + "," + TestConfig.Current.ReplicaServerAndPort;
         Log("Connecting...");
 
-        await using var conn = Create(configuration: config, shared: false, allowAdmin: true);
+        await using var conn = Create(configuration: config, allowAdmin: true, allowSimulateConnectionFailure: true);
 
         var sub = conn.GetSubscriber();
         var channel = RedisChannel.Literal(Me() + flags.ToString()); // Individual channel per case to not overlap publishers
@@ -148,7 +150,7 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
         Assert.True(subscribedServerEndpoint.IsSubscriberConnected, "subscribedServerEndpoint.IsSubscriberConnected");
 
         Assert.True(conn.GetSubscriptions().TryGetValue(channel, out var subscription));
-        var initialServer = subscription.GetCurrentServer();
+        var initialServer = subscription.GetAnyCurrentServer();
         Assert.NotNull(initialServer);
         Assert.True(initialServer.IsConnected);
         Log("Connected to: " + initialServer);
@@ -169,10 +171,10 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
 
         if (expectSuccess)
         {
-            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnected);
-            Assert.True(subscription.IsConnected);
+            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnectedAny());
+            Assert.True(subscription.IsConnectedAny());
 
-            var newServer = subscription.GetCurrentServer();
+            var newServer = subscription.GetAnyCurrentServer();
             Assert.NotNull(newServer);
             Assert.NotEqual(newServer, initialServer);
             Log("Now connected to: " + newServer);
@@ -180,16 +182,16 @@ public class PubSubMultiserverTests(ITestOutputHelper output, SharedConnectionFi
         else
         {
             // This subscription shouldn't be able to reconnect by flags (demanding an unavailable server)
-            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnected);
-            Assert.False(subscription.IsConnected);
+            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnectedAny());
+            Assert.False(subscription.IsConnectedAny());
             Log("Unable to reconnect (as expected)");
 
             // Allow connecting back to the original
             conn.AllowConnect = true;
-            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnected);
-            Assert.True(subscription.IsConnected);
+            await UntilConditionAsync(TimeSpan.FromSeconds(5), () => subscription.IsConnectedAny());
+            Assert.True(subscription.IsConnectedAny());
 
-            var newServer = subscription.GetCurrentServer();
+            var newServer = subscription.GetAnyCurrentServer();
             Assert.NotNull(newServer);
             Assert.Equal(newServer, initialServer);
             Log("Now connected to: " + newServer);

@@ -1,6 +1,8 @@
 using System;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Xunit;
@@ -13,7 +15,7 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task VectorSetAdd_BasicOperation(bool suppressFp32)
+    public async Task VectorSetAdd_BasicOperation(bool useFp32)
     {
         await using var conn = Create(require: RedisFeatures.v8_0_0_M04);
         var db = conn.GetDatabase();
@@ -24,18 +26,11 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
 
         var vector = new[] { 1.0f, 2.0f, 3.0f, 4.0f };
 
-        if (suppressFp32) VectorSetAddMessage.SuppressFp32();
-        try
-        {
-            var request = VectorSetAddRequest.Member("element1", vector.AsMemory(), null);
-            var result = await db.VectorSetAddAsync(key, request);
+        var request = VectorSetAddRequest.Member("element1", vector.AsMemory(), null);
+        request.UseFp32 = useFp32;
+        var result = await db.VectorSetAddAsync(key, request);
 
-            Assert.True(result);
-        }
-        finally
-        {
-            if (suppressFp32) VectorSetAddMessage.RestoreFp32();
-        }
+        Assert.True(result);
     }
 
     [Fact]
@@ -61,14 +56,19 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
     }
 
     [Theory]
-    [InlineData(VectorSetQuantization.Int8)]
-    [InlineData(VectorSetQuantization.None)]
-    [InlineData(VectorSetQuantization.Binary)]
-    public async Task VectorSetAdd_WithEverything(VectorSetQuantization quantization)
+    [InlineData(VectorSetQuantization.Int8, false)]
+    [InlineData(VectorSetQuantization.None, false)]
+    [InlineData(VectorSetQuantization.Binary, false)]
+    [InlineData(VectorSetQuantization.Int8, true)]
+    [InlineData(VectorSetQuantization.None, true)]
+    [InlineData(VectorSetQuantization.Binary, true)]
+    public async Task VectorSetAdd_WithEverything(VectorSetQuantization quantization, bool useFp32)
     {
         await using var conn = Create(require: RedisFeatures.v8_0_0_M04);
+        var server = conn.GetServer(RedisKey.Null);
+        Log($"Server version: {server.Version}");
         var db = conn.GetDatabase();
-        var key = Me();
+        var key = Me() + "/" + quantization;
 
         await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
 
@@ -79,17 +79,20 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
             "element1",
             vector.AsMemory(),
             attributes);
+        request.UseFp32 = useFp32;
         request.Quantization = quantization;
-        request.ReducedDimensions = 64;
+        request.ReducedDimensions = 4;
         request.BuildExplorationFactor = 300;
         request.MaxConnections = 32;
         request.UseCheckAndSet = true;
+        Log("Storing...");
         var result = await db.VectorSetAddAsync(
             key,
             request);
 
         Assert.True(result);
 
+        Log("Stored successfully; fetching attributes...");
         // Verify attributes were stored
         var retrievedAttributes = await db.VectorSetGetAttributesJsonAsync(key, "element1");
         Assert.Equal(attributes, retrievedAttributes);
@@ -149,7 +152,7 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task VectorSetContains(bool suppressFp32)
+    public async Task VectorSetContains(bool useFp32)
     {
         await using var conn = Create(require: RedisFeatures.v8_0_0_M04);
         var db = conn.GetDatabase();
@@ -158,28 +161,21 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
         await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
 
         var vector = new[] { 1.0f, 2.0f, 3.0f };
-        if (suppressFp32) VectorSetAddMessage.SuppressFp32();
-        try
-        {
-            var request = VectorSetAddRequest.Member("element1", vector.AsMemory());
-            await db.VectorSetAddAsync(key, request);
+        var request = VectorSetAddRequest.Member("element1", vector.AsMemory());
+        request.UseFp32 = useFp32;
+        await db.VectorSetAddAsync(key, request);
 
-            var exists = await db.VectorSetContainsAsync(key, "element1");
-            var notExists = await db.VectorSetContainsAsync(key, "element2");
+        var exists = await db.VectorSetContainsAsync(key, "element1");
+        var notExists = await db.VectorSetContainsAsync(key, "element2");
 
-            Assert.True(exists);
-            Assert.False(notExists);
-        }
-        finally
-        {
-            if (suppressFp32) VectorSetAddMessage.RestoreFp32();
-        }
+        Assert.True(exists);
+        Assert.False(notExists);
     }
 
     [Theory]
     [InlineData(true)]
     [InlineData(false)]
-    public async Task VectorSetGetApproximateVector(bool suppressFp32)
+    public async Task VectorSetGetApproximateVector(bool useFp32)
     {
         await using var conn = Create(require: RedisFeatures.v8_0_0_M04);
         var db = conn.GetDatabase();
@@ -188,29 +184,22 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
         await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
 
         var originalVector = new[] { 1.0f, 2.0f, 3.0f, 4.0f };
-        if (suppressFp32) VectorSetAddMessage.SuppressFp32();
-        try
+        var request = VectorSetAddRequest.Member("element1", originalVector.AsMemory());
+        request.UseFp32 = useFp32;
+        await db.VectorSetAddAsync(key, request);
+
+        using var retrievedLease = await db.VectorSetGetApproximateVectorAsync(key, "element1");
+
+        Assert.NotNull(retrievedLease);
+        var retrievedVector = retrievedLease.Span;
+
+        Assert.Equal(originalVector.Length, retrievedVector.Length);
+        // Note: Due to quantization, values might not be exactly equal
+        for (int i = 0; i < originalVector.Length; i++)
         {
-            var request = VectorSetAddRequest.Member("element1", originalVector.AsMemory());
-            await db.VectorSetAddAsync(key, request);
-
-            using var retrievedLease = await db.VectorSetGetApproximateVectorAsync(key, "element1");
-
-            Assert.NotNull(retrievedLease);
-            var retrievedVector = retrievedLease.Span;
-
-            Assert.Equal(originalVector.Length, retrievedVector.Length);
-            // Note: Due to quantization, values might not be exactly equal
-            for (int i = 0; i < originalVector.Length; i++)
-            {
-                Assert.True(
-                    Math.Abs(originalVector[i] - retrievedVector[i]) < 0.1f,
-                    $"Vector component {i} differs too much: expected {originalVector[i]}, got {retrievedVector[i]}");
-            }
-        }
-        finally
-        {
-            if (suppressFp32) VectorSetAddMessage.RestoreFp32();
+            Assert.True(
+                Math.Abs(originalVector[i] - retrievedVector[i]) < 0.1f,
+                $"Vector component {i} differs too much: expected {originalVector[i]}, got {retrievedVector[i]}");
         }
     }
 
@@ -671,5 +660,489 @@ public sealed class VectorSetIntegrationTests(ITestOutputHelper output) : TestBa
 
         Assert.True(linksArray.First(l => l.Member == "element2").Score > 0.9); // similar
         Assert.True(linksArray.First(l => l.Member == "element3").Score < 0.8); // less-so
+    }
+
+    [Fact]
+    public async Task VectorSetRange_BasicOperation()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        // Add members with lexicographically ordered names
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "alpha", "beta", "delta", "gamma" }; // note: delta before gamma because lexicographical
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get all members - should be in lexicographical order
+        using var result = await db.VectorSetRangeAsync(key);
+
+        Assert.NotNull(result);
+        Assert.Equal(4, result.Length);
+        // Lexicographical order: alpha, beta, delta, gamma
+        Assert.Equal(new[] { "alpha", "beta", "delta", "gamma" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithStartAndEnd()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "apple", "banana", "cherry", "date", "elderberry" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get range from "banana" to "date" (inclusive)
+        using var result = await db.VectorSetRangeAsync(key, start: "banana", end: "date");
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Length);
+        Assert.Equal(new[] { "banana", "cherry", "date" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithCount()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 10 members
+        for (int i = 0; i < 10; i++)
+        {
+            var request = VectorSetAddRequest.Member($"member{i}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get only 5 members
+        using var result = await db.VectorSetRangeAsync(key, count: 5);
+
+        Assert.NotNull(result);
+        Assert.Equal(5, result.Length);
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithExcludeStart()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "a", "b", "c", "d" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get range excluding start
+        using var result = await db.VectorSetRangeAsync(key, start: "a", end: "d", exclude: Exclude.Start);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Length);
+        Assert.Equal(new[] { "b", "c", "d" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithExcludeEnd()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "a", "b", "c", "d" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get range excluding end
+        using var result = await db.VectorSetRangeAsync(key, start: "a", end: "d", exclude: Exclude.Stop);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Length);
+        Assert.Equal(new[] { "a", "b", "c" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithExcludeBoth()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "a", "b", "c", "d", "e" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get range excluding both boundaries
+        using var result = await db.VectorSetRangeAsync(key, start: "a", end: "e", exclude: Exclude.Both);
+
+        Assert.NotNull(result);
+        Assert.Equal(3, result.Length);
+        Assert.Equal(new[] { "b", "c", "d" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_EmptySet()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        // Don't add any members
+        using var result = await db.VectorSetRangeAsync(key);
+
+        Assert.NotNull(result);
+        Assert.Empty(result.Span.ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_NoMatches()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "a", "b", "c" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Query range with no matching members
+        using var result = await db.VectorSetRangeAsync(key, start: "x", end: "z");
+
+        Assert.NotNull(result);
+        Assert.Empty(result.Span.ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_OpenStart()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "alpha", "beta", "gamma" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get from beginning to "beta"
+        using var result = await db.VectorSetRangeAsync(key, end: "beta");
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Length);
+        Assert.Equal(new[] { "alpha", "beta" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_OpenEnd()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "alpha", "beta", "gamma" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get from "beta" to end
+        using var result = await db.VectorSetRangeAsync(key, start: "beta");
+
+        Assert.NotNull(result);
+        Assert.Equal(2, result.Length);
+        Assert.Equal(new[] { "beta", "gamma" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRange_SyncVsAsync()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 20 members
+        for (int i = 0; i < 20; i++)
+        {
+            var request = VectorSetAddRequest.Member($"m{i:D2}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Call both sync and async
+        using var syncResult = db.VectorSetRange(key, start: "m05", end: "m15");
+        using var asyncResult = await db.VectorSetRangeAsync(key, start: "m05", end: "m15");
+
+        Assert.NotNull(syncResult);
+        Assert.NotNull(asyncResult);
+        Assert.Equal(syncResult.Length, asyncResult.Length);
+        Assert.Equal(syncResult.Span.ToArray().Select(r => (string?)r), asyncResult.Span.ToArray().Select(r => (string?)r));
+    }
+
+    [Fact]
+    public async Task VectorSetRange_WithNumericLexOrder()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+        var members = new[] { "1", "10", "2", "20", "3" };
+
+        foreach (var member in members)
+        {
+            var request = VectorSetAddRequest.Member(member, vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Get all - should be in lexicographical order, not numeric
+        using var result = await db.VectorSetRangeAsync(key);
+
+        Assert.NotNull(result);
+        Assert.Equal(5, result.Length);
+        // Lexicographical order: "1", "10", "2", "20", "3"
+        Assert.Equal(new[] { "1", "10", "2", "20", "3" }, result.Span.ToArray().Select(r => (string?)r).ToArray());
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerate_BasicIteration()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 50 members
+        for (int i = 0; i < 50; i++)
+        {
+            var request = VectorSetAddRequest.Member($"member{i:D3}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Enumerate with batch size of 10
+        var allMembers = new System.Collections.Generic.List<RedisValue>();
+        foreach (var member in db.VectorSetRangeEnumerate(key, count: 10))
+        {
+            allMembers.Add(member);
+        }
+
+        Assert.Equal(50, allMembers.Count);
+
+        // Verify lexicographical order
+        var sorted = allMembers.OrderBy(m => (string?)m, StringComparer.Ordinal).ToList();
+        Assert.Equal(sorted, allMembers);
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerate_WithRange()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add members "a" through "z"
+        for (char c = 'a'; c <= 'z'; c++)
+        {
+            var request = VectorSetAddRequest.Member(c.ToString(), vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Enumerate from "f" to "p" with batch size 5
+        var allMembers = new System.Collections.Generic.List<RedisValue>();
+        foreach (var member in db.VectorSetRangeEnumerate(key, start: "f", end: "p", count: 5))
+        {
+            allMembers.Add(member);
+        }
+
+        // Should get "f" through "p" inclusive (11 members)
+        Assert.Equal(11, allMembers.Count);
+        Assert.Equal("f", (string?)allMembers.First());
+        Assert.Equal("p", (string?)allMembers.Last());
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerate_EarlyBreak()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 100 members
+        for (int i = 0; i < 100; i++)
+        {
+            var request = VectorSetAddRequest.Member($"member{i:D3}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Take only first 25 members
+        var limitedMembers = db.VectorSetRangeEnumerate(key, count: 10).Take(25).ToList();
+
+        Assert.Equal(25, limitedMembers.Count);
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerate_EmptyBatches()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        // Don't add any members
+        var allMembers = new System.Collections.Generic.List<RedisValue>();
+        foreach (var member in db.VectorSetRangeEnumerate(key))
+        {
+            allMembers.Add(member);
+        }
+
+        Assert.Empty(allMembers);
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerateAsync_BasicIteration()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 50 members
+        for (int i = 0; i < 50; i++)
+        {
+            var request = VectorSetAddRequest.Member($"member{i:D3}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        // Enumerate with batch size of 10
+        var allMembers = new System.Collections.Generic.List<RedisValue>();
+        await foreach (var member in db.VectorSetRangeEnumerateAsync(key, count: 10))
+        {
+            allMembers.Add(member);
+        }
+
+        Assert.Equal(50, allMembers.Count);
+
+        // Verify lexicographical order
+        var sorted = allMembers.OrderBy(m => (string?)m, StringComparer.Ordinal).ToList();
+        Assert.Equal(sorted, allMembers);
+    }
+
+    [Fact]
+    public async Task VectorSetRangeEnumerateAsync_WithCancellation()
+    {
+        await using var conn = Create(require: RedisFeatures.v8_4_0_rc1);
+        var db = conn.GetDatabase();
+        var key = Me();
+
+        await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+        var vector = new[] { 1.0f, 2.0f, 3.0f };
+
+        // Add 100 members
+        for (int i = 0; i < 100; i++)
+        {
+            var request = VectorSetAddRequest.Member($"member{i:D3}", vector.AsMemory());
+            await db.VectorSetAddAsync(key, request);
+        }
+
+        using var cts = new CancellationTokenSource();
+        var allMembers = new System.Collections.Generic.List<RedisValue>();
+
+        // Start enumeration and cancel after collecting some members
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
+        {
+            await foreach (var member in db.VectorSetRangeEnumerateAsync(key, count: 10).WithCancellation(cts.Token))
+            {
+                allMembers.Add(member);
+
+                // Cancel after we've collected 25 members
+                if (allMembers.Count == 25)
+                {
+                    cts.Cancel();
+                }
+            }
+        });
+
+        // Should have stopped at or shortly after 25 members
+        Log($"Expected ~25 members, got {allMembers.Count}");
+        Assert.True(allMembers.Count >= 25 && allMembers.Count <= 35, $"Expected ~25 members, got {allMembers.Count}");
     }
 }

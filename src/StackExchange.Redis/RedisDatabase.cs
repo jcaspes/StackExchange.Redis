@@ -2,13 +2,18 @@
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
-using Pipelines.Sockets.Unofficial.Arenas;
+using RESPite.Messages;
+using StackExchange.Redis.Interfaces;
 
 namespace StackExchange.Redis
 {
-    internal partial class RedisDatabase : RedisBase, IDatabase
+    internal partial class RedisDatabase : RedisBase, IDatabase, IInternalDatabaseAsync
     {
         internal RedisDatabase(ConnectionMultiplexer multiplexer, int db, object? asyncState)
             : base(multiplexer, asyncState)
@@ -19,6 +24,20 @@ namespace StackExchange.Redis
         public object? AsyncState => asyncState;
 
         public int Database { get; }
+
+        DatabaseFeatureFlags IInternalDatabaseAsync.GetFeatures(out string name)
+        {
+            name = multiplexer.ClientName;
+            return GetDatabaseFeatures();
+        }
+
+        CancellationToken IInternalDatabaseAsync.GetNextFailover() => CancellationToken.None;
+
+        // the base feature set for this database; wrapping databases (batch, transaction, ...) override
+        // to fold in their own flag. Cluster is intrinsic to the underlying connection, so it lives here.
+        private protected virtual DatabaseFeatureFlags GetDatabaseFeatures()
+            => multiplexer.ServerSelectionStrategy.ServerType == ServerType.Cluster
+                ? DatabaseFeatureFlags.Cluster : DatabaseFeatureFlags.None;
 
         public IBatch CreateBatch(object? asyncState)
         {
@@ -31,6 +50,10 @@ namespace StackExchange.Redis
             if (this is IBatch) throw new NotSupportedException("Nested transactions are not supported");
             return new RedisTransaction(this, asyncState);
         }
+
+        // the async-only IDatabaseAsync slot; the return type differs (ITransactionAsync vs ITransaction),
+        // so it does not implicitly bind to the public method above
+        ITransactionAsync IDatabaseAsync.CreateTransaction(object? asyncState) => CreateTransaction(asyncState);
 
         private ITransaction? CreateTransactionIfAvailable(object? asyncState)
         {
@@ -218,7 +241,7 @@ namespace StackExchange.Redis
                 : Message.Create(Database, flags, RedisCommand.GEOSEARCHSTORE, destinationKey, sourceKey, redisValues.ToArray());
         }
 
-        private Message GetGeoRadiusMessage(in RedisKey key, RedisValue? member, double longitude, double latitude, double radius, GeoUnit unit, int count, Order? order, GeoRadiusOptions options, CommandFlags flags)
+        internal Message GetGeoRadiusMessage(in RedisKey key, RedisValue? member, double longitude, double latitude, double radius, GeoUnit unit, int count, Order? order, GeoRadiusOptions options, CommandFlags flags)
         {
             var redisValues = new List<RedisValue>(10);
             RedisCommand command;
@@ -247,6 +270,10 @@ namespace StackExchange.Redis
             {
                 redisValues.Add(order.Value.ToLiteral());
             }
+
+            // GEORADIUS[BYMEMBER] defaults to a write category because of the STORE/STOREDIST variants, which
+            // we can't see through Execute; this typed API never emits them, so it is always a pure query.
+            flags = flags.WithCategory(CommandFlags.CommandRetryReadOnly);
 
             return Message.Create(Database, flags, command, key, redisValues.ToArray());
         }
@@ -396,7 +423,7 @@ namespace StackExchange.Redis
 
         public ExpireResult[] HashFieldExpire(RedisKey key, RedisValue[] hashFields, DateTime expiry, ExpireWhen when = ExpireWhen.Always, CommandFlags flags = CommandFlags.None)
         {
-            long milliseconds = GetUnixTimeMilliseconds(expiry);
+            long milliseconds = Expiration.GetUnixTimeMilliseconds(expiry);
             return HashFieldExpireExecute(key, milliseconds, when, PickExpireAtCommandByPrecision, SyncCustomArrExecutor<ExpireResult, ResultProcessor<ExpireResult[]>>, ResultProcessor.ExpireResultArray, flags, hashFields);
         }
 
@@ -408,16 +435,23 @@ namespace StackExchange.Redis
 
         public Task<ExpireResult[]> HashFieldExpireAsync(RedisKey key, RedisValue[] hashFields, DateTime expiry, ExpireWhen when = ExpireWhen.Always, CommandFlags flags = CommandFlags.None)
         {
-            long milliseconds = GetUnixTimeMilliseconds(expiry);
+            long milliseconds = Expiration.GetUnixTimeMilliseconds(expiry);
             return HashFieldExpireExecute(key, milliseconds, when, PickExpireAtCommandByPrecision, AsyncCustomArrExecutor<ExpireResult, ResultProcessor<ExpireResult[]>>, ResultProcessor.ExpireResultArray, flags, hashFields);
         }
 
         private T HashFieldExpireExecute<T, TProcessor>(RedisKey key, long milliseconds, ExpireWhen when, Func<bool, RedisCommand> getCmd, CustomExecutor<T, TProcessor> executor, TProcessor processor, CommandFlags flags, params RedisValue[] hashFields)
+            => executor(GetHashFieldExpireMessage(key, milliseconds, when, getCmd, flags, hashFields), processor);
+
+        internal Message GetHashFieldExpireMessage(RedisKey key, long milliseconds, ExpireWhen when, Func<bool, RedisCommand> getCmd, CommandFlags flags, params RedisValue[] hashFields)
         {
             if (hashFields == null) throw new ArgumentNullException(nameof(hashFields));
             var useSeconds = milliseconds % 1000 == 0;
             var cmd = getCmd(useSeconds);
             long expiry = useSeconds ? (milliseconds / 1000) : milliseconds;
+
+            // H[P]EXPIRE[AT] ... NX/XX/GT/LT is a conditional write, exactly as for the key-level EXPIRE;
+            // a bare one keeps the last-wins default
+            flags = flags.WithCategory(when.AsRetryCategory());
 
             var values = when switch
             {
@@ -425,8 +459,7 @@ namespace StackExchange.Redis
                 _ => new List<RedisValue> { expiry, when.ToLiteral(), RedisLiterals.FIELDS, hashFields.Length },
             };
             values.AddRange(hashFields);
-            var msg = Message.Create(Database, flags, cmd, key, values.ToArray());
-            return executor(msg, processor);
+            return Message.Create(Database, flags, cmd, key, values.ToArray());
         }
 
         private static RedisCommand PickExpireCommandByPrecision(bool useSeconds) => useSeconds ? RedisCommand.HEXPIRE : RedisCommand.HPEXPIRE;
@@ -487,8 +520,11 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
-        private Message HashFieldGetAndSetExpiryMessage(in RedisKey key, in RedisValue hashField, ExpiryToken expiry, CommandFlags flags) =>
-            expiry.Tokens switch
+        internal Message HashFieldGetAndSetExpiryMessage(in RedisKey key, in RedisValue hashField, Expiration expiry, CommandFlags flags)
+        {
+            var tokens = expiry.GetTokenCount(allowEnx: false);
+            flags = WithGetExCategory(flags, tokens);
+            return tokens switch
             {
                 // expiry, for example EX 10
                 2 => Message.Create(Database, flags, RedisCommand.HGETEX, key, expiry.Operand, expiry.Value,  RedisLiterals.FIELDS, 1, hashField),
@@ -497,8 +533,16 @@ namespace StackExchange.Redis
                 // default case when neither expiry nor persist are set
                 _ => Message.Create(Database, flags, RedisCommand.HGETEX, key, RedisLiterals.FIELDS, 1, hashField),
             };
+        }
 
-        private Message HashFieldGetAndSetExpiryMessage(in RedisKey key, RedisValue[] hashFields, ExpiryToken expiry, CommandFlags flags)
+        /// <summary>
+        /// A bare GETEX/HGETEX is a pure read (the per-command default), but any of EX/PX/EXAT/PXAT/PERSIST
+        /// mutates the TTL, making it a write.
+        /// </summary>
+        private static CommandFlags WithGetExCategory(CommandFlags flags, int expiryTokenCount)
+            => expiryTokenCount == 0 ? flags : flags.WithCategory(CommandFlags.CommandRetryWriteLastWins);
+
+        private Message HashFieldGetAndSetExpiryMessage(in RedisKey key, RedisValue[] hashFields, Expiration expiry, CommandFlags flags)
         {
             if (hashFields is null) throw new ArgumentNullException(nameof(hashFields));
             if (hashFields.Length == 1)
@@ -506,14 +550,15 @@ namespace StackExchange.Redis
                 return HashFieldGetAndSetExpiryMessage(key, in hashFields[0], expiry, flags);
             }
 
-            // precision, time, FIELDS, hashFields.Length
-            int extraTokens = expiry.Tokens + 2;
-
-            RedisValue[] values = new RedisValue[expiry.Tokens + 2 + hashFields.Length];
+            // precision, time, FIELDS, hashFields.Length, {N x fields}
+            int expiryTokenCount = expiry.GetTokenCount(allowEnx: false);
+            flags = WithGetExCategory(flags, expiryTokenCount);
+            int extraTokens = expiryTokenCount + 2;
+            RedisValue[] values = new RedisValue[extraTokens + hashFields.Length];
 
             int index = 0;
             // add PERSIST or expiry values
-            switch (expiry.Tokens)
+            switch (expiryTokenCount)
             {
                 case 2:
                     values[index++] = expiry.Operand;
@@ -527,7 +572,7 @@ namespace StackExchange.Redis
             values[index++] = RedisLiterals.FIELDS;
             values[index++] = hashFields.Length;
             // check we've added everything we expected to
-            Debug.Assert(index == extraTokens + hashFields.Length);
+            Debug.Assert(index == extraTokens, $"token mismatch: {index} vs {extraTokens}");
 
             // Add hash fields to the array
             hashFields.AsSpan().CopyTo(values.AsSpan(index));
@@ -537,7 +582,7 @@ namespace StackExchange.Redis
 
         public RedisValue HashFieldGetAndSetExpiry(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteSync(msg, ResultProcessor.RedisValueFromArray);
         }
 
@@ -549,7 +594,7 @@ namespace StackExchange.Redis
 
         public Lease<byte>? HashFieldGetLeaseAndSetExpiry(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteSync(msg, ResultProcessor.LeaseFromArray);
         }
 
@@ -563,7 +608,7 @@ namespace StackExchange.Redis
         {
             if (hashFields == null) throw new ArgumentNullException(nameof(hashFields));
             if (hashFields.Length == 0) return Array.Empty<RedisValue>();
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashFields, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashFields, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteSync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
@@ -577,7 +622,7 @@ namespace StackExchange.Redis
 
         public Task<RedisValue> HashFieldGetAndSetExpiryAsync(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValueFromArray);
         }
 
@@ -589,7 +634,7 @@ namespace StackExchange.Redis
 
         public Task<Lease<byte>?> HashFieldGetLeaseAndSetExpiryAsync(RedisKey key, RedisValue hashField, TimeSpan? expiry = null, bool persist = false, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashField, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteAsync(msg, ResultProcessor.LeaseFromArray);
         }
 
@@ -603,7 +648,7 @@ namespace StackExchange.Redis
         {
             if (hashFields == null) throw new ArgumentNullException(nameof(hashFields));
             if (hashFields.Length == 0) return CompletedTask<RedisValue[]>.FromDefault(Array.Empty<RedisValue>(), asyncState);
-            var msg = HashFieldGetAndSetExpiryMessage(key, hashFields, ExpiryToken.Persist(expiry, persist), flags);
+            var msg = HashFieldGetAndSetExpiryMessage(key, hashFields, Expiration.CreateOrPersist(expiry, persist), flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
@@ -615,11 +660,12 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
-        private Message HashFieldSetAndSetExpiryMessage(in RedisKey key, in RedisValue field, in RedisValue value, ExpiryToken expiry, When when, CommandFlags flags)
+        private Message HashFieldSetAndSetExpiryMessage(in RedisKey key, in RedisValue field, in RedisValue value, Expiration expiry, When when, CommandFlags flags)
         {
+            int expiryTokenCount = expiry.GetTokenCount(allowEnx: false);
             if (when == When.Always)
             {
-                return expiry.Tokens switch
+                return expiryTokenCount switch
                 {
                     2 => Message.Create(Database, flags, RedisCommand.HSETEX, key, expiry.Operand, expiry.Value, RedisLiterals.FIELDS, 1, field, value),
                     1 => Message.Create(Database, flags, RedisCommand.HSETEX, key, expiry.Operand, RedisLiterals.FIELDS, 1, field, value),
@@ -636,7 +682,7 @@ namespace StackExchange.Redis
                     _ => throw new ArgumentOutOfRangeException(nameof(when)),
                 };
 
-                return expiry.Tokens switch
+                return expiryTokenCount switch
                 {
                     2 => Message.Create(Database, flags, RedisCommand.HSETEX, key, existance, expiry.Operand, expiry.Value, RedisLiterals.FIELDS, 1, field, value),
                     1 => Message.Create(Database, flags, RedisCommand.HSETEX, key, existance, expiry.Operand, RedisLiterals.FIELDS, 1, field, value),
@@ -645,7 +691,7 @@ namespace StackExchange.Redis
             }
         }
 
-        private Message HashFieldSetAndSetExpiryMessage(in RedisKey key, HashEntry[] hashFields, ExpiryToken expiry, When when, CommandFlags flags)
+        private Message HashFieldSetAndSetExpiryMessage(in RedisKey key, HashEntry[] hashFields, Expiration expiry, When when, CommandFlags flags)
         {
             if (hashFields.Length == 1)
             {
@@ -653,7 +699,8 @@ namespace StackExchange.Redis
                 return HashFieldSetAndSetExpiryMessage(key, field.Name, field.Value, expiry, when, flags);
             }
             // Determine the base array size
-            var extraTokens = expiry.Tokens + (when == When.Always ? 2 : 3); // [FXX|FNX] {expiry} FIELDS {length}
+            int expiryTokenCount = expiry.GetTokenCount(allowEnx: false);
+            var extraTokens = expiryTokenCount + (when == When.Always ? 2 : 3); // [FXX|FNX] {expiry} FIELDS {length}
             RedisValue[] values = new RedisValue[(hashFields.Length * 2) + extraTokens];
 
             int index = 0;
@@ -670,7 +717,7 @@ namespace StackExchange.Redis
                 default:
                     throw new ArgumentOutOfRangeException(nameof(when));
             }
-            switch (expiry.Tokens)
+            switch (expiryTokenCount)
             {
                 case 2:
                     values[index++] = expiry.Operand;
@@ -693,7 +740,7 @@ namespace StackExchange.Redis
 
         public RedisValue HashFieldSetAndSetExpiry(RedisKey key, RedisValue field, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldSetAndSetExpiryMessage(key, field, value, ExpiryToken.KeepTtl(expiry, keepTtl), when, flags);
+            var msg = HashFieldSetAndSetExpiryMessage(key, field, value, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
 
@@ -706,7 +753,7 @@ namespace StackExchange.Redis
         public RedisValue HashFieldSetAndSetExpiry(RedisKey key, HashEntry[] hashFields, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
             if (hashFields == null) throw new ArgumentNullException(nameof(hashFields));
-            var msg = HashFieldSetAndSetExpiryMessage(key, hashFields, ExpiryToken.KeepTtl(expiry, keepTtl), when, flags);
+            var msg = HashFieldSetAndSetExpiryMessage(key, hashFields, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
         public RedisValue HashFieldSetAndSetExpiry(RedisKey key, HashEntry[] hashFields, DateTime expiry, When when = When.Always, CommandFlags flags = CommandFlags.None)
@@ -718,7 +765,7 @@ namespace StackExchange.Redis
 
         public Task<RedisValue> HashFieldSetAndSetExpiryAsync(RedisKey key, RedisValue field, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = HashFieldSetAndSetExpiryMessage(key, field, value, ExpiryToken.KeepTtl(expiry, keepTtl), when, flags);
+            var msg = HashFieldSetAndSetExpiryMessage(key, field, value, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
@@ -731,7 +778,7 @@ namespace StackExchange.Redis
         public Task<RedisValue> HashFieldSetAndSetExpiryAsync(RedisKey key, HashEntry[] hashFields, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
             if (hashFields == null) throw new ArgumentNullException(nameof(hashFields));
-            var msg = HashFieldSetAndSetExpiryMessage(key, hashFields, ExpiryToken.KeepTtl(expiry, keepTtl), when, flags);
+            var msg = HashFieldSetAndSetExpiryMessage(key, hashFields, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
         public Task<RedisValue> HashFieldSetAndSetExpiryAsync(RedisKey key, HashEntry[] hashFields, DateTime expiry, When when = When.Always, CommandFlags flags = CommandFlags.None)
@@ -977,6 +1024,36 @@ namespace StackExchange.Redis
         {
             var msg = GetHashSetMessage(key, hashFields, flags);
             return ExecuteAsync(msg, ResultProcessor.DemandOK);
+        }
+
+        public void HashImport(RedisKey key, HashImport fieldSet, ReadOnlyMemory<RedisValue> values, CommandFlags flags = CommandFlags.None)
+            => ExecuteSync(GetHashImportMessage(key, fieldSet, values, flags), ResultProcessor.DemandOK);
+
+        public Task HashImportAsync(RedisKey key, HashImport fieldSet, ReadOnlyMemory<RedisValue> values, CommandFlags flags = CommandFlags.None)
+            => ExecuteAsync(GetHashImportMessage(key, fieldSet, values, flags), ResultProcessor.DemandOK);
+
+        private HashImportSetMessage GetHashImportMessage(in RedisKey key, HashImport fieldSet, ReadOnlyMemory<RedisValue> values, CommandFlags flags)
+        {
+            if (fieldSet is null) throw new ArgumentNullException(nameof(fieldSet));
+            fieldSet.ThrowIfDisposed();
+            if (values.Length != fieldSet.FieldCount)
+            {
+                throw new ArgumentException(
+                    $"{values.Length} value(s) were supplied but the field-set defines {fieldSet.FieldCount} field(s); the counts must match.",
+                    nameof(values));
+            }
+            // HIMPORT needs its PREPARE and SET on the same physical connection; the multiplexer provides that via
+            // write-path injection (exactly like SELECT). That injection cannot be reused inside a MULTI: every queued
+            // command adds a slot to the positional EXEC result array, but the transaction only accounts for the ops it
+            // knows about - an injected PREPARE would desync every following result. (This is the same reason
+            // SELECT-injection is itself forbidden inside a transaction.) Supporting it would require enqueuing PREPARE
+            // as a tracked transaction op, which is deliberately out of scope. Batches are fine: an ordered pipeline
+            // with no EXEC aggregate, so PREPARE injects per connection as normal.
+            if (this is ITransaction)
+            {
+                throw new NotSupportedException("HashImport is not supported inside a transaction; the connection-local HIMPORT PREPARE cannot be injected into a MULTI/EXEC without desyncing the EXEC result array.");
+            }
+            return new HashImportSetMessage(Database, flags, fieldSet, key, values);
         }
 
         public Task<bool> HashSetIfNotExistsAsync(RedisKey key, RedisValue hashField, RedisValue value, CommandFlags flags)
@@ -1308,7 +1385,8 @@ namespace StackExchange.Redis
             private readonly MigrateOptions migrateOptions;
             private readonly int timeoutMilliseconds;
             private readonly int toDatabase;
-            private readonly RedisValue toHost, toPort;
+            private readonly string toHost;
+            private readonly int toPort;
 
             public KeyMigrateCommandMessage(int db, RedisKey key, EndPoint toServer, int toDatabase, int timeoutMilliseconds, MigrateOptions migrateOptions, CommandFlags flags)
                 : base(db, flags, RedisCommand.MIGRATE, key)
@@ -1316,25 +1394,25 @@ namespace StackExchange.Redis
                 if (toServer == null) throw new ArgumentNullException(nameof(toServer));
                 if (!Format.TryGetHostPort(toServer, out string? toHost, out int? toPort)) throw new ArgumentException($"Couldn't get host and port from {toServer}", nameof(toServer));
                 this.toHost = toHost;
-                this.toPort = toPort;
+                this.toPort = toPort.Value;
                 if (toDatabase < 0) throw new ArgumentOutOfRangeException(nameof(toDatabase));
                 this.toDatabase = toDatabase;
                 this.timeoutMilliseconds = timeoutMilliseconds;
                 this.migrateOptions = migrateOptions;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
                 bool isCopy = (migrateOptions & MigrateOptions.Copy) != 0;
                 bool isReplace = (migrateOptions & MigrateOptions.Replace) != 0;
-                physical.WriteHeader(Command, 5 + (isCopy ? 1 : 0) + (isReplace ? 1 : 0));
-                physical.WriteBulkString(toHost);
-                physical.WriteBulkString(toPort);
-                physical.Write(Key);
-                physical.WriteBulkString(toDatabase);
-                physical.WriteBulkString(timeoutMilliseconds);
-                if (isCopy) physical.WriteBulkString(RedisLiterals.COPY);
-                if (isReplace) physical.WriteBulkString(RedisLiterals.REPLACE);
+                writer.WriteHeader(Command, 5 + (isCopy ? 1 : 0) + (isReplace ? 1 : 0));
+                writer.WriteBulkString(toHost);
+                writer.WriteBulkString(toPort);
+                writer.Write(Key);
+                writer.WriteBulkString(toDatabase);
+                writer.WriteBulkString(timeoutMilliseconds);
+                if (isCopy) writer.WriteRaw("$4\r\nCOPY\r\n"u8);
+                if (isReplace) writer.WriteRaw("$7\r\nREPLACE\r\n"u8);
             }
 
             public override int ArgCount
@@ -1626,6 +1704,21 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
+        public RedisValue[]? ListMove(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, long count, ListMoveCount mode = ListMoveCount.UpTo, ListMoveOrder order = ListMoveOrder.Bulk, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetListMoveMultipleMessage(sourceKey, destinationKey, sourceSide, destinationSide, count, mode, order, flags);
+            return ExecuteSync(msg, ResultProcessor.NullableRedisValueArray);
+        }
+
+        public Task<RedisValue[]?> ListMoveAsync(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, long count, ListMoveCount mode = ListMoveCount.UpTo, ListMoveOrder order = ListMoveOrder.Bulk, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetListMoveMultipleMessage(sourceKey, destinationKey, sourceSide, destinationSide, count, mode, order, flags);
+            return ExecuteAsync(msg, ResultProcessor.NullableRedisValueArray);
+        }
+
+        private Message GetListMoveMultipleMessage(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, long count, ListMoveCount mode, ListMoveOrder order, CommandFlags flags) =>
+            Message.Create(Database, flags, RedisCommand.LMOVEM, sourceKey, destinationKey, sourceSide.ToLiteral(), destinationSide.ToLiteral(), mode.ToLiteral(), count, order.ToLiteral());
+
         public RedisValue[] ListRange(RedisKey key, long start = 0, long stop = -1, CommandFlags flags = CommandFlags.None)
         {
             var msg = Message.Create(Database, flags, RedisCommand.LRANGE, key, start, stop);
@@ -1770,18 +1863,33 @@ namespace StackExchange.Redis
 
         public bool LockExtend(RedisKey key, RedisValue value, TimeSpan expiry, CommandFlags flags = CommandFlags.None)
         {
-            if (value.IsNull) throw new ArgumentNullException(nameof(value));
-            var tran = GetLockExtendTransaction(key, value, expiry);
+            var msg = TryGetLockExtendMessage(key, value, expiry, flags, out var server);
+            if (msg is not null) return ExecuteSync(msg, ResultProcessor.Boolean, server);
 
+            var tran = GetLockExtendTransaction(key, value, expiry);
             if (tran != null) return tran.Execute(flags);
 
             // without transactions (twemproxy etc), we can't enforce the "value" part
             return KeyExpire(key, expiry, flags);
         }
 
-        public Task<bool> LockExtendAsync(RedisKey key, RedisValue value, TimeSpan expiry, CommandFlags flags = CommandFlags.None)
+        private Message? TryGetLockExtendMessage(in RedisKey key, in RedisValue value, TimeSpan expiry, CommandFlags flags, out ServerEndPoint? server, [CallerMemberName] string? caller = null)
         {
             if (value.IsNull) throw new ArgumentNullException(nameof(value));
+
+            // note that lock tokens are expected to be small, so: we'll use IFEQ rather than IFDEQ, for reliability
+            // note possible future extension:[P]EXPIRE ... IF* https://github.com/redis/redis/issues/14505
+            var features = GetFeatures(key, flags, RedisCommand.SET, out server);
+            return features.SetWithValueCheck
+                ? GetStringSetMessage(key, value, expiry, ValueCondition.Equal(value), flags, caller) // use check-and-set
+                : null;
+        }
+
+        public Task<bool> LockExtendAsync(RedisKey key, RedisValue value, TimeSpan expiry, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = TryGetLockExtendMessage(key, value, expiry, flags, out var server);
+            if (msg is not null) return ExecuteAsync(msg, ResultProcessor.Boolean, server);
+
             var tran = GetLockExtendTransaction(key, value, expiry);
             if (tran != null) return tran.ExecuteAsync(flags);
 
@@ -1801,7 +1909,9 @@ namespace StackExchange.Redis
 
         public bool LockRelease(RedisKey key, RedisValue value, CommandFlags flags = CommandFlags.None)
         {
-            if (value.IsNull) throw new ArgumentNullException(nameof(value));
+            var msg = TryGetLockReleaseMessage(key, value, flags, out var server);
+            if (msg is not null) return ExecuteSync(msg, ResultProcessor.Boolean, server);
+
             var tran = GetLockReleaseTransaction(key, value);
             if (tran != null) return tran.Execute(flags);
 
@@ -1809,9 +1919,22 @@ namespace StackExchange.Redis
             return KeyDelete(key, flags);
         }
 
-        public Task<bool> LockReleaseAsync(RedisKey key, RedisValue value, CommandFlags flags = CommandFlags.None)
+        private Message? TryGetLockReleaseMessage(in RedisKey key, in RedisValue value, CommandFlags flags, out ServerEndPoint? server, [CallerMemberName] string? caller = null)
         {
             if (value.IsNull) throw new ArgumentNullException(nameof(value));
+
+            // note that lock tokens are expected to be small, so: we'll use IFEQ rather than IFDEQ, for reliability
+            var features = GetFeatures(key, flags, RedisCommand.DELEX, out server);
+            return features.DeleteWithValueCheck
+                ? GetStringDeleteMessage(key, ValueCondition.Equal(value), flags, caller) // use check-and-delete
+                : null;
+        }
+
+        public Task<bool> LockReleaseAsync(RedisKey key, RedisValue value, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = TryGetLockReleaseMessage(key, value, flags, out var server);
+            if (msg is not null) return ExecuteAsync(msg, ResultProcessor.Boolean, server);
+
             var tran = GetLockReleaseTransaction(key, value);
             if (tran != null) return tran.ExecuteAsync(flags);
 
@@ -1870,15 +1993,17 @@ namespace StackExchange.Redis
         public long Publish(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             if (channel.IsNullOrEmpty) throw new ArgumentNullException(nameof(channel));
-            var msg = Message.Create(-1, flags, channel.PublishCommand, channel, message);
-            return ExecuteSync(msg, ResultProcessor.Int64);
+            var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
+            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
+            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
         }
 
         public Task<long> PublishAsync(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             if (channel.IsNullOrEmpty) throw new ArgumentNullException(nameof(channel));
-            var msg = Message.Create(-1, flags, channel.PublishCommand, channel, message);
-            return ExecuteAsync(msg, ResultProcessor.Int64);
+            var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
+            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
+            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
         }
 
         public RedisResult Execute(string command, params object[] args)
@@ -2024,49 +2149,49 @@ namespace StackExchange.Redis
 
         public RedisValue[] SetCombine(SetOperation operation, RedisKey first, RedisKey second, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, false), first, second);
+            var msg = Message.Create(Database, flags, operation.ToSetCommand(), first, second);
             return ExecuteSync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
         public RedisValue[] SetCombine(SetOperation operation, RedisKey[] keys, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, false), keys);
+            var msg = Message.Create(Database, flags, operation.ToSetCommand(), keys);
             return ExecuteSync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
         public long SetCombineAndStore(SetOperation operation, RedisKey destination, RedisKey first, RedisKey second, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, true), destination, first, second);
+            var msg = Message.Create(Database, flags, operation.ToSetStoreCommand(), destination, first, second);
             return ExecuteSync(msg, ResultProcessor.Int64);
         }
 
         public long SetCombineAndStore(SetOperation operation, RedisKey destination, RedisKey[] keys, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, true), destination, keys);
+            var msg = Message.Create(Database, flags, operation.ToSetStoreCommand(), destination, keys);
             return ExecuteSync(msg, ResultProcessor.Int64);
         }
 
         public Task<long> SetCombineAndStoreAsync(SetOperation operation, RedisKey destination, RedisKey first, RedisKey second, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, true), destination, first, second);
+            var msg = Message.Create(Database, flags, operation.ToSetStoreCommand(), destination, first, second);
             return ExecuteAsync(msg, ResultProcessor.Int64);
         }
 
         public Task<long> SetCombineAndStoreAsync(SetOperation operation, RedisKey destination, RedisKey[] keys, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, true), destination, keys);
+            var msg = Message.Create(Database, flags, operation.ToSetStoreCommand(), destination, keys);
             return ExecuteAsync(msg, ResultProcessor.Int64);
         }
 
         public Task<RedisValue[]> SetCombineAsync(SetOperation operation, RedisKey first, RedisKey second, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, false), first, second);
+            var msg = Message.Create(Database, flags, operation.ToSetCommand(), first, second);
             return ExecuteAsync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
         public Task<RedisValue[]> SetCombineAsync(SetOperation operation, RedisKey[] keys, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(Database, flags, SetOperationCommand(operation, false), keys);
+            var msg = Message.Create(Database, flags, operation.ToSetCommand(), keys);
             return ExecuteAsync(msg, ResultProcessor.RedisValueArray, defaultValue: Array.Empty<RedisValue>());
         }
 
@@ -2096,13 +2221,25 @@ namespace StackExchange.Redis
 
         public long SetIntersectionLength(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetSetIntersectionLengthMessage(keys, limit, flags);
+            var msg = GetSetCardinalityMessage(RedisCommand.SINTERCARD, keys, limit, flags);
             return ExecuteSync(msg, ResultProcessor.Int64);
         }
 
         public Task<long> SetIntersectionLengthAsync(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetSetIntersectionLengthMessage(keys, limit, flags);
+            var msg = GetSetCardinalityMessage(RedisCommand.SINTERCARD, keys, limit, flags);
+            return ExecuteAsync(msg, ResultProcessor.Int64);
+        }
+
+        public long SetCombineLength(SetOperation operation, RedisKey[] keys, long limit = 0, bool approximate = false, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetSetCombineLengthMessage(operation, keys, limit, approximate, flags);
+            return ExecuteSync(msg, ResultProcessor.Int64);
+        }
+
+        public Task<long> SetCombineLengthAsync(SetOperation operation, RedisKey[] keys, long limit = 0, bool approximate = false, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetSetCombineLengthMessage(operation, keys, limit, approximate, flags);
             return ExecuteAsync(msg, ResultProcessor.Int64);
         }
 
@@ -2403,10 +2540,22 @@ namespace StackExchange.Redis
             return ExecuteSync(msg, ResultProcessor.Double);
         }
 
+        public double? SortedSetIncrement(RedisKey key, RedisValue member, double value, ValueCondition when, CommandFlags flags)
+        {
+            var msg = GetSortedSetIncrementMessage(key, member, value, when, flags);
+            return ExecuteSync(msg, ResultProcessor.NullableDouble);
+        }
+
         public Task<double> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, CommandFlags flags = CommandFlags.None)
         {
             var msg = Message.Create(Database, flags, RedisCommand.ZINCRBY, key, value, member);
             return ExecuteAsync(msg, ResultProcessor.Double);
+        }
+
+        public Task<double?> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, ValueCondition when, CommandFlags flags)
+        {
+            var msg = GetSortedSetIncrementMessage(key, member, value, when, flags);
+            return ExecuteAsync(msg, ResultProcessor.NullableDouble);
         }
 
         public long SortedSetIntersectionLength(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None)
@@ -2747,16 +2896,22 @@ namespace StackExchange.Redis
 
         public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStreamAddMessage(
-                key,
-                messageId ?? StreamConstants.AutoGeneratedId,
-                maxLength,
-                useApproximateMaxLength,
-                new NameValueEntry(streamField, streamValue),
-                limit,
-                mode,
-                flags);
+            var options = LegacyStreamAddOptions(messageId, StreamIdempotentId.Empty, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
+            return ExecuteSync(msg, ResultProcessor.RedisValue);
+        }
 
+        public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
+        {
+            var options = LegacyStreamAddOptions(null, in idempotentId, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
+            return ExecuteSync(msg, ResultProcessor.RedisValue);
+        }
+
+        public RedisValue StreamAdd(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamAddOptions options, CommandFlags flags = CommandFlags.None)
+        {
+            options.ThrowIfInvalid();
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
 
@@ -2765,16 +2920,22 @@ namespace StackExchange.Redis
 
         public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStreamAddMessage(
-                key,
-                messageId ?? StreamConstants.AutoGeneratedId,
-                maxLength,
-                useApproximateMaxLength,
-                new NameValueEntry(streamField, streamValue),
-                limit,
-                mode,
-                flags);
+            var options = LegacyStreamAddOptions(messageId, StreamIdempotentId.Empty, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
+            return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
 
+        public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
+        {
+            var options = LegacyStreamAddOptions(null, in idempotentId, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
+            return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamAddOptions options, CommandFlags flags = CommandFlags.None)
+        {
+            options.ThrowIfInvalid();
+            var msg = GetStreamAddMessage(key, in options, new NameValueEntry(streamField, streamValue), flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
@@ -2783,16 +2944,22 @@ namespace StackExchange.Redis
 
         public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStreamAddMessage(
-                key,
-                messageId ?? StreamConstants.AutoGeneratedId,
-                maxLength,
-                useApproximateMaxLength,
-                streamPairs,
-                limit,
-                mode,
-                flags);
+            var options = LegacyStreamAddOptions(messageId, StreamIdempotentId.Empty, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
+            return ExecuteSync(msg, ResultProcessor.RedisValue);
+        }
 
+        public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
+        {
+            var options = LegacyStreamAddOptions(null, in idempotentId, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
+            return ExecuteSync(msg, ResultProcessor.RedisValue);
+        }
+
+        public RedisValue StreamAdd(RedisKey key, NameValueEntry[] streamPairs, StreamAddOptions options, CommandFlags flags = CommandFlags.None)
+        {
+            options.ThrowIfInvalid();
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
 
@@ -2801,17 +2968,79 @@ namespace StackExchange.Redis
 
         public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStreamAddMessage(
-                key,
-                messageId ?? StreamConstants.AutoGeneratedId,
-                maxLength,
-                useApproximateMaxLength,
-                streamPairs,
-                limit,
-                mode,
-                flags);
-
+            var options = LegacyStreamAddOptions(messageId, StreamIdempotentId.Empty, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None)
+        {
+            var options = LegacyStreamAddOptions(null, in idempotentId, maxLength, useApproximateMaxLength, limit, mode);
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
+            return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, StreamAddOptions options, CommandFlags flags = CommandFlags.None)
+        {
+            options.ThrowIfInvalid();
+            var msg = GetStreamAddMessage(key, in options, streamPairs, flags);
+            return ExecuteAsync(msg, ResultProcessor.RedisValue);
+        }
+
+        public void StreamConfigure(RedisKey key, StreamConfiguration configuration, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetStreamConfigureMessage(key, configuration, flags);
+            ExecuteSync(msg, ResultProcessor.DemandOK);
+        }
+
+        public Task StreamConfigureAsync(RedisKey key, StreamConfiguration configuration, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetStreamConfigureMessage(key, configuration, flags);
+            return ExecuteAsync(msg, ResultProcessor.DemandOK);
+        }
+
+        private Message GetStreamConfigureMessage(RedisKey key, StreamConfiguration configuration, CommandFlags flags)
+        {
+            if (key.IsNull) throw new ArgumentNullException(nameof(key));
+            if (configuration == null) throw new ArgumentNullException(nameof(configuration));
+            if (configuration.IdmpMaxSize.HasValue)
+            {
+                if (configuration.IdmpDuration.HasValue)
+                {
+                    // duration and maxsize
+                    return Message.Create(
+                        Database,
+                        flags,
+                        RedisCommand.XCFGSET,
+                        key,
+                        RedisLiterals.IDMP_DURATION,
+                        configuration.IdmpDuration.Value,
+                        RedisLiterals.IDMP_MAXSIZE,
+                        configuration.IdmpMaxSize.Value);
+                }
+                // just maxsize
+                return Message.Create(
+                    Database,
+                    flags,
+                    RedisCommand.XCFGSET,
+                    key,
+                    RedisLiterals.IDMP_MAXSIZE,
+                    configuration.IdmpMaxSize.Value);
+            }
+
+            if (configuration.IdmpDuration.HasValue)
+            {
+                // just duration
+                return Message.Create(
+                    Database,
+                    flags,
+                    RedisCommand.XCFGSET,
+                    key,
+                    RedisLiterals.IDMP_DURATION,
+                    configuration.IdmpDuration.Value);
+            }
+
+            return Message.Create(Database, flags, RedisCommand.XCFGSET, key); // this will manifest a -ERR, but let's use the server's message
         }
 
         public StreamAutoClaimResult StreamAutoClaim(RedisKey key, RedisValue consumerGroup, RedisValue claimingConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count = null, CommandFlags flags = CommandFlags.None)
@@ -2896,8 +3125,9 @@ namespace StackExchange.Redis
 
         public bool StreamConsumerGroupSetPosition(RedisKey key, RedisValue groupName, RedisValue position, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -2913,8 +3143,9 @@ namespace StackExchange.Redis
 
         public Task<bool> StreamConsumerGroupSetPositionAsync(RedisKey key, RedisValue groupName, RedisValue position, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -2974,8 +3205,9 @@ namespace StackExchange.Redis
 
         public StreamConsumerInfo[] StreamConsumerInfo(RedisKey key, RedisValue groupName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XINFO,
                 new RedisValue[]
@@ -2990,8 +3222,9 @@ namespace StackExchange.Redis
 
         public Task<StreamConsumerInfo[]> StreamConsumerInfoAsync(RedisKey key, RedisValue groupName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XINFO,
                 new RedisValue[]
@@ -3088,8 +3321,9 @@ namespace StackExchange.Redis
 
         public long StreamDeleteConsumer(RedisKey key, RedisValue groupName, RedisValue consumerName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -3105,8 +3339,9 @@ namespace StackExchange.Redis
 
         public Task<long> StreamDeleteConsumerAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -3122,8 +3357,9 @@ namespace StackExchange.Redis
 
         public bool StreamDeleteConsumerGroup(RedisKey key, RedisValue groupName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -3138,8 +3374,9 @@ namespace StackExchange.Redis
 
         public Task<bool> StreamDeleteConsumerGroupAsync(RedisKey key, RedisValue groupName, CommandFlags flags = CommandFlags.None)
         {
-            var msg = Message.Create(
+            var msg = Message.CreateInKeySlot(
                 Database,
+                key,
                 flags,
                 RedisCommand.XGROUP,
                 new RedisValue[]
@@ -3248,41 +3485,64 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.SingleStreamWithNameSkip, defaultValue: Array.Empty<StreamEntry>());
         }
 
-        public RedisStream[] StreamRead(StreamPosition[] streamPositions, int? countPerStream = null, CommandFlags flags = CommandFlags.None)
+        public RedisStream[] StreamRead(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags)
         {
             var msg = GetMultiStreamReadMessage(streamPositions, countPerStream, flags);
             return ExecuteSync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
         }
 
-        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, CommandFlags flags = CommandFlags.None)
+        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags)
         {
             var msg = GetMultiStreamReadMessage(streamPositions, countPerStream, flags);
             return ExecuteAsync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
         }
 
-        public StreamEntry[] StreamReadGroup(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position, int? count, CommandFlags flags)
+#pragma warning disable RS0026 // additive overload: the existing overload's parameters are required, so shorter calls bind here
+        public RedisStream[] StreamRead(StreamPosition[] streamPositions, int? countPerStream = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None)
         {
-            return StreamReadGroup(
+            var msg = GetMultiStreamReadMessage(streamPositions, countPerStream, flags, maxCount, maxSize);
+            return ExecuteSync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
+        }
+
+        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetMultiStreamReadMessage(streamPositions, countPerStream, flags, maxCount, maxSize);
+            return ExecuteAsync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
+        }
+#pragma warning restore RS0026
+
+        public StreamEntry[] StreamReadGroup(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position, int? count, CommandFlags flags) =>
+            StreamReadGroup(
                 key,
                 groupName,
                 consumerName,
                 position,
                 count,
                 false,
+                null,
                 flags);
-        }
 
         public StreamEntry[] StreamReadGroup(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, CommandFlags flags = CommandFlags.None)
-        {
-            var actualPosition = position ?? StreamPosition.NewMessages;
+            => StreamReadGroup(
+                key,
+                groupName,
+                consumerName,
+                position,
+                count,
+                noAck,
+                null,
+                flags);
 
+        public StreamEntry[] StreamReadGroup(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, CommandFlags flags = CommandFlags.None)
+        {
             var msg = GetStreamReadGroupMessage(
                 key,
                 groupName,
                 consumerName,
-                StreamPosition.Resolve(actualPosition, RedisCommand.XREADGROUP),
+                StreamPosition.Resolve(position ?? StreamPosition.NewMessages, RedisCommand.XREADGROUP),
                 count,
                 noAck,
+                claimMinIdleTime,
                 flags);
 
             return ExecuteSync(msg, ResultProcessor.SingleStreamWithNameSkip, defaultValue: Array.Empty<StreamEntry>());
@@ -3297,37 +3557,57 @@ namespace StackExchange.Redis
                 position,
                 count,
                 false,
+                null,
                 flags);
         }
 
         public Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, CommandFlags flags = CommandFlags.None)
-        {
-            var actualPosition = position ?? StreamPosition.NewMessages;
+            => StreamReadGroupAsync(
+                key,
+                groupName,
+                consumerName,
+                position,
+                count,
+                noAck,
+                null,
+                flags);
 
+        public Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, CommandFlags flags = CommandFlags.None)
+        {
             var msg = GetStreamReadGroupMessage(
                 key,
                 groupName,
                 consumerName,
-                StreamPosition.Resolve(actualPosition, RedisCommand.XREADGROUP),
+                StreamPosition.Resolve(position ?? StreamPosition.NewMessages, RedisCommand.XREADGROUP),
                 count,
                 noAck,
+                claimMinIdleTime,
                 flags);
 
             return ExecuteAsync(msg, ResultProcessor.SingleStreamWithNameSkip, defaultValue: Array.Empty<StreamEntry>());
         }
 
         public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, CommandFlags flags)
-        {
-            return StreamReadGroup(
+            => StreamReadGroup(
                 streamPositions,
                 groupName,
                 consumerName,
                 countPerStream,
                 false,
+                null,
                 flags);
-        }
 
-        public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, CommandFlags flags = CommandFlags.None)
+        public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, CommandFlags flags)
+            => StreamReadGroup(
+                streamPositions,
+                groupName,
+                consumerName,
+                countPerStream,
+                noAck,
+                null,
+                flags);
+
+        public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags)
         {
             var msg = GetMultiStreamReadGroupMessage(
                 streamPositions,
@@ -3335,23 +3615,33 @@ namespace StackExchange.Redis
                 consumerName,
                 countPerStream,
                 noAck,
+                claimMinIdleTime,
                 flags);
 
             return ExecuteSync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
         }
 
         public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, CommandFlags flags)
-        {
-            return StreamReadGroupAsync(
+            => StreamReadGroupAsync(
                 streamPositions,
                 groupName,
                 consumerName,
                 countPerStream,
                 false,
+                null,
                 flags);
-        }
 
-        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, CommandFlags flags = CommandFlags.None)
+        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, CommandFlags flags)
+            => StreamReadGroupAsync(
+                streamPositions,
+                groupName,
+                consumerName,
+                countPerStream,
+                noAck,
+                null,
+                flags);
+
+        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags)
         {
             var msg = GetMultiStreamReadGroupMessage(
                 streamPositions,
@@ -3359,10 +3649,45 @@ namespace StackExchange.Redis
                 consumerName,
                 countPerStream,
                 noAck,
+                claimMinIdleTime,
                 flags);
 
             return ExecuteAsync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
         }
+
+#pragma warning disable RS0026 // additive overload: the existing overload's parameters are required, so shorter calls bind here
+        public RedisStream[] StreamReadGroup(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetMultiStreamReadGroupMessage(
+                streamPositions,
+                groupName,
+                consumerName,
+                countPerStream,
+                noAck,
+                claimMinIdleTime,
+                flags,
+                maxCount,
+                maxSize);
+
+            return ExecuteSync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
+        }
+
+        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None)
+        {
+            var msg = GetMultiStreamReadGroupMessage(
+                streamPositions,
+                groupName,
+                consumerName,
+                countPerStream,
+                noAck,
+                claimMinIdleTime,
+                flags,
+                maxCount,
+                maxSize);
+
+            return ExecuteAsync(msg, ResultProcessor.MultiStream, defaultValue: Array.Empty<RedisStream>());
+        }
+#pragma warning restore RS0026
 
         public long StreamTrim(RedisKey key, int maxLength, bool useApproximateMaxLength, CommandFlags flags)
             => StreamTrim(key, maxLength, useApproximateMaxLength, null, StreamTrimMode.KeepReferences, flags);
@@ -3510,25 +3835,25 @@ namespace StackExchange.Redis
 
         public RedisValue StringGetSetExpiry(RedisKey key, TimeSpan? expiry, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringGetExMessage(key, expiry, flags);
+            var msg = GetStringGetExMessage(key, Expiration.CreateOrPersist(expiry, !expiry.HasValue), flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
 
         public RedisValue StringGetSetExpiry(RedisKey key, DateTime expiry, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringGetExMessage(key, expiry, flags);
+            var msg = GetStringGetExMessage(key, new(expiry), flags);
             return ExecuteSync(msg, ResultProcessor.RedisValue);
         }
 
         public Task<RedisValue> StringGetSetExpiryAsync(RedisKey key, TimeSpan? expiry, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringGetExMessage(key, expiry, flags);
+            var msg = GetStringGetExMessage(key, Expiration.CreateOrPersist(expiry, !expiry.HasValue), flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
         public Task<RedisValue> StringGetSetExpiryAsync(RedisKey key, DateTime expiry, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringGetExMessage(key, expiry, flags);
+            var msg = GetStringGetExMessage(key, new(expiry), flags);
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
@@ -3672,13 +3997,19 @@ namespace StackExchange.Redis
 
         public bool StringSet(RedisKey key, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringSetMessage(key, value, expiry, keepTtl, when, flags);
+            var msg = GetStringSetMessage(key, value, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteSync(msg, ResultProcessor.Boolean);
         }
 
         public bool StringSet(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringSetMessage(values, when, flags);
+            var msg = GetStringSetMessage(values, when, Expiration.Default, flags);
+            return ExecuteSync(msg, ResultProcessor.Boolean);
+        }
+
+        public bool StringSet(KeyValuePair<RedisKey, RedisValue>[] values, When when, Expiration expiry, CommandFlags flags)
+        {
+            var msg = GetStringSetMessage(values, when, expiry, flags);
             return ExecuteSync(msg, ResultProcessor.Boolean);
         }
 
@@ -3690,13 +4021,19 @@ namespace StackExchange.Redis
 
         public Task<bool> StringSetAsync(RedisKey key, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringSetMessage(key, value, expiry, keepTtl, when, flags);
+            var msg = GetStringSetMessage(key, value, Expiration.CreateOrKeepTtl(expiry, keepTtl), when, flags);
             return ExecuteAsync(msg, ResultProcessor.Boolean);
         }
 
         public Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, CommandFlags flags = CommandFlags.None)
         {
-            var msg = GetStringSetMessage(values, when, flags);
+            var msg = GetStringSetMessage(values, when, Expiration.Default, flags);
+            return ExecuteAsync(msg, ResultProcessor.Boolean);
+        }
+
+        public Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when, Expiration expiry, CommandFlags flags)
+        {
+            var msg = GetStringSetMessage(values, when, expiry, flags);
             return ExecuteAsync(msg, ResultProcessor.Boolean);
         }
 
@@ -3776,14 +4113,13 @@ namespace StackExchange.Redis
             return ExecuteAsync(msg, ResultProcessor.RedisValue);
         }
 
-        private static long GetUnixTimeMilliseconds(DateTime when) => when.Kind switch
+        internal Message GetCopyMessage(in RedisKey sourceKey, RedisKey destinationKey, int destinationDatabase, bool replace, CommandFlags flags)
         {
-            DateTimeKind.Local or DateTimeKind.Utc => (when.ToUniversalTime() - RedisBase.UnixEpoch).Ticks / TimeSpan.TicksPerMillisecond,
-            _ => throw new ArgumentException("Expiry time must be either Utc or Local", nameof(when)),
-        };
+            // without REPLACE, COPY fails if the destination exists, so a replay is a no-op (the per-command
+            // default); with REPLACE it becomes an unconditional overwrite of the destination.
+            if (replace) flags = flags.WithCategory(CommandFlags.CommandRetryWriteLastWins);
 
-        private Message GetCopyMessage(in RedisKey sourceKey, RedisKey destinationKey, int destinationDatabase, bool replace, CommandFlags flags) =>
-            destinationDatabase switch
+            return destinationDatabase switch
             {
                 < -1 => throw new ArgumentOutOfRangeException(nameof(destinationDatabase)),
                 -1 when replace => Message.Create(Database, flags, RedisCommand.COPY, sourceKey, destinationKey, RedisLiterals.REPLACE),
@@ -3791,8 +4127,9 @@ namespace StackExchange.Redis
                 _ when replace => Message.Create(Database, flags, RedisCommand.COPY, sourceKey, destinationKey, RedisLiterals.DB, destinationDatabase, RedisLiterals.REPLACE),
                 _ => Message.Create(Database, flags, RedisCommand.COPY, sourceKey, destinationKey, RedisLiterals.DB, destinationDatabase),
             };
+        }
 
-        private Message GetExpiryMessage(in RedisKey key, CommandFlags flags, TimeSpan? expiry, ExpireWhen when, out ServerEndPoint? server)
+        internal Message GetExpiryMessage(in RedisKey key, CommandFlags flags, TimeSpan? expiry, ExpireWhen when, out ServerEndPoint? server)
         {
             if (expiry is null || expiry.Value == TimeSpan.MaxValue)
             {
@@ -3808,7 +4145,7 @@ namespace StackExchange.Redis
             return GetExpiryMessage(key, RedisCommand.PEXPIRE, RedisCommand.EXPIRE, milliseconds, when, flags, out server);
         }
 
-        private Message GetExpiryMessage(in RedisKey key, CommandFlags flags, DateTime? expiry, ExpireWhen when, out ServerEndPoint? server)
+        internal Message GetExpiryMessage(in RedisKey key, CommandFlags flags, DateTime? expiry, ExpireWhen when, out ServerEndPoint? server)
         {
             if (expiry is null || expiry == DateTime.MaxValue)
             {
@@ -3820,7 +4157,7 @@ namespace StackExchange.Redis
                 };
             }
 
-            long milliseconds = GetUnixTimeMilliseconds(expiry.Value);
+            long milliseconds = Expiration.GetUnixTimeMilliseconds(expiry.Value);
             return GetExpiryMessage(key, RedisCommand.PEXPIREAT, RedisCommand.EXPIREAT, milliseconds, when, flags, out server);
         }
 
@@ -3834,6 +4171,10 @@ namespace StackExchange.Redis
             out ServerEndPoint? server)
         {
             server = null;
+
+            // EXPIRE ... NX/XX/GT/LT is a conditional write; a bare EXPIRE keeps the last-wins default
+            flags = flags.WithCategory(when.AsRetryCategory());
+
             if ((milliseconds % 1000) != 0)
             {
                 var features = GetFeatures(key, flags, RedisCommand.PEXPIRE, out server);
@@ -3959,6 +4300,9 @@ namespace StackExchange.Redis
             return tran;
         }
 
+        // The analyzer is right that this is DELEX, but this *is* the fallback: LockRelease prefers the atomic
+        // form (see GetStringDeleteMessage) and only lands here when the server does not support it.
+        [SuppressMessage("Usage", "SER301:Transaction can be replaced by a single atomic operation", Justification = "Deliberate fallback for servers without DELEX.")]
         private ITransaction? GetLockReleaseTransaction(RedisKey key, RedisValue value)
         {
             var tran = CreateTransactionIfAvailable(asyncState);
@@ -3990,7 +4334,7 @@ namespace StackExchange.Redis
             return result;
         }
 
-        private Message GetMultiStreamReadGroupMessage(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, CommandFlags flags) =>
+        private Message GetMultiStreamReadGroupMessage(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags, int? maxCount = null, int? maxSize = null) =>
             new MultiStreamReadGroupCommandMessage(
                 Database,
                 flags,
@@ -3998,19 +4342,25 @@ namespace StackExchange.Redis
                 groupName,
                 consumerName,
                 countPerStream,
-                noAck);
+                noAck,
+                claimMinIdleTime,
+                maxCount,
+                maxSize);
 
-        private sealed class MultiStreamReadGroupCommandMessage : Message // XREADGROUP with multiple stream. Example: XREADGROUP GROUP groupName consumerName COUNT countPerStream STREAMS stream1 stream2 id1 id2
+        internal sealed class MultiStreamReadGroupCommandMessage : Message // XREADGROUP with multiple stream. Example: XREADGROUP GROUP groupName consumerName COUNT countPerStream STREAMS stream1 stream2 id1 id2
         {
             private readonly StreamPosition[] streamPositions;
             private readonly RedisValue groupName;
             private readonly RedisValue consumerName;
             private readonly int? countPerStream;
+            private readonly int? maxCount;
+            private readonly int? maxSize;
             private readonly bool noAck;
             private readonly int argCount;
+            private readonly TimeSpan? claimMinIdleTime;
 
-            public MultiStreamReadGroupCommandMessage(int db, CommandFlags flags, StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck)
-                : base(db, flags, RedisCommand.XREADGROUP)
+            public MultiStreamReadGroupCommandMessage(int db, CommandFlags flags, StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, int? maxCount = null, int? maxSize = null)
+                : base(db, flags.WithCategory(GetStreamReadGroupCategory(streamPositions, claimMinIdleTime)), RedisCommand.XREADGROUP)
             {
                 if (streamPositions == null) throw new ArgumentNullException(nameof(streamPositions));
                 if (streamPositions.Length == 0) throw new ArgumentOutOfRangeException(nameof(streamPositions), "streamOffsetPairs must contain at least one item.");
@@ -4024,6 +4374,16 @@ namespace StackExchange.Redis
                     throw new ArgumentOutOfRangeException(nameof(countPerStream), "countPerStream must be greater than 0.");
                 }
 
+                if (maxCount.HasValue && maxCount <= 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(maxCount), "maxCount must be greater than 0.");
+                }
+
+                if (maxSize.HasValue && maxSize <= 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(maxSize), "maxSize must be greater than 0.");
+                }
+
                 groupName.AssertNotNull();
                 consumerName.AssertNotNull();
 
@@ -4031,12 +4391,18 @@ namespace StackExchange.Redis
                 this.groupName = groupName;
                 this.consumerName = consumerName;
                 this.countPerStream = countPerStream;
+                this.maxCount = maxCount;
+                this.maxSize = maxSize;
                 this.noAck = noAck;
+                this.claimMinIdleTime = claimMinIdleTime;
 
                 argCount = 4 // Room for GROUP groupName consumerName & STREAMS
                     + (streamPositions.Length * 2) // Enough room for the stream keys and associated IDs.
                     + (countPerStream.HasValue ? 2 : 0) // Room for "COUNT num" or 0 if countPerStream is null.
-                    + (noAck ? 1 : 0); // Allow for the NOACK subcommand.
+                    + (maxCount.HasValue ? 2 : 0) // Room for "MAXCOUNT num".
+                    + (maxSize.HasValue ? 2 : 0) // Room for "MAXSIZE num".
+                    + (noAck ? 1 : 0) // Allow for the NOACK subcommand.
+                    + (claimMinIdleTime.HasValue ? 2 : 0); // Allow for the CLAIM {minIdleTime} subcommand.
             }
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
@@ -4049,48 +4415,68 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, argCount);
-                physical.WriteBulkString(StreamConstants.Group);
-                physical.WriteBulkString(groupName);
-                physical.WriteBulkString(consumerName);
+                writer.WriteHeader(Command, argCount);
+                writer.WriteRaw("$5\r\nGROUP\r\n"u8);
+                writer.WriteBulkString(groupName);
+                writer.WriteBulkString(consumerName);
 
                 if (countPerStream.HasValue)
                 {
-                    physical.WriteBulkString(StreamConstants.Count);
-                    physical.WriteBulkString(countPerStream.Value);
+                    writer.WriteRaw("$5\r\nCOUNT\r\n"u8);
+                    writer.WriteBulkString(countPerStream.Value);
+                }
+
+                if (maxCount.HasValue)
+                {
+                    writer.WriteRaw("$8\r\nMAXCOUNT\r\n"u8);
+                    writer.WriteBulkString(maxCount.Value);
+                }
+
+                if (maxSize.HasValue)
+                {
+                    writer.WriteRaw("$7\r\nMAXSIZE\r\n"u8);
+                    writer.WriteBulkString(maxSize.Value);
                 }
 
                 if (noAck)
                 {
-                    physical.WriteBulkString(StreamConstants.NoAck);
+                    writer.WriteRaw("$5\r\nNOACK\r\n"u8);
                 }
 
-                physical.WriteBulkString(StreamConstants.Streams);
+                if (claimMinIdleTime.HasValue)
+                {
+                    writer.WriteRaw("$5\r\nCLAIM\r\n"u8);
+                    writer.WriteBulkString(claimMinIdleTime.Value.TotalMilliseconds);
+                }
+
+                writer.WriteRaw("$7\r\nSTREAMS\r\n"u8);
                 for (int i = 0; i < streamPositions.Length; i++)
                 {
-                    physical.Write(streamPositions[i].Key);
+                    writer.Write(streamPositions[i].Key);
                 }
                 for (int i = 0; i < streamPositions.Length; i++)
                 {
-                    physical.WriteBulkString(StreamPosition.Resolve(streamPositions[i].Position, RedisCommand.XREADGROUP));
+                    writer.WriteBulkString(StreamPosition.Resolve(streamPositions[i].Position, RedisCommand.XREADGROUP));
                 }
             }
 
             public override int ArgCount => argCount;
         }
 
-        private Message GetMultiStreamReadMessage(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags) =>
-            new MultiStreamReadCommandMessage(Database, flags, streamPositions, countPerStream);
+        private Message GetMultiStreamReadMessage(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags, int? maxCount = null, int? maxSize = null) =>
+            new MultiStreamReadCommandMessage(Database, flags, streamPositions, countPerStream, maxCount, maxSize);
 
-        private sealed class MultiStreamReadCommandMessage : Message // XREAD with multiple stream. Example: XREAD COUNT 2 STREAMS mystream writers 0-0 0-0
+        internal sealed class MultiStreamReadCommandMessage : Message // XREAD with multiple stream. Example: XREAD COUNT 2 STREAMS mystream writers 0-0 0-0
         {
             private readonly StreamPosition[] streamPositions;
             private readonly int? countPerStream;
+            private readonly int? maxCount;
+            private readonly int? maxSize;
             private readonly int argCount;
 
-            public MultiStreamReadCommandMessage(int db, CommandFlags flags, StreamPosition[] streamPositions, int? countPerStream)
+            public MultiStreamReadCommandMessage(int db, CommandFlags flags, StreamPosition[] streamPositions, int? countPerStream, int? maxCount = null, int? maxSize = null)
                 : base(db, flags, RedisCommand.XREAD)
             {
                 if (streamPositions == null) throw new ArgumentNullException(nameof(streamPositions));
@@ -4105,11 +4491,25 @@ namespace StackExchange.Redis
                     throw new ArgumentOutOfRangeException(nameof(countPerStream), "countPerStream must be greater than 0.");
                 }
 
+                if (maxCount.HasValue && maxCount <= 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(maxCount), "maxCount must be greater than 0.");
+                }
+
+                if (maxSize.HasValue && maxSize <= 0)
+                {
+                    throw new ArgumentOutOfRangeException(nameof(maxSize), "maxSize must be greater than 0.");
+                }
+
                 this.streamPositions = streamPositions;
                 this.countPerStream = countPerStream;
+                this.maxCount = maxCount;
+                this.maxSize = maxSize;
 
                 argCount = 1 // Streams keyword.
                     + (countPerStream.HasValue ? 2 : 0) // Room for "COUNT num" or 0 if countPerStream is null.
+                    + (maxCount.HasValue ? 2 : 0) // Room for "MAXCOUNT num".
+                    + (maxSize.HasValue ? 2 : 0) // Room for "MAXSIZE num".
                     + (streamPositions.Length * 2); // Room for the stream names and the ID after which to begin reading.
             }
 
@@ -4123,24 +4523,36 @@ namespace StackExchange.Redis
                 return slot;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, argCount);
+                writer.WriteHeader(Command, argCount);
 
                 if (countPerStream.HasValue)
                 {
-                    physical.WriteBulkString(StreamConstants.Count);
-                    physical.WriteBulkString(countPerStream.Value);
+                    writer.WriteRaw("$5\r\nCOUNT\r\n"u8);
+                    writer.WriteBulkString(countPerStream.Value);
                 }
 
-                physical.WriteBulkString(StreamConstants.Streams);
+                if (maxCount.HasValue)
+                {
+                    writer.WriteRaw("$8\r\nMAXCOUNT\r\n"u8);
+                    writer.WriteBulkString(maxCount.Value);
+                }
+
+                if (maxSize.HasValue)
+                {
+                    writer.WriteRaw("$7\r\nMAXSIZE\r\n"u8);
+                    writer.WriteBulkString(maxSize.Value);
+                }
+
+                writer.WriteRaw("$7\r\nSTREAMS\r\n"u8);
                 for (int i = 0; i < streamPositions.Length; i++)
                 {
-                    physical.Write(streamPositions[i].Key);
+                    writer.Write(streamPositions[i].Key);
                 }
                 for (int i = 0; i < streamPositions.Length; i++)
                 {
-                    physical.WriteBulkString(StreamPosition.Resolve(streamPositions[i].Position, RedisCommand.XREADGROUP));
+                    writer.WriteBulkString(StreamPosition.Resolve(streamPositions[i].Position, RedisCommand.XREADGROUP));
                 }
             }
 
@@ -4157,7 +4569,7 @@ namespace StackExchange.Redis
             {
                 if ((exclude & Exclude.Stop) == 0) return value; // inclusive is default
             }
-            return "(" + Format.ToString(value); // '(' prefix means exclusive
+            return ("(" + Format.ToString(value)).AsRedisValue(); // '(' prefix means exclusive
         }
 
         private Message GetRestoreMessage(RedisKey key, byte[] value, TimeSpan? expiry, CommandFlags flags)
@@ -4166,54 +4578,17 @@ namespace StackExchange.Redis
             return Message.Create(Database, flags, RedisCommand.RESTORE, key, pttl, value);
         }
 
-        private Message GetSetIntersectionLengthMessage(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None)
-        {
-            if (keys == null) throw new ArgumentNullException(nameof(keys));
+        private Message GetSetCardinalityMessage(RedisCommand command, RedisKey[] keys, long limit, CommandFlags flags)
+            => new SetOperationCardinalityMessage(Database, flags, command, keys, limit, approximate: false);
 
-            var values = new RedisValue[1 + keys.Length + (limit > 0 ? 2 : 0)];
-            int i = 0;
-            values[i++] = keys.Length;
-            for (var j = 0; j < keys.Length; j++)
-            {
-                values[i++] = keys[j].AsRedisValue();
-            }
-            if (limit > 0)
-            {
-                values[i++] = RedisLiterals.LIMIT;
-                values[i] = limit;
-            }
+        private Message GetSetCombineLengthMessage(SetOperation operation, RedisKey[] keys, long limit, bool approximate, CommandFlags flags)
+            // Deliberately do NOT gate `approximate` here: today only SUNIONCARD accepts APPROX (SINTERCARD/SDIFFCARD
+            // will error), but if later server versions extend it we don't want a stale client-side check blocking it.
+            // Let the server decide and surface any error.
+            => new SetOperationCardinalityMessage(Database, flags, operation.ToSetCardinalityCommand(), keys, limit, approximate);
 
-            return Message.Create(Database, flags, RedisCommand.SINTERCARD, values);
-        }
-
-        private Message GetSortedSetAddMessage(RedisKey key, RedisValue member, double score, SortedSetWhen when, bool change, CommandFlags flags)
-        {
-            RedisValue[] arr = new RedisValue[2 + when.CountBits() + (change ? 1 : 0)];
-            int index = 0;
-            if ((when & SortedSetWhen.NotExists) != 0)
-            {
-                arr[index++] = RedisLiterals.NX;
-            }
-            if ((when & SortedSetWhen.Exists) != 0)
-            {
-                arr[index++] = RedisLiterals.XX;
-            }
-            if ((when & SortedSetWhen.GreaterThan) != 0)
-            {
-                arr[index++] = RedisLiterals.GT;
-            }
-            if ((when & SortedSetWhen.LessThan) != 0)
-            {
-                arr[index++] = RedisLiterals.LT;
-            }
-            if (change)
-            {
-                arr[index++] = RedisLiterals.CH;
-            }
-            arr[index++] = score;
-            arr[index++] = member;
-            return Message.Create(Database, flags, RedisCommand.ZADD, key, arr);
-        }
+        internal Message GetSortedSetAddMessage(RedisKey key, RedisValue member, double score, SortedSetWhen when, bool change, CommandFlags flags)
+            => new SingleSortedSetAddMessage(Database, flags, key, member, score, when, change, increment: false);
 
         private Message? GetSortedSetAddMessage(RedisKey key, SortedSetEntry[] values, SortedSetWhen when, bool change, CommandFlags flags)
         {
@@ -4224,44 +4599,36 @@ namespace StackExchange.Redis
                 case 1:
                     return GetSortedSetAddMessage(key, values[0].element, values[0].score, when, change, flags);
                 default:
-                    RedisValue[] arr = new RedisValue[(values.Length * 2) + when.CountBits() + (change ? 1 : 0)];
-                    int index = 0;
-                    if ((when & SortedSetWhen.NotExists) != 0)
-                    {
-                        arr[index++] = RedisLiterals.NX;
-                    }
-                    if ((when & SortedSetWhen.Exists) != 0)
-                    {
-                        arr[index++] = RedisLiterals.XX;
-                    }
-                    if ((when & SortedSetWhen.GreaterThan) != 0)
-                    {
-                        arr[index++] = RedisLiterals.GT;
-                    }
-                    if ((when & SortedSetWhen.LessThan) != 0)
-                    {
-                        arr[index++] = RedisLiterals.LT;
-                    }
-                    if (change)
-                    {
-                        arr[index++] = RedisLiterals.CH;
-                    }
-
-                    for (int i = 0; i < values.Length; i++)
-                    {
-                        arr[index++] = values[i].score;
-                        arr[index++] = values[i].element;
-                    }
-                    return Message.Create(Database, flags, RedisCommand.ZADD, key, arr);
+                    return new MultipleSortedSetAddMessage(Database, flags, key, values, when, change);
             }
         }
 
-        private Message GetSortMessage(RedisKey destination, RedisKey key, long skip, long take, Order order, SortType sortType, RedisValue by, RedisValue[]? get, CommandFlags flags, out ServerEndPoint? server)
+        internal Message GetSortedSetIncrementMessage(RedisKey key, RedisValue member, double value, ValueCondition when, CommandFlags flags)
+        {
+            switch (when.Kind)
+            {
+                case ValueCondition.ConditionKind.Always:
+                    return Message.Create(Database, flags, RedisCommand.ZINCRBY, key, value, member);
+                case ValueCondition.ConditionKind.Exists:
+                    return new SingleSortedSetAddMessage(Database, flags, key, member, value, SortedSetWhen.Exists, change: false, increment: true);
+                case ValueCondition.ConditionKind.NotExists:
+                    return new SingleSortedSetAddMessage(Database, flags, key, member, value, SortedSetWhen.NotExists, change: false, increment: true);
+                default:
+                    when.ThrowInvalidOperation(nameof(SortedSetIncrement));
+                    goto case ValueCondition.ConditionKind.Always; // not reached
+            }
+        }
+
+        internal Message GetSortMessage(RedisKey destination, RedisKey key, long skip, long take, Order order, SortType sortType, RedisValue by, RedisValue[]? get, CommandFlags flags, out ServerEndPoint? server)
         {
             server = null;
             var command = destination.IsNull && GetFeatures(key, flags, RedisCommand.SORT_RO, out server).ReadOnlySort
                 ? RedisCommand.SORT_RO
                 : RedisCommand.SORT;
+
+            // SORT is categorized read-only by default (the common case), but the STORE variant writes the
+            // destination key; without this, a replay of a SORT ... STORE would be treated as a harmless read.
+            if (!destination.IsNull) flags = flags.WithCategory(CommandFlags.CommandRetryWriteLastWins);
 
             // If SORT_RO is not available, we cannot issue the command to a read-only replica
             if (command == RedisCommand.SORT)
@@ -4339,7 +4706,7 @@ namespace StackExchange.Redis
 
         private Message GetSortedSetCombineAndStoreCommandMessage(SetOperation operation, RedisKey destination, RedisKey[] keys, double[]? weights, Aggregate aggregate, CommandFlags flags)
         {
-            var command = operation.ToCommand(store: true);
+            var command = operation.ToSortedSetStoreCommand();
             if (keys == null)
             {
                 throw new ArgumentNullException(nameof(keys));
@@ -4366,35 +4733,10 @@ namespace StackExchange.Redis
 
         private Message GetSortedSetCombineCommandMessage(SetOperation operation, RedisKey[] keys, double[]? weights, Aggregate aggregate, bool withScores, CommandFlags flags)
         {
-            var command = operation.ToCommand(store: false);
-            if (keys == null)
-            {
-                throw new ArgumentNullException(nameof(keys));
-            }
-            if (command == RedisCommand.ZDIFF && (weights != null || aggregate != Aggregate.Sum))
-            {
-                throw new ArgumentException("ZDIFF cannot be used with weights or aggregation.");
-            }
-            if (weights != null && keys.Length != weights.Length)
-            {
-                throw new ArgumentException("Keys and weights should have the same number of elements.", nameof(weights));
-            }
-
-            var i = 0;
-            var values = new RedisValue[1 + keys.Length +
-                                        (weights?.Length > 0 ? 1 + weights.Length : 0) +
-                                        (aggregate != Aggregate.Sum ? 2 : 0) +
-                                        (withScores ? 1 : 0)];
-            values[i++] = keys.Length;
-            foreach (var key in keys)
-            {
-                values[i++] = key.AsRedisValue();
-            }
-            AddWeightsAggregationAndScore(values.AsSpan(i), weights, aggregate, withScores: withScores);
-            return Message.Create(Database, flags, command, values ?? RedisValue.EmptyArray);
+            return new SetOperationMessage(Database, flags, operation, keys, weights, aggregate, withScores);
         }
 
-        private void AddWeightsAggregationAndScore(Span<RedisValue> values, double[]? weights, Aggregate aggregate, bool withScores = false)
+        private void AddWeightsAggregationAndScore(Span<RedisValue> values, double[]? weights, Aggregate aggregate)
         {
             int i = 0;
             if (weights?.Length > 0)
@@ -4417,12 +4759,12 @@ namespace StackExchange.Redis
                     values[i++] = RedisLiterals.AGGREGATE;
                     values[i++] = RedisLiterals.MAX;
                     break;
+                case Aggregate.Count:
+                    values[i++] = RedisLiterals.AGGREGATE;
+                    values[i++] = RedisLiterals.COUNT;
+                    break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(aggregate));
-            }
-            if (withScores)
-            {
-                values[i++] = RedisLiterals.WITHSCORES;
             }
         }
 
@@ -4437,23 +4779,7 @@ namespace StackExchange.Redis
         }
 
         private Message GetSortedSetIntersectionLengthMessage(RedisKey[] keys, long limit, CommandFlags flags)
-        {
-            if (keys == null) throw new ArgumentNullException(nameof(keys));
-
-            var i = 0;
-            var values = new RedisValue[1 + keys.Length + (limit > 0 ? 2 : 0)];
-            values[i++] = keys.Length;
-            foreach (var key in keys)
-            {
-                values[i++] = key.AsRedisValue();
-            }
-            if (limit > 0)
-            {
-                values[i++] = RedisLiterals.LIMIT;
-                values[i++] = limit;
-            }
-            return Message.Create(Database, flags, RedisCommand.ZINTERCARD, values);
-        }
+            => new SetOperationCardinalityMessage(Database, flags, RedisCommand.ZINTERCARD, keys, limit, approximate: false);
 
         private Message GetSortedSetRangeByScoreMessage(RedisKey key, double start, double stop, Exclude exclude, Order order, long skip, long take, CommandFlags flags, bool withScores)
         {
@@ -4539,100 +4865,138 @@ namespace StackExchange.Redis
             return Message.Create(Database, flags, RedisCommand.XACKDEL, key, values);
         }
 
-        private Message GetStreamAddMessage(RedisKey key, RedisValue messageId, long? maxLength, bool useApproximateMaxLength, NameValueEntry streamPair, long? limit, StreamTrimMode mode, CommandFlags flags)
-        {
-            // Calculate the correct number of arguments:
-            //  3 array elements for Entry ID & NameValueEntry.Name & NameValueEntry.Value.
-            //  2 elements if using MAXLEN (keyword & value), otherwise 0.
-            //  1 element if using Approximate Length (~), otherwise 0.
-            var totalLength = 3 + (maxLength.HasValue ? 2 : 0)
-                                + (maxLength.HasValue && useApproximateMaxLength ? 1 : 0)
-                                + (limit.HasValue ? 2 : 0)
-                                + (mode != StreamTrimMode.KeepReferences ? 1 : 0);
-
-            var values = new RedisValue[totalLength];
-            var offset = 0;
-
-            if (maxLength.HasValue)
+        /// <summary>
+        /// Maps the legacy positional trim/id arguments onto <see cref="StreamAddOptions"/>.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately does *not* call <see cref="StreamAddOptions.ThrowIfInvalid"/>: the shipped overloads
+        /// have always passed questionable combinations (<c>LIMIT</c> without a threshold, say) through to the
+        /// server, and that behaviour is preserved; only the options-based overloads validate up-front.
+        /// </remarks>
+        private static StreamAddOptions LegacyStreamAddOptions(RedisValue? messageId, in StreamIdempotentId idempotentId, long? maxLength, bool useApproximateMaxLength, long? limit, StreamTrimMode mode)
+            => new()
             {
-                values[offset++] = StreamConstants.MaxLen;
+                MessageId = messageId,
+                IdempotentId = idempotentId,
+                MaxLength = maxLength,
+                Approximate = useApproximateMaxLength,
+                Limit = limit,
+                TrimMode = mode,
+            };
 
-                if (useApproximateMaxLength)
+        /// <summary>
+        /// The number of arguments written by <see cref="WriteStreamAddPrefix"/>.
+        /// </summary>
+        private static int GetStreamAddPrefixLength(in StreamAddOptions options)
+            => (options.CreateStream ? 0 : 1) // NOMKSTREAM
+                + (options.HasThreshold ? 2 : 0) // MAXLEN|MINID <threshold>
+                + (options.HasThreshold && options.Approximate ? 1 : 0) // ~
+                + (options.Limit.HasValue ? 2 : 0) // LIMIT N
+                + (options.TrimMode == StreamTrimMode.KeepReferences ? 0 : 1) // relevant trim-mode keyword
+                + options.IdempotentId.ArgCount // IDMP <pid> <iid> / IDMPAUTO <pid>
+                + 1; // the stream entry ID
+
+        /// <summary>
+        /// Writes everything in <c>XADD</c> between the key and the field/value pairs, i.e.
+        /// <c>[NOMKSTREAM] [MAXLEN|MINID [~] threshold] [LIMIT n] [KEEPREF|DELREF|ACKED] [IDMP...] &lt;*|id&gt;</c>.
+        /// </summary>
+        private static void WriteStreamAddPrefix(in StreamAddOptions options, RedisValue[] values, ref int offset)
+        {
+            if (!options.CreateStream)
+            {
+                values[offset++] = StreamConstants.NoMkStream;
+            }
+
+            if (options.HasThreshold)
+            {
+                var byMaxLength = options.MaxLength.HasValue;
+                values[offset++] = byMaxLength ? StreamConstants.MaxLen : StreamConstants.MinId;
+
+                if (options.Approximate)
                 {
                     values[offset++] = StreamConstants.ApproximateMaxLen;
                 }
 
-                values[offset++] = maxLength.Value;
+                values[offset++] = byMaxLength ? options.MaxLength.GetValueOrDefault() : options.MinId;
             }
 
-            if (limit.HasValue)
+            if (options.Limit.HasValue)
             {
                 values[offset++] = RedisLiterals.LIMIT;
-                values[offset++] = limit.Value;
+                values[offset++] = options.Limit.GetValueOrDefault();
             }
 
-            if (mode != StreamTrimMode.KeepReferences)
+            if (options.TrimMode != StreamTrimMode.KeepReferences)
             {
-                values[offset++] = StreamConstants.GetMode(mode);
+                values[offset++] = StreamConstants.GetMode(options.TrimMode);
             }
 
-            values[offset++] = messageId;
+            options.IdempotentId.WriteTo(values, ref offset);
+
+            values[offset++] = options.EntryId;
+        }
+
+        internal Message GetStreamAddMessage(in RedisKey key, in StreamAddOptions options, NameValueEntry streamPair, CommandFlags flags)
+        {
+            // 2 array elements for NameValueEntry.Name & NameValueEntry.Value, after the shared prefix
+            var totalLength = 2 + GetStreamAddPrefixLength(in options);
+
+            var values = new RedisValue[totalLength];
+            var offset = 0;
+
+            WriteStreamAddPrefix(in options, values, ref offset);
 
             values[offset++] = streamPair.Name;
             values[offset++] = streamPair.Value;
 
             Debug.Assert(offset == totalLength);
-            return Message.Create(Database, flags, RedisCommand.XADD, key, values);
+            return Message.Create(Database, GetStreamAddCategory(flags, in options), RedisCommand.XADD, key, values);
         }
+
+        /// <summary>
+        /// XADD accumulates when the server picks the ID, but two arg shapes make a replay a guaranteed no-op:
+        /// a *fully* explicit entry ID (a second attempt is rejected as "equal or smaller"), and either idempotency
+        /// form - <c>IDMP producer id</c> or <c>IDMPAUTO producer</c> (which derives the id from the entry content).
+        /// The latter exists precisely to make at-most-once production survive a retry.
+        /// </summary>
+        /// <remarks>
+        /// "Fully" is the load-bearing word: <c>&lt;ms&gt;-*</c> asks the server to pick the *sequence*, so a replay
+        /// appends a second entry (5-0, then 5-1) rather than being rejected. Testing only against the bare
+        /// <c>*</c> would therefore let a double-append through under the default policy.
+        /// </remarks>
+        private static CommandFlags GetStreamAddCategory(CommandFlags flags, in StreamAddOptions options)
+            => (options.IdempotentId.ArgCount != 0 || !IsServerAssignedId(options.EntryId))
+                ? flags.WithCategory(CommandFlags.CommandRetryWriteChecked)
+                : flags;
+
+        /// <summary>
+        /// Whether the server assigns any part of a stream entry id, i.e. it ends in <c>*</c> - either the bare
+        /// <c>*</c> (server picks both halves) or the <c>&lt;ms&gt;-*</c> auto-sequence form (server picks the
+        /// sequence). Anything else is fully caller-specified, and so cannot be appended twice.
+        /// </summary>
+        internal static bool IsServerAssignedId(in RedisValue messageId)
+            => messageId.EndsWithAscii((byte)'*');
 
         /// <summary>
         /// Gets message for <see href="https://redis.io/commands/xadd"/>.
         /// </summary>
-        private Message GetStreamAddMessage(RedisKey key, RedisValue entryId, long? maxLength, bool useApproximateMaxLength, NameValueEntry[] streamPairs, long? limit, StreamTrimMode mode, CommandFlags flags)
+        internal Message GetStreamAddMessage(in RedisKey key, in StreamAddOptions options, NameValueEntry[] streamPairs, CommandFlags flags)
         {
             if (streamPairs == null) throw new ArgumentNullException(nameof(streamPairs));
             if (streamPairs.Length == 0) throw new ArgumentOutOfRangeException(nameof(streamPairs), "streamPairs must contain at least one item.");
 
-            if (maxLength.HasValue && maxLength <= 0)
+            if (options.MaxLength.HasValue && options.MaxLength <= 0)
             {
-                throw new ArgumentOutOfRangeException(nameof(maxLength), "maxLength must be greater than 0.");
+                throw new ArgumentOutOfRangeException(nameof(options), "maxLength must be greater than 0.");
             }
 
             var totalLength = (streamPairs.Length * 2) // Room for the name/value pairs
-                + 1 // The stream entry ID
-                + (maxLength.HasValue ? 2 : 0) // MAXLEN N
-                + (maxLength.HasValue && useApproximateMaxLength ? 1 : 0) // ~
-                + (mode == StreamTrimMode.KeepReferences ? 0 : 1) // relevant trim-mode keyword
-                + (limit.HasValue ? 2 : 0); // LIMIT N
+                + GetStreamAddPrefixLength(in options);
 
             var values = new RedisValue[totalLength];
-
             var offset = 0;
 
-            if (maxLength.HasValue)
-            {
-                values[offset++] = StreamConstants.MaxLen;
-
-                if (useApproximateMaxLength)
-                {
-                    values[offset++] = StreamConstants.ApproximateMaxLen;
-                }
-
-                values[offset++] = maxLength.Value;
-            }
-
-            if (limit.HasValue)
-            {
-                values[offset++] = RedisLiterals.LIMIT;
-                values[offset++] = limit.Value;
-            }
-
-            if (mode != StreamTrimMode.KeepReferences)
-            {
-                values[offset++] = StreamConstants.GetMode(mode);
-            }
-
-            values[offset++] = entryId;
+            WriteStreamAddPrefix(in options, values, ref offset);
 
             for (var i = 0; i < streamPairs.Length; i++)
             {
@@ -4641,10 +5005,10 @@ namespace StackExchange.Redis
             }
 
             Debug.Assert(offset == totalLength);
-            return Message.Create(Database, flags, RedisCommand.XADD, key, values);
+            return Message.Create(Database, GetStreamAddCategory(flags, in options), RedisCommand.XADD, key, values);
         }
 
-        private Message GetStreamAutoClaimMessage(RedisKey key, RedisValue consumerGroup, RedisValue assignToConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count, bool idsOnly, CommandFlags flags)
+        internal Message GetStreamAutoClaimMessage(RedisKey key, RedisValue consumerGroup, RedisValue assignToConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count, bool idsOnly, CommandFlags flags)
         {
             // XAUTOCLAIM <key> <group> <consumer> <min-idle-time> <start> [COUNT count] [JUSTID]
             var values = new RedisValue[4 + (count is null ? 0 : 2) + (idsOnly ? 1 : 0)];
@@ -4667,10 +5031,10 @@ namespace StackExchange.Redis
                 values[offset++] = StreamConstants.JustId;
             }
 
-            return Message.Create(Database, flags, RedisCommand.XAUTOCLAIM, key, values);
+            return Message.Create(Database, WithJustIdCategory(flags, idsOnly), RedisCommand.XAUTOCLAIM, key, values);
         }
 
-        private Message GetStreamClaimMessage(RedisKey key, RedisValue consumerGroup, RedisValue assignToConsumer, long minIdleTimeInMs, RedisValue[] messageIds, bool returnJustIds, CommandFlags flags)
+        internal Message GetStreamClaimMessage(RedisKey key, RedisValue consumerGroup, RedisValue assignToConsumer, long minIdleTimeInMs, RedisValue[] messageIds, bool returnJustIds, CommandFlags flags)
         {
             if (messageIds == null) throw new ArgumentNullException(nameof(messageIds));
             if (messageIds.Length == 0) throw new ArgumentOutOfRangeException(nameof(messageIds), "messageIds must contain at least one item.");
@@ -4694,8 +5058,17 @@ namespace StackExchange.Redis
                 values[offset] = StreamConstants.JustId;
             }
 
-            return Message.Create(Database, flags, RedisCommand.XCLAIM, key, values);
+            return Message.Create(Database, WithJustIdCategory(flags, returnJustIds), RedisCommand.XCLAIM, key, values);
         }
+
+        /// <summary>
+        /// Reassigning ownership is itself idempotent, but XCLAIM/XAUTOCLAIM bump the entry's delivery counter on
+        /// every call - except under JUSTID, which explicitly does not. So JUSTID is a clean conditional write;
+        /// without it we leave the per-command default, since the counter is consumer-group bookkeeping rather
+        /// than caller data (raising it to "accumulating" would stop these being retried at all by default).
+        /// </summary>
+        private static CommandFlags WithJustIdCategory(CommandFlags flags, bool justId)
+            => justId ? flags.WithCategory(CommandFlags.CommandRetryWriteChecked) : flags;
 
         private Message GetStreamCreateConsumerGroupMessage(RedisKey key, RedisValue groupName, RedisValue? position = null, bool createStream = true, CommandFlags flags = CommandFlags.None)
         {
@@ -4713,11 +5086,7 @@ namespace StackExchange.Redis
                 values[4] = StreamConstants.MkStream;
             }
 
-            return Message.Create(
-                Database,
-                flags,
-                RedisCommand.XGROUP,
-                values);
+            return Message.CreateInKeySlot(Database, key, flags, RedisCommand.XGROUP, values);
         }
 
         /// <summary>
@@ -4757,7 +5126,7 @@ namespace StackExchange.Redis
             values[offset++] = groupName;
             if (minIdleTimeInMs is not null)
             {
-                values[offset++] = "IDLE";
+                values[offset++] = RedisLiterals.IDLE;
                 values[offset++] = minIdleTimeInMs;
             }
             values[offset++] = minId ?? StreamConstants.ReadMinValue;
@@ -4806,8 +5175,40 @@ namespace StackExchange.Redis
                 values);
         }
 
-        private Message GetStreamReadGroupMessage(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue afterId, int? count, bool noAck, CommandFlags flags) =>
-            new SingleStreamReadGroupCommandMessage(Database, flags, key, groupName, consumerName, afterId, count, noAck);
+        internal Message GetStreamReadGroupMessage(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue afterId, int? count, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags) =>
+            new SingleStreamReadGroupCommandMessage(Database, flags, key, groupName, consumerName, afterId, count, noAck, claimMinIdleTime);
+
+        /// <summary>
+        /// XREADGROUP defaults to "never retry": with ">" it consumes undelivered entries and advances the group's
+        /// last-delivered-id, so a replay silently skips messages. Any *explicit* id instead re-reads this
+        /// consumer's own pending list, which is a pure read and fully repeatable.
+        /// </summary>
+        /// <remarks>
+        /// CLAIM is emitted independently of the position, and takes entries from *other* consumers' pending lists
+        /// (bumping delivery counts, as XCLAIM does without JUSTID). That is an ownership mutation, not a read, so
+        /// it suppresses the demotion regardless of the ids asked for.
+        /// </remarks>
+        private static CommandFlags GetStreamReadGroupCategory(in RedisValue afterId, TimeSpan? claimMinIdleTime)
+            => claimMinIdleTime is not null || afterId == StreamConstants.UndeliveredMessages
+                ? CommandFlags.None
+                : CommandFlags.CommandRetryReadOnly;
+
+        /// <inheritdoc cref="GetStreamReadGroupCategory(in RedisValue, TimeSpan?)"/>
+        /// <remarks>For the multi-stream form, a single ">" anywhere consumes, so all of them must be explicit.</remarks>
+        private static CommandFlags GetStreamReadGroupCategory(StreamPosition[] streamPositions, TimeSpan? claimMinIdleTime)
+        {
+            if (claimMinIdleTime is not null) return CommandFlags.None;
+
+            // note: called from a base-ctor argument, so this runs before the null/empty validation below
+            if (streamPositions is null || streamPositions.Length == 0) return CommandFlags.None;
+
+            foreach (var position in streamPositions)
+            {
+                if (position.Position == StreamConstants.UndeliveredMessages) return CommandFlags.None;
+            }
+
+            return CommandFlags.CommandRetryReadOnly;
+        }
 
         private sealed class SingleStreamReadGroupCommandMessage : Message.CommandKeyBase // XREADGROUP with single stream. eg XREADGROUP GROUP mygroup Alice COUNT 1 STREAMS mystream >
         {
@@ -4817,9 +5218,10 @@ namespace StackExchange.Redis
             private readonly int? count;
             private readonly bool noAck;
             private readonly int argCount;
+            private readonly TimeSpan? claimMinIdleTime;
 
-            public SingleStreamReadGroupCommandMessage(int db, CommandFlags flags, RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue afterId, int? count, bool noAck)
-                : base(db, flags, RedisCommand.XREADGROUP, key)
+            public SingleStreamReadGroupCommandMessage(int db, CommandFlags flags, RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue afterId, int? count, bool noAck, TimeSpan? claimMinIdleTime)
+                : base(db, flags.WithCategory(GetStreamReadGroupCategory(afterId, claimMinIdleTime)), RedisCommand.XREADGROUP, key)
             {
                 if (count.HasValue && count <= 0)
                 {
@@ -4835,30 +5237,37 @@ namespace StackExchange.Redis
                 this.afterId = afterId;
                 this.count = count;
                 this.noAck = noAck;
-                argCount = 6 + (count.HasValue ? 2 : 0) + (noAck ? 1 : 0);
+                this.claimMinIdleTime = claimMinIdleTime;
+                argCount = 6 + (count.HasValue ? 2 : 0) + (noAck ? 1 : 0) + (claimMinIdleTime.HasValue ? 2 : 0);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, argCount);
-                physical.WriteBulkString(StreamConstants.Group);
-                physical.WriteBulkString(groupName);
-                physical.WriteBulkString(consumerName);
+                writer.WriteHeader(Command, argCount);
+                writer.WriteRaw("$5\r\nGROUP\r\n"u8);
+                writer.WriteBulkString(groupName);
+                writer.WriteBulkString(consumerName);
 
                 if (count.HasValue)
                 {
-                    physical.WriteBulkString(StreamConstants.Count);
-                    physical.WriteBulkString(count.Value);
+                    writer.WriteRaw("$5\r\nCOUNT\r\n"u8);
+                    writer.WriteBulkString(count.Value);
                 }
 
                 if (noAck)
                 {
-                    physical.WriteBulkString(StreamConstants.NoAck);
+                    writer.WriteRaw("$5\r\nNOACK\r\n"u8);
                 }
 
-                physical.WriteBulkString(StreamConstants.Streams);
-                physical.Write(Key);
-                physical.WriteBulkString(afterId);
+                if (claimMinIdleTime.HasValue)
+                {
+                    writer.WriteRaw("$5\r\nCLAIM\r\n"u8);
+                    writer.WriteBulkString(claimMinIdleTime.Value.TotalMilliseconds);
+                }
+
+                writer.WriteRaw("$7\r\nSTREAMS\r\n"u8);
+                writer.Write(Key);
+                writer.WriteBulkString(afterId);
             }
 
             public override int ArgCount => argCount;
@@ -4888,19 +5297,19 @@ namespace StackExchange.Redis
                 argCount = count.HasValue ? 5 : 3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, argCount);
+                writer.WriteHeader(Command, argCount);
 
                 if (count.HasValue)
                 {
-                    physical.WriteBulkString(StreamConstants.Count);
-                    physical.WriteBulkString(count.Value);
+                    writer.WriteRaw("$5\r\nCOUNT\r\n"u8);
+                    writer.WriteBulkString(count.Value);
                 }
 
-                physical.WriteBulkString(StreamConstants.Streams);
-                physical.Write(Key);
-                physical.WriteBulkString(afterId);
+                writer.WriteRaw("$7\r\nSTREAMS\r\n"u8);
+                writer.Write(Key);
+                writer.WriteBulkString(afterId);
             }
 
             public override int ArgCount => argCount;
@@ -4967,8 +5376,8 @@ namespace StackExchange.Redis
             for (int i = 0; i < keys.Length; i++)
             {
                 values[i + 2] = keys[i].AsRedisValue();
-                slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
             }
+            slot = serverSelectionStrategy.CombineSlot(slot, keys);
             return Message.CreateInSlot(Database, slot, flags, RedisCommand.BITOP, values);
         }
 
@@ -4989,15 +5398,17 @@ namespace StackExchange.Redis
             return Message.CreateInSlot(Database, slot, flags, RedisCommand.BITOP, new[] { op, destination.AsRedisValue(), first.AsRedisValue(), second.AsRedisValue() });
         }
 
-        private Message GetStringGetExMessage(in RedisKey key, TimeSpan? expiry, CommandFlags flags = CommandFlags.None) => expiry switch
+        internal Message GetStringGetExMessage(in RedisKey key, Expiration expiry, CommandFlags flags = CommandFlags.None)
         {
-            null => Message.Create(Database, flags, RedisCommand.GETEX, key, RedisLiterals.PERSIST),
-            _ => Message.Create(Database, flags, RedisCommand.GETEX, key, RedisLiterals.PX, (long)expiry.Value.TotalMilliseconds),
-        };
-
-        private Message GetStringGetExMessage(in RedisKey key, DateTime expiry, CommandFlags flags = CommandFlags.None) => expiry == DateTime.MaxValue
-            ? Message.Create(Database, flags, RedisCommand.GETEX, key, RedisLiterals.PERSIST)
-            : Message.Create(Database, flags, RedisCommand.GETEX, key, RedisLiterals.PXAT, GetUnixTimeMilliseconds(expiry));
+            var tokens = expiry.GetTokenCount(allowEnx: false);
+            flags = WithGetExCategory(flags, tokens);
+            return tokens switch
+            {
+                0 => Message.Create(Database, flags, RedisCommand.GETEX, key),
+                1 => Message.Create(Database, flags, RedisCommand.GETEX, key, expiry.Operand),
+                _ => Message.Create(Database, flags, RedisCommand.GETEX, key, expiry.Operand, expiry.Value),
+            };
+        }
 
         private Message GetStringGetWithExpiryMessage(RedisKey key, CommandFlags flags, out ResultProcessor<RedisValueWithExpiry> processor, out ServerEndPoint? server)
         {
@@ -5016,73 +5427,85 @@ namespace StackExchange.Redis
             return new StringGetWithExpiryMessage(Database, flags, RedisCommand.TTL, key);
         }
 
-        private Message? GetStringSetMessage(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, CommandFlags flags = CommandFlags.None)
+        private Message? GetStringSetMessage(KeyValuePair<RedisKey, RedisValue>[] values, When when, Expiration expiry, CommandFlags flags)
         {
             if (values == null) throw new ArgumentNullException(nameof(values));
             switch (values.Length)
             {
                 case 0: return null;
-                case 1: return GetStringSetMessage(values[0].Key, values[0].Value, null, false, when, flags);
+                case 1: return GetStringSetMessage(values[0].Key, values[0].Value, expiry, when, flags);
                 default:
-                    WhenAlwaysOrNotExists(when);
-                    int slot = ServerSelectionStrategy.NoSlot, offset = 0;
-                    var args = new RedisValue[values.Length * 2];
-                    var serverSelectionStrategy = multiplexer.ServerSelectionStrategy;
-                    for (int i = 0; i < values.Length; i++)
+                    // assume MSETEX in the general case, but look for scenarios where we can use the simpler
+                    // MSET/MSETNX commands (which have wider applicability in terms of server versions)
+                    // (note that when/expiry is ignored when not MSETEX; no need to explicitly wipe)
+                    WhenAlwaysOrExistsOrNotExists(when);
+                    var cmd = when switch
                     {
-                        args[offset++] = values[i].Key.AsRedisValue();
-                        args[offset++] = values[i].Value;
-                        slot = serverSelectionStrategy.CombineSlot(slot, values[i].Key);
-                    }
-                    return Message.CreateInSlot(Database, slot, flags, when == When.NotExists ? RedisCommand.MSETNX : RedisCommand.MSET, args);
+                        When.Always when expiry.IsNone => RedisCommand.MSET,
+                        When.NotExists when expiry.IsNoneOrKeepTtl => RedisCommand.MSETNX, // "keepttl" with "not exists" is the same as "no expiry"
+                        _ => RedisCommand.MSETEX,
+                    };
+                    return Message.Create(Database, flags, cmd, values, expiry, when);
             }
         }
 
-        private Message GetStringSetMessage(
+        internal Message GetStringSetMessage(
             RedisKey key,
             RedisValue value,
-            TimeSpan? expiry = null,
-            bool keepTtl = false,
+            Expiration expiry,
             When when = When.Always,
             CommandFlags flags = CommandFlags.None)
         {
             WhenAlwaysOrExistsOrNotExists(when);
+            static Message ThrowWhen() => throw new ArgumentOutOfRangeException(nameof(when));
+
+            // NX/XX make this a *conditional* write, whichever spelling we end up emitting below
+            // (SETNX, or SET with NX/XX); a bare SET keeps the per-command "last wins" default.
+            flags = flags.WithCategory(when.AsRetryCategory());
+
             if (value.IsNull) return Message.Create(Database, flags, RedisCommand.DEL, key);
 
-            if (expiry == null || expiry.Value == TimeSpan.MaxValue)
-            {
-                // no expiry
-                return when switch
-                {
-                    When.Always when !keepTtl => Message.Create(Database, flags, RedisCommand.SET, key, value),
-                    When.Always when keepTtl => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.KEEPTTL),
-                    When.NotExists when !keepTtl => Message.Create(Database, flags, RedisCommand.SETNX, key, value),
-                    When.NotExists when keepTtl => Message.Create(Database, flags, RedisCommand.SETNX, key, value, RedisLiterals.KEEPTTL),
-                    When.Exists when !keepTtl => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.XX),
-                    When.Exists when keepTtl => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.XX, RedisLiterals.KEEPTTL),
-                    _ => throw new ArgumentOutOfRangeException(nameof(when)),
-                };
-            }
-            long milliseconds = expiry.Value.Ticks / TimeSpan.TicksPerMillisecond;
+            if (expiry.IsPersist) throw new NotSupportedException("SET+PERSIST is not supported"); // we don't expect to get here ever
 
-            if ((milliseconds % 1000) == 0)
+            if (expiry.IsNone)
             {
-                // a nice round number of seconds
-                long seconds = milliseconds / 1000;
                 return when switch
                 {
-                    When.Always => Message.Create(Database, flags, RedisCommand.SETEX, key, seconds, value),
-                    When.Exists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.EX, seconds, RedisLiterals.XX),
-                    When.NotExists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.EX, seconds, RedisLiterals.NX),
-                    _ => throw new ArgumentOutOfRangeException(nameof(when)),
+                    When.Always => Message.Create(Database, flags, RedisCommand.SET, key, value),
+                    When.NotExists => Message.Create(Database, flags, RedisCommand.SETNX, key, value),
+                    When.Exists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.XX),
+                    _ => ThrowWhen(),
                 };
             }
 
+            if (expiry.IsKeepTtl)
+            {
+                return when switch
+                {
+                    When.Always => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.KEEPTTL),
+                    When.NotExists => Message.Create(Database, flags, RedisCommand.SETNX, key, value), // (there would be no existing TTL to keep)
+                    When.Exists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.XX, RedisLiterals.KEEPTTL),
+                    _ => ThrowWhen(),
+                };
+            }
+
+            expiry.GetTokenCount(allowEnx: false);
+
+            if (when is When.Always & expiry.IsRelative)
+            {
+                // special case to SETEX/PSETEX
+                return expiry.IsSeconds
+                    ? Message.Create(Database, flags, RedisCommand.SETEX, key, expiry.Value, value)
+                    : Message.Create(Database, flags, RedisCommand.PSETEX, key, expiry.Value, value);
+            }
+
+            // use SET with EX/PX/EXAT/PXAT and possibly XX/NX
+            var expiryOperand = expiry.GetOperand(out var expiryValue);
             return when switch
             {
-                When.Always => Message.Create(Database, flags, RedisCommand.PSETEX, key, milliseconds, value),
-                When.Exists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.PX, milliseconds, RedisLiterals.XX),
-                When.NotExists => Message.Create(Database, flags, RedisCommand.SET, key, value, RedisLiterals.PX, milliseconds, RedisLiterals.NX),
+                When.Always => Message.Create(Database, flags, RedisCommand.SET, key, value, expiryOperand, expiryValue),
+                When.Exists => Message.Create(Database, flags, RedisCommand.SET, key, value, expiryOperand, expiryValue, RedisLiterals.XX),
+                When.NotExists => Message.Create(Database, flags, RedisCommand.SET, key, value, expiryOperand, expiryValue, RedisLiterals.NX),
                 _ => throw new ArgumentOutOfRangeException(nameof(when)),
             };
         }
@@ -5096,6 +5519,12 @@ namespace StackExchange.Redis
             CommandFlags flags = CommandFlags.None)
         {
             WhenAlwaysOrExistsOrNotExists(when);
+
+            // as GetStringSetMessage: NX/XX make the write conditional. Note that the GET operand makes the
+            // *reply* non-idempotent on a replay (you get back what you just wrote), but that is equally
+            // true of GETSET, which we categorize on its keyspace effect alone; stay consistent.
+            flags = flags.WithCategory(when.AsRetryCategory());
+
             if (value.IsNull) return Message.Create(Database, flags, RedisCommand.GETDEL, key);
 
             if (expiry == null || expiry.Value == TimeSpan.MaxValue)
@@ -5145,14 +5574,6 @@ namespace StackExchange.Redis
             -1 => Message.Create(Database, flags, RedisCommand.DECR, key),
             > 0 => Message.Create(Database, flags, RedisCommand.INCRBY, key, value),
             _ => Message.Create(Database, flags, RedisCommand.DECRBY, key, -value),
-        };
-
-        private static RedisCommand SetOperationCommand(SetOperation operation, bool store) => operation switch
-        {
-            SetOperation.Difference => store ? RedisCommand.SDIFFSTORE : RedisCommand.SDIFF,
-            SetOperation.Intersect => store ? RedisCommand.SINTERSTORE : RedisCommand.SINTER,
-            SetOperation.Union => store ? RedisCommand.SUNIONSTORE : RedisCommand.SUNION,
-            _ => throw new ArgumentOutOfRangeException(nameof(operation)),
         };
 
         private CursorEnumerable<T>? TryScan<T>(RedisKey key, RedisValue pattern, int pageSize, long cursor, int pageOffset, CommandFlags flags, RedisCommand command, ResultProcessor<ScanEnumerable<T>.ScanResult> processor, out ServerEndPoint? server, bool noValues = false)
@@ -5286,6 +5707,7 @@ namespace StackExchange.Redis
 
             private protected override Message CreateMessage(in RedisValue cursor)
             {
+                var flags = this.flags.WithScanCursorCategory(cursor);
                 if (noValues)
                 {
                     if (CursorUtils.IsNil(pattern) && pageSize == CursorUtils.DefaultRedisPageSize) return Message.Create(db, flags, command, key, cursor, RedisLiterals.NOVALUES);
@@ -5322,50 +5744,63 @@ namespace StackExchange.Redis
         {
             internal readonly string Script;
             public ScriptLoadMessage(CommandFlags flags, string script)
-                : base(-1, flags, RedisCommand.SCRIPT)
+                // SCRIPT as a whole is server-admin, but LOAD is an idempotent write to a node's script cache -
+                // re-issuing it yields the same SHA - and it sits on the normal EVALSHA path. Deliberately NOT
+                // server-specific, unlike the rest of SCRIPT: the SHA is a pure function of the script, so a
+                // replay on a *different* node returns the same answer, and the bookkeeping follows it - the
+                // hash is recorded against whichever endpoint actually replied (see ResultProcessor.ScriptLoad
+                // -> ServerEndPoint.AddScript), not against the one we aimed at. Nothing here touches the
+                // keyspace, so there is no data outcome to get wrong; the worst case is that the node we
+                // *meant* to warm is still cold, and a later EVALSHA there gets NOSCRIPT and falls back to EVAL,
+                // which is an already-handled path (see IsScriptUnavailable).
+                //
+                // Note this is currently about stated intent rather than live behaviour: the only caller that
+                // could be retried across endpoints is IServer.ScriptLoad, and WithRetry wraps IDatabaseAsync
+                // only. The internal load-then-EVALSHA pairing in ScriptEvalMessage.GetMessages is written to
+                // one connection as a unit and so is never independently re-routed.
+                : base(-1, flags.WithCategory(CommandFlags.CommandRetryConnection), RedisCommand.SCRIPT)
             {
                 Script = script ?? throw new ArgumentNullException(nameof(script));
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.WriteBulkString(RedisLiterals.LOAD);
-                physical.WriteBulkString((RedisValue)Script);
+                writer.WriteHeader(Command, 2);
+                writer.WriteRaw("$4\r\nLOAD\r\n"u8);
+                writer.WriteBulkString(Script);
             }
             public override int ArgCount => 2;
         }
 
-        private sealed class HashScanResultProcessor : ScanResultProcessor<HashEntry>
+        internal sealed class HashScanResultProcessor : ScanResultProcessor<HashEntry>
         {
             public static readonly ResultProcessor<ScanEnumerable<HashEntry>.ScanResult> Default = new HashScanResultProcessor();
-            private HashScanResultProcessor() { }
-            protected override HashEntry[]? Parse(in RawResult result, out int count)
-                => HashEntryArray.TryParse(result, out HashEntry[]? pairs, true, out count) ? pairs : null;
+            internal HashScanResultProcessor() { }
+            protected override HashEntry[]? Parse(ref RespReader reader, RedisProtocol protocol, out int count)
+                => HashEntryArray.ParseArray(ref reader, protocol, true, out count, null);
         }
 
-        private abstract class ScanResultProcessor<T> : ResultProcessor<ScanEnumerable<T>.ScanResult>
+        internal abstract class ScanResultProcessor<T> : ResultProcessor<ScanEnumerable<T>.ScanResult>
         {
-            protected abstract T[]? Parse(in RawResult result, out int count);
+            protected abstract T[]? Parse(ref RespReader reader, RedisProtocol protocol, out int count);
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
-                switch (result.Resp2TypeArray)
+                // AggregateLengthIs also handles null (equivalent to zero, in terms of length)
+                if (reader.IsAggregate && reader.AggregateLengthIs(2))
                 {
-                    case ResultType.Array:
-                        var arr = result.GetItems();
-                        if (arr.Length == 2)
+                    var iter = reader.AggregateChildren();
+                    if (iter.MoveNext() && iter.Value.TryReadInt64(out var i64) && iter.MoveNext())
+                    {
+                        var innerReader = iter.Value;
+                        if (innerReader.IsAggregate)
                         {
-                            ref RawResult inner = ref arr[1];
-                            if (inner.Resp2TypeArray == ResultType.Array && arr[0].TryGetInt64(out var i64))
-                            {
-                                T[]? oversized = Parse(inner, out int count);
-                                var sscanResult = new ScanEnumerable<T>.ScanResult(i64, oversized, count, true);
-                                SetResult(message, sscanResult);
-                                return true;
-                            }
+                            T[]? oversized = Parse(ref innerReader, connection.Protocol.GetValueOrDefault(), out int count);
+                            var sscanResult = new ScanEnumerable<T>.ScanResult(i64, oversized, count, true);
+                            SetResult(message, sscanResult);
+                            return true;
                         }
-                        break;
+                    }
                 }
                 return false;
             }
@@ -5374,43 +5809,82 @@ namespace StackExchange.Redis
         internal sealed class ExecuteMessage : Message
         {
             private readonly ICollection<object> _args;
-            public new CommandBytes Command { get; }
+            private string _unknownCommand;
 
-            public ExecuteMessage(CommandMap? map, int db, CommandFlags flags, string command, ICollection<object>? args) : base(db, flags, RedisCommand.UNKNOWN)
+            private static int RemoveDbIfNotRequired(int suggestedDb, string adhocCommand, out RedisCommand knownCommand)
             {
-                if (args != null && args.Count >= PhysicalConnection.REDIS_MAX_ARGS) // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
+                // attempt to parse the ad-hoc command to a known command, so we can apply correct aliasing, etc
+                if (!RedisCommandMetadata.TryParseCI(adhocCommand, out knownCommand))
+                {
+                    knownCommand = RedisCommand.UNKNOWN;
+                }
+                if ((knownCommand is not RedisCommand.UNKNOWN & suggestedDb >= 0) && !Message.RequiresDatabase(knownCommand))
+                {
+                    // strip the DB; historically we didn't enforce this when IDatabase was
+                    // used to issue known commands as strings, so: don't complain now
+                    // (this is only an issue *because* we now recognise the known commands)
+                    suggestedDb = -1;
+                }
+                return suggestedDb;
+            }
+
+            public ExecuteMessage(CommandMap? map, int db, CommandFlags flags, string command, ICollection<object>? args)
+                : base(RemoveDbIfNotRequired(db, command, out var knownCommand), flags, knownCommand)
+            {
+                if (args != null && args.Count >= MessageWriter.REDIS_MAX_ARGS) // using >= here because we will be adding 1 for the command itself (which is an arg for the purposes of the multi-bulk protocol)
                 {
                     throw ExceptionFactory.TooManyArgs(command, args.Count);
                 }
-                Command = map?.GetBytes(command) ?? default;
-                if (Command.IsEmpty) throw ExceptionFactory.CommandDisabled(command);
+
+                // a redis command token never contains space, so a command like
+                // "ACL SETUSER x" is always a caller mistake (it gets sent as one unknown token
+                // and the server replies with an opaque error); fail fast with actionable guidance
+                if (command.IndexOf(' ') >= 0) throw ExceptionFactory.CommandHasWhitespace(command);
+
+                map ??= CommandMap.Default;
+                _unknownCommand = "";
+                if (Command is RedisCommand.UNKNOWN)
+                {
+                    _unknownCommand = command;
+                }
+                else if (!map.IsAvailable(Command))
+                {
+                    throw ExceptionFactory.CommandDisabled(command);
+                }
                 _args = args ?? Array.Empty<object>();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(RedisCommand.UNKNOWN, _args.Count, Command);
+                if (Command is RedisCommand.UNKNOWN)
+                {
+                    writer.WriteHeader(_unknownCommand, _args.Count);
+                }
+                else
+                {
+                    writer.WriteHeader(Command, _args.Count);
+                }
                 foreach (object arg in _args)
                 {
                     if (arg is RedisKey key)
                     {
-                        physical.Write(key);
+                        writer.Write(key);
                     }
                     else if (arg is RedisChannel channel)
                     {
-                        physical.Write(channel);
+                        writer.Write(channel);
                     }
                     else
                     { // recognises well-known types
                         var val = RedisValue.TryParse(arg, out var valid);
                         if (!valid) throw new InvalidCastException($"Unable to parse value: '{arg}'");
-                        physical.WriteBulkString(val);
+                        writer.WriteBulkString(val);
                     }
                 }
             }
 
-            public override string CommandString => Command.ToString();
-            public override string CommandAndKey => Command.ToString();
+            public override string CommandString => Command is RedisCommand.UNKNOWN ? _unknownCommand : base.CommandString;
+            public override string CommandAndKey => CommandString;
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
             {
@@ -5425,6 +5899,24 @@ namespace StackExchange.Redis
                 return slot;
             }
             public override int ArgCount => _args.Count;
+
+            protected override bool TryGetSubCommand(out SubCommand subCommand)
+            {
+                // the sub-command (if any) is the first argument after the command itself,
+                // e.g. CLIENT [GETNAME]; ad-hoc Execute args are boxed objects, so normalize
+                // the first one to a RedisValue before probing it against the known sub-commands
+                foreach (object arg in _args)
+                {
+                    var value = RedisValue.TryParse(arg, out var valid);
+                    if (valid)
+                    {
+                        return SubCommandMetadata.TryGetSubCommand(value, out subCommand);
+                    }
+                    break; // only the first argument is a sub-command candidate
+                }
+                subCommand = SubCommand.Unknown;
+                return false;
+            }
         }
 
         private sealed class ScriptEvalMessage : Message, IMultiMessage
@@ -5456,21 +5948,11 @@ namespace StackExchange.Redis
 
                 if (keys == null) keys = Array.Empty<RedisKey>();
                 if (values == null) values = Array.Empty<RedisValue>();
-                for (int i = 0; i < keys.Length; i++)
-                    keys[i].AssertNotNull();
-                this.keys = keys;
-                for (int i = 0; i < values.Length; i++)
-                    values[i].AssertNotNull();
-                this.values = values;
+                this.keys = keys.AssertAllNonNull();
+                this.values = values.AssertAllNonNull();
             }
 
-            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
-            {
-                int slot = ServerSelectionStrategy.NoSlot;
-                for (int i = 0; i < keys.Length; i++)
-                    slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
-                return slot;
-            }
+            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => serverSelectionStrategy.HashSlot(keys);
 
             public IEnumerable<Message> GetMessages(PhysicalConnection connection)
             {
@@ -5493,47 +5975,55 @@ namespace StackExchange.Redis
                 yield return this;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
                 if (hexHash != null)
                 {
-                    physical.WriteHeader(RedisCommand.EVALSHA, 2 + keys.Length + values.Length);
-                    physical.WriteSha1AsHex(hexHash);
+                    writer.WriteHeader(RedisCommand.EVALSHA, 2 + keys.Length + values.Length);
+                    writer.WriteSha1AsHex(hexHash);
                 }
                 else if (asciiHash != null)
                 {
-                    physical.WriteHeader(RedisCommand.EVALSHA, 2 + keys.Length + values.Length);
-                    physical.WriteBulkString((RedisValue)asciiHash);
+                    writer.WriteHeader(RedisCommand.EVALSHA, 2 + keys.Length + values.Length);
+                    writer.WriteBulkString(asciiHash);
                 }
                 else
                 {
-                    physical.WriteHeader(RedisCommand.EVAL, 2 + keys.Length + values.Length);
-                    physical.WriteBulkString((RedisValue)script);
+                    writer.WriteHeader(RedisCommand.EVAL, 2 + keys.Length + values.Length);
+                    writer.WriteBulkString(script);
                 }
-                physical.WriteBulkString(keys.Length);
+                writer.WriteBulkString(keys.Length);
                 for (int i = 0; i < keys.Length; i++)
-                    physical.Write(keys[i]);
+                    writer.Write(keys[i]);
                 for (int i = 0; i < values.Length; i++)
-                    physical.WriteBulkString(values[i]);
+                    writer.WriteBulkString(values[i]);
             }
             public override int ArgCount => 2 + keys.Length + values.Length;
         }
 
-        private sealed class SetScanResultProcessor : ScanResultProcessor<RedisValue>
+        internal sealed class SetScanResultProcessor : ScanResultProcessor<RedisValue>
         {
             public static readonly ResultProcessor<ScanEnumerable<RedisValue>.ScanResult> Default = new SetScanResultProcessor();
-            private SetScanResultProcessor() { }
-            protected override RedisValue[] Parse(in RawResult result, out int count)
+            internal SetScanResultProcessor() { }
+            protected override RedisValue[] Parse(ref RespReader reader, RedisProtocol protocol, out int count)
             {
-                var items = result.GetItems();
-                if (items.IsEmpty)
+                if (reader.IsNull)
                 {
                     count = 0;
                     return Array.Empty<RedisValue>();
                 }
-                count = (int)items.Length;
+                count = reader.AggregateLength();
+                if (count == 0)
+                {
+                    return Array.Empty<RedisValue>();
+                }
                 RedisValue[] arr = ArrayPool<RedisValue>.Shared.Rent(count);
-                items.CopyTo(arr, (in RawResult r) => r.AsRedisValue());
+                var iter = reader.AggregateChildren();
+                for (int i = 0; i < count; i++)
+                {
+                    iter.DemandNext();
+                    arr[i] = iter.Value.ReadRedisValue();
+                }
                 return arr;
             }
         }
@@ -5577,15 +6067,15 @@ namespace StackExchange.Redis
 
             RedisValue formattedStart = exclude switch
             {
-                Exclude.Both or Exclude.Start => $"({start}",
-                _ when sortedSetOrder == SortedSetOrder.ByLex => $"[{start}",
+                Exclude.Both or Exclude.Start => $"({start}".AsRedisValue(),
+                _ when sortedSetOrder == SortedSetOrder.ByLex => $"[{start}".AsRedisValue(),
                 _ => start,
             };
 
             RedisValue formattedStop = exclude switch
             {
-                Exclude.Both or Exclude.Stop => $"({stop}",
-                _ when sortedSetOrder == SortedSetOrder.ByLex => $"[{stop}",
+                Exclude.Both or Exclude.Stop => $"({stop}".AsRedisValue(),
+                _ when sortedSetOrder == SortedSetOrder.ByLex => $"[{stop}".AsRedisValue(),
                 _ => stop,
             };
 
@@ -5610,41 +6100,35 @@ namespace StackExchange.Redis
             public SortedSetCombineAndStoreCommandMessage(int db, CommandFlags flags, RedisCommand command, RedisKey destination, RedisKey[] keys, RedisValue[] values)
                 : base(db, flags, command, destination)
             {
-                for (int i = 0; i < keys.Length; i++)
-                    keys[i].AssertNotNull();
-                this.keys = keys;
-                for (int i = 0; i < values.Length; i++)
-                    values[i].AssertNotNull();
-                this.values = values;
+                this.keys = keys.AssertAllNonNull();
+                this.values = values.AssertAllNonNull();
             }
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
             {
                 int slot = base.GetHashSlot(serverSelectionStrategy);
-                for (int i = 0; i < keys.Length; i++)
-                    slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
-                return slot;
+                return serverSelectionStrategy.CombineSlot(slot, keys);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2 + keys.Length + values.Length);
-                physical.Write(Key);
-                physical.WriteBulkString(keys.Length);
+                writer.WriteHeader(Command, 2 + keys.Length + values.Length);
+                writer.Write(Key);
+                writer.WriteBulkString(keys.Length);
                 for (int i = 0; i < keys.Length; i++)
-                    physical.Write(keys[i]);
+                    writer.Write(keys[i]);
                 for (int i = 0; i < values.Length; i++)
-                    physical.WriteBulkString(values[i]);
+                    writer.WriteBulkString(values[i]);
             }
             public override int ArgCount => 2 + keys.Length + values.Length;
         }
 
-        private sealed class SortedSetScanResultProcessor : ScanResultProcessor<SortedSetEntry>
+        internal sealed class SortedSetScanResultProcessor : ScanResultProcessor<SortedSetEntry>
         {
             public static readonly ResultProcessor<ScanEnumerable<SortedSetEntry>.ScanResult> Default = new SortedSetScanResultProcessor();
-            private SortedSetScanResultProcessor() { }
-            protected override SortedSetEntry[]? Parse(in RawResult result, out int count)
-                => SortedSetWithScores.TryParse(result, out SortedSetEntry[]? pairs, true, out count) ? pairs : null;
+            internal SortedSetScanResultProcessor() { }
+            protected override SortedSetEntry[]? Parse(ref RespReader reader, RedisProtocol protocol, out int count)
+                => SortedSetWithScores.ParseArray(ref reader, protocol, true, out count, null);
         }
 
         private sealed class StringGetWithExpiryMessage : Message.CommandKeyBase, IMultiMessage
@@ -5683,10 +6167,10 @@ namespace StackExchange.Redis
                 return false;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(command, 1);
-                physical.Write(Key);
+                writer.WriteHeader(command, 1);
+                writer.Write(Key);
             }
             public override int ArgCount => 1;
         }
@@ -5695,27 +6179,23 @@ namespace StackExchange.Redis
         {
             public static readonly ResultProcessor<RedisValueWithExpiry> Default = new StringGetWithExpiryProcessor();
             private StringGetWithExpiryProcessor() { }
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
-                switch (result.Resp2TypeBulkString)
+                if (reader.IsScalar)
                 {
-                    case ResultType.Integer:
-                    case ResultType.SimpleString:
-                    case ResultType.BulkString:
-                        RedisValue value = result.AsRedisValue();
-                        if (message is StringGetWithExpiryMessage sgwem && sgwem.UnwrapValue(out var expiry, out var ex))
+                    RedisValue value = reader.ReadRedisValue();
+                    if (message is StringGetWithExpiryMessage sgwem && sgwem.UnwrapValue(out var expiry, out var ex))
+                    {
+                        if (ex == null)
                         {
-                            if (ex == null)
-                            {
-                                SetResult(message, new RedisValueWithExpiry(value, expiry));
-                            }
-                            else
-                            {
-                                SetException(message, ex);
-                            }
-                            return true;
+                            SetResult(message, new RedisValueWithExpiry(value, expiry));
                         }
-                        break;
+                        else
+                        {
+                            SetException(message, ex);
+                        }
+                        return true;
+                    }
                 }
                 return false;
             }

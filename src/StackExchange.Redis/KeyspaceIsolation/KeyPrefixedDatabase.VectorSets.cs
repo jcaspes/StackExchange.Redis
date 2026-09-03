@@ -1,6 +1,4 @@
-﻿using System;
-
-// ReSharper disable once CheckNamespace
+﻿// ReSharper disable once CheckNamespace
 namespace StackExchange.Redis.KeyspaceIsolation;
 
 internal sealed partial class KeyPrefixedDatabase
@@ -53,4 +51,22 @@ internal sealed partial class KeyPrefixedDatabase
         VectorSetSimilaritySearchRequest query,
         CommandFlags flags = CommandFlags.None) =>
         Inner.VectorSetSimilaritySearch(ToInner(key), query, flags);
+
+    public Lease<RedisValue> VectorSetRange(
+        RedisKey key,
+        RedisValue start = default,
+        RedisValue end = default,
+        long count = -1,
+        Exclude exclude = Exclude.None,
+        CommandFlags flags = CommandFlags.None) =>
+        Inner.VectorSetRange(ToInner(key), start, end, count, exclude, flags);
+
+    public System.Collections.Generic.IEnumerable<RedisValue> VectorSetRangeEnumerate(
+        RedisKey key,
+        RedisValue start = default,
+        RedisValue end = default,
+        long count = 100,
+        Exclude exclude = Exclude.None,
+        CommandFlags flags = CommandFlags.None) =>
+        Inner.VectorSetRangeEnumerate(ToInner(key), start, end, count, exclude, flags);
 }

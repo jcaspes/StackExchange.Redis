@@ -2,24 +2,28 @@
   <PropertyGroup>
     <Nullable>enable</Nullable>
     <!-- extend the default lib targets for the main lib; mostly because of "vectors" -->
-    <TargetFrameworks>net461;netstandard2.0;net472;netcoreapp3.1;net6.0;net8.0</TargetFrameworks>
+    <TargetFrameworks>net461;netstandard2.0;net472;net6.0;net8.0;net10.0</TargetFrameworks>
     <Description>High performance Redis client, incorporating both synchronous and asynchronous usage.</Description>
     <AssemblyName>StackExchange.Redis</AssemblyName>
     <AssemblyTitle>StackExchange.Redis</AssemblyTitle>
     <PackageId>StackExchange.Redis</PackageId>
     <PackageTags>Async;Redis;Cache;PubSub;Messaging</PackageTags>
     <SignAssembly>true</SignAssembly>
-    <PublicSign Condition=" '$(OS)' != 'Windows_NT' ">true</PublicSign>
     <DefineConstants Condition="'$(TargetFramework)' != 'net461'">$(DefineConstants);VECTOR_SAFE</DefineConstants>
     <DefineConstants Condition="'$(TargetFramework)' != 'net461' and '$(TargetFramework)' != 'net472' and '$(TargetFramework)' != 'netstandard2.0'">$(DefineConstants);UNIX_SOCKET</DefineConstants>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+
+    <!-- for debugging low-level parsing problems; absolutely do not us in production -->
+    <!--<DefineConstants Condition="'$(Configuration)' == 'Debug'">$(DefineConstants);PARSE_DETAIL</DefineConstants>-->
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- needed everywhere (with hack to override to LTS when possible) -->
-    <PackageReference Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))" Include="Microsoft.Extensions.Logging.Abstractions" VersionOverride="8.0"/>
-    <PackageReference Condition="!$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))" Include="Microsoft.Extensions.Logging.Abstractions" />
-    <PackageReference Include="Pipelines.Sockets.Unofficial" />
+    <!-- needed everywhere -->
+    <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" />
+    <PackageReference Include="System.IO.Hashing" />
+
+    <!-- pipelines is built in from .NET 10 onwards -->
+    <PackageReference Condition="!$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net10.0'))" Include="System.IO.Pipelines"/>
 
     <!-- built into .NET core now -->
     <PackageReference Include="Microsoft.Bcl.AsyncInterfaces" Condition="'$(TargetFramework)' == 'net472' or '$(TargetFramework)' == 'net461' or '$(TargetFramework)' == 'netstandard2.0'" />
@@ -32,14 +36,22 @@
     <PackageReference Include="System.IO.Compression" Condition="'$(TargetFramework)' == 'net472' or '$(TargetFramework)' == 'net461' " />
 
     <None Include="README.md" Pack="true" PackagePath="\"/>
+
+    <!-- imported into consuming projects; makes <RedisMinServerVersion> visible to the shipped analyzer -->
+    <None Include="build\StackExchange.Redis.props" Pack="true" PackagePath="build\" />
+
+    <Compile Update="HotKeys.*.cs" DependentUpon="HotKeys.cs" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- APIs for all target frameworks -->
-    <AdditionalFiles Include="PublicAPI/PublicAPI.Shipped.txt" />
-    <AdditionalFiles Include="PublicAPI/PublicAPI.Unshipped.txt" />
-    <!-- APIs for netcoreapp3.1+ -->
-    <AdditionalFiles Include="PublicAPI/$(TargetFramework)/PublicAPI.Shipped.txt" Condition="'$(TargetFrameworkIdentifier)' == '.NETCoreApp'" />
+    <AdditionalFiles Include="PublicAPI/PublicAPI.*.txt" />
+    <!-- conditional symbol entries (debug hacks) -->
+    <AdditionalFiles Include="PublicAPI/$(Configuration)/PublicAPI.txt" />
+    <!-- progressively additive APIs in later frameworks; each folder is effectively NET_X_Y_OR_GREATER -->
+    <AdditionalFiles Include="PublicAPI/net6.0/PublicAPI.*.txt" Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net6.0'))" />
+    <!-- for example... -->
+    <!-- <AdditionalFiles Include="PublicAPI/net10.0/PublicAPI.*.txt" Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net10.0'))" /> -->
   </ItemGroup>
 
   <ItemGroup>
@@ -49,6 +61,62 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\eng\StackExchange.Redis.Build\StackExchange.Redis.Build.csproj" OutputItemType="Analyzer" ReferenceOutputAssembly="false" />
+    <ProjectReference Include="..\RESPite\RESPite.csproj" />
+  </ItemGroup>
+
+  <!--
+    Ship eng/StackExchange.Redis.Build as the package's analyzer, and eng/StackExchange.Redis.CodeFixes
+    alongside it. Every project already references the analyzer (see Directory.Build.props) with
+    ReferenceOutputAssembly="false", so it is a build-time tool here and not a dependency; this is what
+    additionally puts it in the package for consumers.
+
+    analyzers/dotnet/cs is the conventional path, and applies to all consumer target frameworks. Roslyn itself
+    is PrivateAssets="all" in both projects so it is not carried along - the host supplies it. That is also why
+    the code fixes are a *separate* assembly: they need Workspaces, which csc does not ship and the IDE does.
+
+    The paths are asked of the projects rather than assembled from bin/$(Configuration), so that a change to the
+    output layout cannot quietly produce a package with no analyzer in it. The existence check is the point:
+    Packing without having built them is otherwise a silent omission, and the failure mode downstream
+    (no diagnostics, ever, for any consumer) is invisible.
+  -->
+  <Target Name="_ResolveSERAnalyzerForPackaging" BeforeTargets="_GetPackageFiles">
+    <MSBuild Projects="..\..\eng\StackExchange.Redis.Build\StackExchange.Redis.Build.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);TargetFramework=netstandard2.0">
+      <Output TaskParameter="TargetOutputs" ItemName="_SERAnalyzerAssembly" />
+    </MSBuild>
+
+    <!-- appended to the same item, so the checks and the pack below cover both without being written twice -->
+    <MSBuild Projects="..\..\eng\StackExchange.Redis.CodeFixes\StackExchange.Redis.CodeFixes.csproj"
+             Targets="GetTargetPath"
+             Properties="Configuration=$(Configuration);TargetFramework=netstandard2.0">
+      <Output TaskParameter="TargetOutputs" ItemName="_SERAnalyzerAssembly" />
+    </MSBuild>
+
+    <Error Condition="'@(_SERAnalyzerAssembly)' == ''"
+           Text="Could not resolve the StackExchange.Redis.Build analyzer output; the package would ship without its analyzer." />
+    <Error Condition="!Exists('%(_SERAnalyzerAssembly.FullPath)')"
+           Text="The StackExchange.Redis.Build analyzer has not been built (%(_SERAnalyzerAssembly.FullPath)); build it before packing." />
+
+    <ItemGroup>
+      <!-- no trailing separator: these items are absolute paths, and NuGet appends one itself - a trailing
+           slash here produces "analyzers/dotnet/cs//Foo.dll", which loads but is a malformed package path -->
+      <None Include="@(_SERAnalyzerAssembly)" Pack="true" PackagePath="analyzers/dotnet/cs" Visible="false" />
+    </ItemGroup>
+  </Target>
+
+  <ItemGroup>
+    <Compile Update="Availability/MultiGroupDatabase.*.cs">
+      <DependentUpon>MultiGroupDatabase.cs</DependentUpon>
+    </Compile>
+    <Compile Update="Availability/HealthCheck.*.cs">
+      <DependentUpon>HealthCheck.cs</DependentUpon>
+    </Compile>
+    <Compile Update="Availability/HealthCheckProbe.*.cs">
+      <DependentUpon>HealthCheckProbe.cs</DependentUpon>
+    </Compile>
+    <Compile Update="Availability/MultiGroupSubscriber.*.cs">
+      <DependentUpon>MultiGroupSubscriber.cs</DependentUpon>
+    </Compile>
   </ItemGroup>
 </Project>

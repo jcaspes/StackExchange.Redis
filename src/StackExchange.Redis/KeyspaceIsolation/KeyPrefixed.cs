@@ -3,11 +3,13 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Net;
+using System.Threading;
 using System.Threading.Tasks;
+using StackExchange.Redis.Interfaces;
 
 namespace StackExchange.Redis.KeyspaceIsolation
 {
-    internal partial class KeyPrefixed<TInner> : IDatabaseAsync where TInner : IDatabaseAsync
+    internal partial class KeyPrefixed<TInner> : IDatabaseAsync, IInternalDatabaseAsync where TInner : IDatabaseAsync
     {
         internal KeyPrefixed(TInner inner, byte[] keyPrefix)
         {
@@ -17,9 +19,32 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public IConnectionMultiplexer Multiplexer => Inner.Multiplexer;
 
+        public int Database => Inner.Database;
+
+        // default: this wrapper is not a full database (it is the base for the batch/transaction wrappers too),
+        // so it cannot start a transaction; KeyPrefixedDatabase reimplements this to prefix a real one
+        ITransactionAsync IDatabaseAsync.CreateTransaction(object? asyncState)
+            => throw new NotSupportedException("Transactions cannot be created here");
+
         internal TInner Inner { get; }
 
         internal byte[] Prefix { get; }
+
+        DatabaseFeatureFlags IInternalDatabaseAsync.GetFeatures(out string name)
+            => Inner.GetFeatures(out name) | GetDatabaseFeatures();
+
+        CancellationToken IInternalDatabaseAsync.GetNextFailover() => Inner.GetNextFailover();
+
+        // this wrapper does not stamp its own async-state; it inherits whatever the inner database uses
+        object? IInternalDatabaseAsync.AsyncState => Inner.GetAsyncState();
+
+        // the flags contributed by this wrapper itself (on top of the inner database); the batch and
+        // transaction subclasses override to fold in their own flag, mirroring RedisDatabase/RedisBatch/
+        // RedisTransaction rather than relying on the inner instance to carry it.
+        private protected virtual DatabaseFeatureFlags GetDatabaseFeatures()
+            => DatabaseFeatureFlags.KeyPrefix;
+
+        public override string ToString() => this.BuildString();
 
         public Task<RedisValue> DebugObjectAsync(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.DebugObjectAsync(ToInner(key), flags);
@@ -183,6 +208,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<long> HashStringLengthAsync(RedisKey key, RedisValue hashField, CommandFlags flags = CommandFlags.None) =>
             Inner.HashStringLengthAsync(ToInner(key), hashField, flags);
 
+        public Task HashImportAsync(RedisKey key, HashImport fieldSet, ReadOnlyMemory<RedisValue> values, CommandFlags flags = CommandFlags.None) =>
+            Inner.HashImportAsync(ToInner(key), fieldSet, values, flags);
+
         public Task HashSetAsync(RedisKey key, HashEntry[] hashFields, CommandFlags flags = CommandFlags.None) =>
             Inner.HashSetAsync(ToInner(key), hashFields, flags);
 
@@ -321,6 +349,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<RedisValue> ListMoveAsync(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, CommandFlags flags = CommandFlags.None) =>
             Inner.ListMoveAsync(ToInner(sourceKey), ToInner(destinationKey), sourceSide, destinationSide);
 
+        public Task<RedisValue[]?> ListMoveAsync(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, long count, ListMoveCount mode = ListMoveCount.UpTo, ListMoveOrder order = ListMoveOrder.Bulk, CommandFlags flags = CommandFlags.None) =>
+            Inner.ListMoveAsync(ToInner(sourceKey), ToInner(destinationKey), sourceSide, destinationSide, count, mode, order, flags);
+
         public Task<RedisValue[]> ListRangeAsync(RedisKey key, long start = 0, long stop = -1, CommandFlags flags = CommandFlags.None) =>
             Inner.ListRangeAsync(ToInner(key), start, stop, flags);
 
@@ -435,6 +466,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<long> SetIntersectionLengthAsync(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None) =>
             Inner.SetIntersectionLengthAsync(ToInner(keys), limit, flags);
 
+        public Task<long> SetCombineLengthAsync(SetOperation operation, RedisKey[] keys, long limit = 0, bool approximate = false, CommandFlags flags = CommandFlags.None) =>
+            Inner.SetCombineLengthAsync(operation, ToInner(keys), limit, approximate, flags);
+
         public Task<long> SetLengthAsync(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.SetLengthAsync(ToInner(key), flags);
 
@@ -505,6 +539,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public Task<double> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, CommandFlags flags = CommandFlags.None) =>
             Inner.SortedSetIncrementAsync(ToInner(key), member, value, flags);
+
+        public Task<double?> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, ValueCondition when, CommandFlags flags) =>
+            Inner.SortedSetIncrementAsync(ToInner(key), member, value, when, flags);
 
         public Task<long> SortedSetIntersectionLengthAsync(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None) =>
             Inner.SortedSetIntersectionLengthAsync(ToInner(keys), limit, flags);
@@ -609,6 +646,12 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<StreamTrimResult[]> StreamAcknowledgeAndDeleteAsync(RedisKey key, RedisValue groupName, StreamTrimMode mode, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAcknowledgeAndDeleteAsync(ToInner(key), groupName, mode, messageIds, flags);
 
+        public Task<long> StreamNegativeAcknowledgeAsync(RedisKey key, RedisValue groupName, StreamNackMode mode, RedisValue messageId, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamNegativeAcknowledgeAsync(ToInner(key), groupName, mode, messageId, flags);
+
+        public Task<long> StreamNegativeAcknowledgeAsync(RedisKey key, RedisValue groupName, StreamNackMode mode, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamNegativeAcknowledgeAsync(ToInner(key), groupName, mode, messageIds, flags);
+
         public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId, int? maxLength, bool useApproximateMaxLength, CommandFlags flags) =>
             Inner.StreamAddAsync(ToInner(key), streamField, streamValue, messageId, maxLength, useApproximateMaxLength, flags);
 
@@ -620,6 +663,21 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAddAsync(ToInner(key), streamPairs, messageId, maxLength, useApproximateMaxLength, limit, mode, flags);
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAddAsync(ToInner(key), streamField, streamValue, idempotentId, maxLength, useApproximateMaxLength, limit, mode, flags);
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs,  StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode mode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAddAsync(ToInner(key), streamPairs, idempotentId, maxLength, useApproximateMaxLength, limit, mode, flags);
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamAddOptions options, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAddAsync(ToInner(key), streamField, streamValue, options, flags);
+
+        public Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, StreamAddOptions options, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamAddAsync(ToInner(key), streamPairs, options, flags);
+
+        public Task StreamConfigureAsync(RedisKey key, StreamConfiguration configuration, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamConfigureAsync(ToInner(key), configuration, flags);
 
         public Task<StreamAutoClaimResult> StreamAutoClaimAsync(RedisKey key, RedisValue consumerGroup, RedisValue claimingConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count = null, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamAutoClaimAsync(ToInner(key), consumerGroup, claimingConsumer, minIdleTimeInMs, startAtId, count, flags);
@@ -681,8 +739,11 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<StreamEntry[]> StreamReadAsync(RedisKey key, RedisValue position, int? count = null, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamReadAsync(ToInner(key), position, count, flags);
 
-        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, CommandFlags flags = CommandFlags.None) =>
+        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags) =>
             Inner.StreamReadAsync(streamPositions, countPerStream, flags);
+
+        public Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamReadAsync(streamPositions, countPerStream, maxCount, maxSize, flags);
 
         public Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position, int? count, CommandFlags flags) =>
             Inner.StreamReadGroupAsync(ToInner(key), groupName, consumerName, position, count, flags);
@@ -690,11 +751,20 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamReadGroupAsync(ToInner(key), groupName, consumerName, position, count, noAck, flags);
 
+        public Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamReadGroupAsync(ToInner(key), groupName, consumerName, position, count, noAck, claimMinIdleTime, flags);
+
         public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, CommandFlags flags) =>
             Inner.StreamReadGroupAsync(streamPositions, groupName, consumerName, countPerStream, flags);
 
         public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, CommandFlags flags = CommandFlags.None) =>
             Inner.StreamReadGroupAsync(streamPositions, groupName, consumerName, countPerStream, noAck, flags);
+
+        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags) =>
+            Inner.StreamReadGroupAsync(streamPositions, groupName, consumerName, countPerStream, noAck, claimMinIdleTime, flags);
+
+        public Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None) =>
+            Inner.StreamReadGroupAsync(streamPositions, groupName, consumerName, countPerStream, noAck, claimMinIdleTime, maxCount, maxSize, flags);
 
         public Task<long> StreamTrimAsync(RedisKey key, int maxLength, bool useApproximateMaxLength, CommandFlags flags) =>
             Inner.StreamTrimAsync(ToInner(key), maxLength, useApproximateMaxLength, flags);
@@ -726,8 +796,14 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<long> StringBitPositionAsync(RedisKey key, bool bit, long start = 0, long end = -1, StringIndexType indexType = StringIndexType.Byte, CommandFlags flags = CommandFlags.None) =>
             Inner.StringBitPositionAsync(ToInner(key), bit, start, end, indexType, flags);
 
+        public Task<bool> StringDeleteAsync(RedisKey key, ValueCondition when, CommandFlags flags = CommandFlags.None) =>
+            Inner.StringDeleteAsync(ToInner(key), when, flags);
+
         public Task<double> StringDecrementAsync(RedisKey key, double value, CommandFlags flags = CommandFlags.None) =>
             Inner.StringDecrementAsync(ToInner(key), value, flags);
+
+        public Task<ValueCondition?> StringDigestAsync(RedisKey key, CommandFlags flags = CommandFlags.None) =>
+            Inner.StringDigestAsync(ToInner(key), flags);
 
         public Task<long> StringDecrementAsync(RedisKey key, long value = 1, CommandFlags flags = CommandFlags.None) =>
             Inner.StringDecrementAsync(ToInner(key), value, flags);
@@ -768,11 +844,23 @@ namespace StackExchange.Redis.KeyspaceIsolation
         public Task<long> StringIncrementAsync(RedisKey key, long value = 1, CommandFlags flags = CommandFlags.None) =>
             Inner.StringIncrementAsync(ToInner(key), value, flags);
 
+        public Task<StringIncrementResult<double>> StringIncrementAsync(RedisKey key, double value, Expiration expiry, double? lowerBound = null, double? upperBound = null, IncrementOptions options = IncrementOptions.None, CommandFlags flags = CommandFlags.None) =>
+            Inner.StringIncrementAsync(ToInner(key), value, expiry, lowerBound, upperBound, options, flags);
+
+        public Task<StringIncrementResult<long>> StringIncrementAsync(RedisKey key, long value, Expiration expiry, long? lowerBound = null, long? upperBound = null, IncrementOptions options = IncrementOptions.None, CommandFlags flags = CommandFlags.None) =>
+            Inner.StringIncrementAsync(ToInner(key), value, expiry, lowerBound, upperBound, options, flags);
+
         public Task<long> StringLengthAsync(RedisKey key, CommandFlags flags = CommandFlags.None) =>
             Inner.StringLengthAsync(ToInner(key), flags);
 
+        public Task<bool> StringSetAsync(RedisKey key, RedisValue value, Expiration expiry, ValueCondition when, CommandFlags flags = CommandFlags.None)
+            => Inner.StringSetAsync(ToInner(key), value, expiry, when, flags);
+
         public Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, CommandFlags flags = CommandFlags.None) =>
             Inner.StringSetAsync(ToInner(values), when, flags);
+
+        public Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when, Expiration expiry, CommandFlags flags) =>
+            Inner.StringSetAsync(ToInner(values), when, expiry, flags);
 
         public Task<bool> StringSetAsync(RedisKey key, RedisValue value, TimeSpan? expiry, When when) =>
             Inner.StringSetAsync(ToInner(key), value, expiry, when);
@@ -803,6 +891,9 @@ namespace StackExchange.Redis.KeyspaceIsolation
             Inner.KeyTouchAsync(ToInner(key), flags);
 
         public bool TryWait(Task task) =>
+            // forwarding is not using: these decorators must implement the interface in full, and the
+            // implementation cannot be dropped while the interface declares it
+            #pragma warning disable SER308 // Blocking on a task through the library's Wait helpers
             Inner.TryWait(task);
 
         public TResult Wait<TResult>(Task<TResult> task) =>
@@ -813,6 +904,7 @@ namespace StackExchange.Redis.KeyspaceIsolation
 
         public void WaitAll(params Task[] tasks) =>
             Inner.WaitAll(tasks);
+            #pragma warning restore SER308
 
         protected internal RedisKey ToInner(RedisKey outer) =>
             RedisKey.WithPrefix(Prefix, outer);
@@ -896,10 +988,10 @@ namespace StackExchange.Redis.KeyspaceIsolation
             RedisKey.ConcatenateBytes(Prefix, null, (byte[]?)outer);
 
         protected RedisValue SortByToInner(RedisValue outer) =>
-            (outer == "nosort") ? outer : ToInner(outer);
+            (outer == RedisLiterals.nosort) ? outer : ToInner(outer);
 
         protected RedisValue SortGetToInner(RedisValue outer) =>
-            (outer == "#") ? outer : ToInner(outer);
+            (outer == RedisLiterals.HashSymbol) ? outer : ToInner(outer);
 
         [return: NotNullIfNotNull("outer")]
         protected RedisValue[]? SortGetToInner(RedisValue[]? outer)

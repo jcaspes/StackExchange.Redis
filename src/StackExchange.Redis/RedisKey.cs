@@ -2,6 +2,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.InteropServices;
 using System.Text;
 
 namespace StackExchange.Redis
@@ -221,7 +222,7 @@ namespace StackExchange.Redis
 
         internal RedisValue AsRedisValue()
         {
-            if (KeyPrefix == null && KeyValue is string keyString) return keyString;
+            if (KeyPrefix == null && KeyValue is string keyString) return keyString.AsRedisValue();
             return (byte[]?)this;
         }
 
@@ -395,6 +396,14 @@ namespace StackExchange.Redis
                 _ => ((byte[])KeyValue).Length,
             };
 
+        internal int MaxByteCount() =>
+            (KeyPrefix is null ? 0 : KeyPrefix.Length) + KeyValue switch
+            {
+                null => 0,
+                string s => Encoding.UTF8.GetMaxByteCount(s.Length),
+                _ => ((byte[])KeyValue).Length,
+            };
+
         internal int CopyTo(Span<byte> destination)
         {
             int written = 0;
@@ -411,12 +420,12 @@ namespace StackExchange.Redis
                 case string s:
                     if (s.Length != 0)
                     {
-#if NETCOREAPP
+#if NET
                         written += Encoding.UTF8.GetBytes(s, destination);
 #else
                         unsafe
                         {
-                            fixed (byte* bPtr = destination)
+                            fixed (byte* bPtr = &MemoryMarshal.GetReference(destination))
                             {
                                 fixed (char* cPtr = s)
                                 {

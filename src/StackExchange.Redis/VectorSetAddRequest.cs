@@ -6,7 +6,6 @@ namespace StackExchange.Redis;
 /// <summary>
 /// Represents the request for a vectorset add operation.
 /// </summary>
-[Experimental(Experiments.VectorSets, UrlFormat = Experiments.UrlFormat)]
 public abstract class VectorSetAddRequest
 {
     // polymorphism left open for future, but needs to be handled internally
@@ -23,7 +22,7 @@ public abstract class VectorSetAddRequest
     public static VectorSetAddRequest Member(
         RedisValue element,
         ReadOnlyMemory<float> values,
-#if NET7_0_OR_GREATER
+#if NET8_0_OR_GREATER
         [StringSyntax(StringSyntaxAttribute.Json)]
 #endif
         string? attributesJson = null)
@@ -38,6 +37,8 @@ public abstract class VectorSetAddRequest
     /// Optional dimension reduction using random projection (REDUCE parameter).
     /// </summary>
     public int? ReducedDimensions { get; set; }
+
+    internal bool UseFp32 { get; set; } = true; // for testing
 
     /// <summary>
     /// Quantization type - Int8 (Q8), None (NOQUANT), or Binary (BIN). Default: Int8.
@@ -75,6 +76,7 @@ public abstract class VectorSetAddRequest
                 UseCheckAndSet,
                 element,
                 values,
-                attributesJson);
+                attributesJson,
+                UseFp32);
     }
 }

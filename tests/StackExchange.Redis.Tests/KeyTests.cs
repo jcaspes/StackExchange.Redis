@@ -14,6 +14,8 @@ public class KeyTests(ITestOutputHelper output, SharedConnectionFixture fixture)
     [Fact]
     public async Task TestScan()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true);
 
         var dbId = TestConfig.GetDedicatedDB(conn);
@@ -33,6 +35,8 @@ public class KeyTests(ITestOutputHelper output, SharedConnectionFixture fixture)
     [Fact]
     public async Task FlushFetchRandomKey()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true);
 
         var dbId = TestConfig.GetDedicatedDB(conn);
@@ -48,6 +52,27 @@ public class KeyTests(ITestOutputHelper output, SharedConnectionFixture fixture)
 
         Assert.NotNull(keyBytes);
         Assert.Equal(prefix + "abc", Encoding.UTF8.GetString(keyBytes));
+    }
+
+    [Fact]
+    public async Task KeyTypeOfMissingKeyIsNone() // see #3156
+    {
+        await using var conn = Create();
+
+        var db = conn.GetDatabase();
+        var key = Me();
+        db.KeyDelete(key, CommandFlags.FireAndForget);
+
+        Assert.Equal(RedisType.None, db.KeyType(key));
+        Assert.Equal(RedisType.None, await db.KeyTypeAsync(key));
+
+        db.StringSet(key, "abc", flags: CommandFlags.FireAndForget);
+        Assert.Equal(RedisType.String, db.KeyType(key));
+        Assert.Equal(RedisType.String, await db.KeyTypeAsync(key));
+
+        db.KeyDelete(key, CommandFlags.FireAndForget);
+        Assert.Equal(RedisType.None, db.KeyType(key));
+        Assert.Equal(RedisType.None, await db.KeyTypeAsync(key));
     }
 
     [Fact]

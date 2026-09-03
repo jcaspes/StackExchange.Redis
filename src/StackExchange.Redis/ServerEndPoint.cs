@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Runtime.CompilerServices;
@@ -9,6 +10,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
+using StackExchange.Redis.Availability;
 using static StackExchange.Redis.PhysicalBridge;
 
 namespace StackExchange.Redis
@@ -90,7 +92,12 @@ namespace StackExchange.Redis
         /// This is memoized because it's accessed on hot paths inside the write lock.
         /// </remarks>
         public bool SupportsDatabases =>
-            supportsDatabases ??= serverType == ServerType.Standalone && Multiplexer.CommandMap.IsAvailable(RedisCommand.SELECT);
+            supportsDatabases ??= serverType switch
+            {
+                ServerType.Standalone => true,
+                ServerType.Cluster => _productVariant is ProductVariant.Valkey,
+                _ => false,
+            } && Multiplexer.CommandMap.IsAvailable(RedisCommand.SELECT);
 
         public int Databases
         {
@@ -101,7 +108,6 @@ namespace StackExchange.Redis
         public bool IsConnecting => interactive?.IsConnecting == true;
         public bool IsConnected => interactive?.IsConnected == true;
         public bool IsSubscriberConnected => KnowOrAssumeResp3() ? IsConnected : subscription?.IsConnected == true;
-
         public bool KnowOrAssumeResp3()
         {
             var protocol = interactive?.Protocol;
@@ -175,7 +181,7 @@ namespace StackExchange.Redis
         internal State InteractiveConnectionState => interactive?.ConnectionState ?? State.Disconnected;
         internal State SubscriptionConnectionState => KnowOrAssumeResp3() ? InteractiveConnectionState : subscription?.ConnectionState ?? State.Disconnected;
 
-        public long OperationCount => interactive?.OperationCount ?? 0 + subscription?.OperationCount ?? 0;
+        public long OperationCount => (interactive?.OperationCount ?? 0) + (subscription?.OperationCount ?? 0);
 
         public bool RequiresReadMode => serverType == ServerType.Cluster && IsReplica;
 
@@ -277,6 +283,23 @@ namespace StackExchange.Redis
                 : interactive ??= CreateBridge(ConnectionType.Interactive, null);
         }
 
+        /// <summary>
+        /// Moves a subscription message that was queued against the interactive bridge over to the subscription
+        /// bridge, which is where it belongs now that we know the connection is RESP2 (see #3154).
+        /// </summary>
+        /// <returns><c>true</c> if the message is now the subscription bridge's responsibility.</returns>
+        internal bool TryRerouteToSubscriptionBridge(Message message, PhysicalBridge from)
+        {
+            if (isDisposed) return false;
+
+            // deliberately not via GetBridge: that consults the same expectation that got us here
+            var target = subscription ??= CreateBridge(ConnectionType.Subscription, null);
+            if (target is null || ReferenceEquals(target, from)) return false;
+
+            target.AcceptRerouted(message);
+            return true;
+        }
+
         public PhysicalBridge? GetBridge(RedisCommand command, bool create = true)
         {
             if (isDisposed) return null;
@@ -298,6 +321,23 @@ namespace StackExchange.Redis
         }
 
         public RedisFeatures GetFeatures() => new RedisFeatures(version);
+
+        /// <summary>
+        /// The <c>CLUSTER SLOTS</c> view of the topology, keyed on node-id. Populated alongside
+        /// <see cref="ClusterConfiguration"/> but not yet used for routing, so the two can be compared
+        /// before anything depends on this one.
+        /// </summary>
+        internal ClusterTopology? ClusterTopology { get; private set; }
+
+        internal void SetClusterSlots(ClusterSlotsResult? slots)
+        {
+            var topology = ClusterTopology.From(slots);
+            if (topology is not null)
+            {
+                ClusterTopology = topology;
+                Multiplexer.Trace($"Shadow topology: {topology.Nodes.Count} nodes");
+            }
+        }
 
         public void SetClusterConfiguration(ClusterConfiguration configuration)
         {
@@ -323,6 +363,8 @@ namespace StackExchange.Redis
                 ServerEndPoint? primary = null;
                 foreach (var node in configuration.Nodes)
                 {
+                    if (node.IgnoreFromClient) continue;
+
                     if (node.NodeId == thisNode.ParentNodeId)
                     {
                         primary = Multiplexer.GetServerEndPoint(node.EndPoint);
@@ -380,7 +422,23 @@ namespace StackExchange.Redis
             }
         }
 
-        internal async Task AutoConfigureAsync(PhysicalConnection? connection, ILogger? log = null)
+        /// <summary>
+        /// Whether <c>HELLO</c> has told us our replication role (and server mode) on the current connection.
+        /// </summary>
+        /// <remarks>Reset at the start of each handshake, and set when the <c>HELLO</c> reply is processed.</remarks>
+        internal bool RoleKnownFromHello { get; set; }
+
+        /// <summary>
+        /// Issues the topology/configuration discovery commands for this server.
+        /// </summary>
+        /// <param name="connection">The connection to write to; <c>null</c> for an already-established connection.</param>
+        /// <param name="log">The log to write handshake details to.</param>
+        /// <param name="extraFlags">Additional flags to apply to the messages issued.</param>
+        /// <param name="helloPending">
+        /// Whether a <c>HELLO</c> has been written to this same batch, but not yet answered; in that case
+        /// we expect to learn our role from it, so we can skip the key-based fallback probe.
+        /// </param>
+        internal async Task AutoConfigureAsync(PhysicalConnection? connection, ILogger? log = null, CommandFlags extraFlags = CommandFlags.None, bool helloPending = false)
         {
             if (!serverType.SupportsAutoConfigure())
             {
@@ -392,7 +450,7 @@ namespace StackExchange.Redis
             log?.LogInformationAutoConfiguring(new(this));
 
             var commandMap = Multiplexer.CommandMap;
-            const CommandFlags flags = CommandFlags.FireAndForget | CommandFlags.NoRedirect;
+            var flags = CommandFlags.FireAndForget | CommandFlags.NoRedirect | extraFlags;
             var features = GetFeatures();
             Message msg;
 
@@ -402,11 +460,11 @@ namespace StackExchange.Redis
             {
                 if (Multiplexer.RawConfig.KeepAlive <= 0)
                 {
-                    msg = Message.Create(-1, flags, RedisCommand.CONFIG, RedisLiterals.GET, RedisLiterals.timeout);
+                    msg = Message.Create(-1, flags | Message.NoFlushFlag, RedisCommand.CONFIG, RedisLiterals.GET, RedisLiterals.timeout);
                     msg.SetInternalCall();
                     await WriteDirectOrQueueFireAndForgetAsync(connection, msg, autoConfigProcessor).ForAwait();
                 }
-                msg = Message.Create(-1, flags, RedisCommand.CONFIG, RedisLiterals.GET, features.ReplicaCommands ? RedisLiterals.replica_read_only : RedisLiterals.slave_read_only);
+                msg = Message.Create(-1, flags | Message.NoFlushFlag, RedisCommand.CONFIG, RedisLiterals.GET, features.ReplicaCommands ? RedisLiterals.replica_read_only : RedisLiterals.slave_read_only);
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, autoConfigProcessor).ForAwait();
                 msg = Message.Create(-1, flags, RedisCommand.CONFIG, RedisLiterals.GET, RedisLiterals.databases);
@@ -415,7 +473,8 @@ namespace StackExchange.Redis
             }
             if (commandMap.IsAvailable(RedisCommand.SENTINEL))
             {
-                msg = Message.Create(-1, flags, RedisCommand.SENTINEL, RedisLiterals.MASTERS);
+                // SENTINEL MASTERS only reads the sentinel's view, despite SENTINEL defaulting to server-admin
+                msg = Message.Create(-1, flags.WithCategory(CommandFlags.CommandRetryReadOnly | Message.CommandServerSpecific), RedisCommand.SENTINEL, RedisLiterals.MASTERS);
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, autoConfigProcessor).ForAwait();
             }
@@ -443,9 +502,11 @@ namespace StackExchange.Redis
                     await WriteDirectOrQueueFireAndForgetAsync(connection, msg, autoConfigProcessor).ForAwait();
                 }
             }
-            else if (commandMap.IsAvailable(RedisCommand.SET))
+            else if (commandMap.IsAvailable(RedisCommand.SET) && !(helloPending || RoleKnownFromHello))
             {
                 // This is a nasty way to find if we are a replica, and it will only work on up-level servers, but...
+                // (note we only get here when HELLO isn't going to tell us: the HELLO reply carries "role", and
+                // unlike this probe it doesn't need a key - which matters when ACLs restrict key patterns; see #2968)
                 RedisKey key = Multiplexer.UniqueId;
                 // The actual value here doesn't matter (we detect the error code if it fails).
                 // The value here is to at least give some indication to anyone watching via "monitor",
@@ -456,9 +517,21 @@ namespace StackExchange.Redis
             }
             if (commandMap.IsAvailable(RedisCommand.CLUSTER))
             {
-                msg = Message.Create(-1, flags, RedisCommand.CLUSTER, RedisLiterals.NODES);
+                msg = RedisServer.GetClusterNodesMessage(flags);
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.ClusterNodes).ForAwait();
+
+                // CLUSTER SLOTS would go here - it is the view that conveys naming preference and node ids,
+                // and ClusterTopology/SetClusterSlots exist ready for it. Deliberately *not* invoked yet:
+                // this PR is scoped to work that cannot destabilise a connection, and asking every server for
+                // an extra command on every autoconfigure is a new failure surface on the connect path (an
+                // unexpected error reply to an internal call, a proxy that mangles the command) for no
+                // user-visible benefit until routing actually consumes it. Enabled in the follow-up, where
+                // ordering matters too: it must precede CLUSTER NODES so identities are known before NODES
+                // creates servers by address.
+                //// msg = Message.Create(-1, flags, RedisCommand.CLUSTER, RedisLiterals.SLOTS);
+                //// msg.SetInternalCall();
+                //// await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.ClusterSlots).ForAwait();
             }
             // If we are going to fetch a tie breaker, do so last and we'll get it in before the tracer fires completing the connection
             // But if GETs are disabled on this, do not fail the connection - we just don't get tiebreaker benefits
@@ -619,7 +692,7 @@ namespace StackExchange.Redis
         {
             // Until we've connected at least once, we're going to have a DidNotRespond unselectable reason present
             var bridge = unselectableReasons == 0 || (allowDisconnected && unselectableReasons == UnselectableFlags.DidNotRespond)
-                ? GetBridge(command, false)
+                ? GetBridge(command, true)
                 : null;
 
             return bridge != null && (allowDisconnected || bridge.IsConnected);
@@ -673,7 +746,7 @@ namespace StackExchange.Redis
 
                 var handshake = HandshakeAsync(connection, log);
 
-                if (handshake.Status != TaskStatus.RanToCompletion)
+                if (!handshake.IsCompletedSuccessfully)
                 {
                     return OnEstablishingAsyncAwaited(connection, handshake);
                 }
@@ -695,14 +768,21 @@ namespace StackExchange.Redis
                     // Clear the unselectable flag ASAP since we are open for business
                     ClearUnselectable(UnselectableFlags.DidNotRespond);
 
-                    if (bridge == subscription)
+                    // is *this specific* connection using RESP3? (without reference to config preferences)
+                    bool isResp3 = connection?.Protocol is >= RedisProtocol.Resp3;
+                    if (bridge == subscription || isResp3)
                     {
                         // Note: this MUST be fire and forget, because we might be in the middle of a Sync processing
                         // TracerProcessor which is executing this line inside a SetResultCore().
                         // Since we're issuing commands inside a SetResult path in a message, we'd create a deadlock by waiting.
                         Multiplexer.EnsureSubscriptions(CommandFlags.FireAndForget);
                     }
-                    if (IsConnected && (IsSubscriberConnected || !SupportsSubscriptions || KnowOrAssumeResp3()))
+                    else if (SupportsSubscriptions && Multiplexer.RawConfig.Protocol > RedisProtocol.Resp2)
+                    {
+                        // interactive, and we wanted RESP3+, but we didn't get it; spin up pub/sub
+                        Activate(ConnectionType.Subscription, null);
+                    }
+                    if (IsConnected && (IsSubscriberConnected || !SupportsSubscriptions || isResp3))
                     {
                         // Only connect on the second leg - we can accomplish this by checking both
                         // Or the first leg, if we're only making 1 connection because subscriptions aren't supported
@@ -719,7 +799,7 @@ namespace StackExchange.Redis
         }
 
         internal int LastInfoReplicationCheckSecondsAgo =>
-            unchecked(Environment.TickCount - Thread.VolatileRead(ref lastInfoReplicationCheckTicks)) / 1000;
+            unchecked(Environment.TickCount - Volatile.Read(ref lastInfoReplicationCheckTicks)) / 1000;
 
         private EndPoint? primaryEndPoint;
         public EndPoint? PrimaryEndPoint
@@ -920,6 +1000,8 @@ namespace StackExchange.Redis
                 {
                     return Awaited(result);
                 }
+                // Must consume the ValueTask even on success path
+                result.GetAwaiter().GetResult();
             }
             return default;
         }
@@ -933,6 +1015,19 @@ namespace StackExchange.Redis
             return bridge;
         }
 
+        /// <summary>
+        /// Issues <c>HELLO</c>, optionally carrying the credentials and client name.
+        /// </summary>
+        /// <remarks>The server can reject RESP3 either with an error (<c>HELLO</c> not understood, or an
+        /// unsupported protocol version) or by simply reporting RESP2, so we don't assign the protocol here:
+        /// that happens when the reply is processed (and as a last resort, when the tracer completes).</remarks>
+        private async Task WriteHelloAsync(PhysicalConnection connection, ILogger? log, int protocolVersion, string? user, string? password, string? clientName)
+        {
+            var hello = Message.CreateHello(protocolVersion, user, password, clientName, CommandFlags.FireAndForget | Message.NoFlushFlag);
+            hello.SetInternalCall();
+            await WriteDirectOrQueueFireAndForgetAsync(connection, hello, ResultProcessor.AutoConfigureProcessor.Create(log)).ForAwait();
+        }
+
         private async Task HandshakeAsync(PhysicalConnection connection, ILogger? log)
         {
             log?.LogInformationServerHandshake(new(this));
@@ -941,13 +1036,14 @@ namespace StackExchange.Redis
                 Multiplexer.Trace("No connection!?");
                 return;
             }
-            Message msg;
-            // Note that we need "" (not null) for password in the case of 'nopass' logins
-            var config = Multiplexer.RawConfig;
-            string? user = config.User;
-            string password = config.Password ?? "";
 
-            string clientName = Multiplexer.ClientName;
+            Message msg;
+            var config = Multiplexer.RawConfig;
+            var user = config.User;
+            // Note that we need "" (not null) for password in the case of 'nopass' logins
+            var password = config.Password ?? "";
+            var clientName = Multiplexer.ClientName;
+
             if (!string.IsNullOrWhiteSpace(clientName))
             {
                 clientName = nameSanitizer.Replace(clientName, "");
@@ -983,37 +1079,65 @@ namespace StackExchange.Redis
             // the various tasks and just `return connection.FlushAsync();` - however, since handshake is low
             // volume, we can afford to optimize for a good stack-trace rather than avoiding state machines.
             ResultProcessor<bool>? autoConfig = null;
-            if (Multiplexer.RawConfig.TryResp3()) // note this includes an availability check on HELLO
+            bool isInteractive = connection.BridgeCouldBeNull?.ConnectionType == ConnectionType.Interactive;
+            if (isInteractive)
+            {
+                // forget what the previous connection's HELLO told us; re-established below, if this one repeats it
+                // (the subscription handshake is deliberately left out of this: it doesn't do the discovery step)
+                RoleKnownFromHello = false;
+            }
+
+            // HELLO serves two purposes: negotiating RESP3, and reporting details we would otherwise need INFO or
+            // CONFIG for (see #2968) - so we issue it whenever the server should understand it, at 2 or 3.
+            bool helloAvailable = Multiplexer.RawConfig.TryHello(out int helloProtocol); // includes an availability check on HELLO
+            bool negotiateResp3 = helloAvailable && helloProtocol >= 3;
+
+            // HELLO can carry the credentials, but we only use that when we have no other way of authenticating,
+            // and *never* both HELLO AUTH and a standalone AUTH. This is defensive against a redis bug (7.4
+            // through at least 8.x; valkey is unaffected): inside a pipelined batch, a *failing* AUTH only gets
+            // a reply if it is the first command in that batch - otherwise the error is silently dropped, which
+            // desynchronizes every reply that follows it on the connection. When that happens during the
+            // handshake, the tracer never gets its answer and the connection never becomes usable: what should
+            // have been a clean authentication failure instead presents as a connection that times out
+            // everything. So AUTH goes first in the batch, and HELLO follows it (bare).
+            bool haveCredentials = !string.IsNullOrWhiteSpace(user) || !string.IsNullOrWhiteSpace(password);
+            bool canAuthDirectly = Multiplexer.CommandMap.IsAvailable(RedisCommand.AUTH);
+            bool helloCarriesCredentials = helloAvailable && haveCredentials && !canAuthDirectly;
+
+            // ...which also means HELLO doesn't have to come first: only the credential-carrying flavour does,
+            // as nothing else can authenticate the connection in that case
+            if (helloCarriesCredentials)
             {
                 log?.LogInformationAuthenticatingViaHello(new(this));
-                var hello = Message.CreateHello(3, user, password, clientName, CommandFlags.FireAndForget);
-                hello.SetInternalCall();
-                await WriteDirectOrQueueFireAndForgetAsync(connection, hello, autoConfig ??= ResultProcessor.AutoConfigureProcessor.Create(log)).ForAwait();
-
-                // note that the server can reject RESP3 via either an -ERR response (HELLO not understood), or by simply saying "nope",
-                // so we don't set the actual .Protocol until we process the result of the HELLO request
+                await WriteHelloAsync(connection, log, helloProtocol, user, password, clientName).ForAwait();
             }
-            else
+            else if (!negotiateResp3)
             {
-                // if we're not even issuing HELLO, we're RESP2
+                // whether or not we issue HELLO for discovery below, we're RESP2
                 connection.SetProtocol(RedisProtocol.Resp2);
             }
 
-            // note: we auth EVEN IF we have used HELLO to AUTH; because otherwise the fallback/detection path is pure hell,
-            // and: we're pipelined here, so... meh
-            if (!string.IsNullOrWhiteSpace(user) && Multiplexer.CommandMap.IsAvailable(RedisCommand.AUTH))
+            if (!string.IsNullOrWhiteSpace(user) && canAuthDirectly)
             {
                 log?.LogInformationAuthenticatingUserPassword(new(this));
-                msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.AUTH, (RedisValue)user, (RedisValue)password);
+                msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.AUTH, user.AsRedisValue(), password.AsRedisValue());
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.DemandOK).ForAwait();
             }
-            else if (!string.IsNullOrWhiteSpace(password) && Multiplexer.CommandMap.IsAvailable(RedisCommand.AUTH))
+            else if (!string.IsNullOrWhiteSpace(password) && canAuthDirectly)
             {
                 log?.LogInformationAuthenticatingPassword(new(this));
-                msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.AUTH, (RedisValue)password);
+                msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.AUTH, password.AsRedisValue());
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.DemandOK).ForAwait();
+            }
+
+            // a bare HELLO, now that the connection is authenticated; for RESP2 this is discovery only, so we
+            // limit it to the interactive connection (the subscription connection does no discovery)
+            bool bareHello = helloAvailable && !helloCarriesCredentials && (negotiateResp3 || isInteractive);
+            if (bareHello)
+            {
+                await WriteHelloAsync(connection, log, helloProtocol, user: null, password: null, clientName: null).ForAwait();
             }
 
             if (Multiplexer.CommandMap.IsAvailable(RedisCommand.CLIENT))
@@ -1021,7 +1145,7 @@ namespace StackExchange.Redis
                 if (!string.IsNullOrWhiteSpace(clientName))
                 {
                     log?.LogInformationSettingClientName(new(this), clientName);
-                    msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.CLIENT, RedisLiterals.SETNAME, (RedisValue)clientName);
+                    msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.CLIENT, RedisLiterals.SETNAME, clientName.AsRedisValue());
                     msg.SetInternalCall();
                     await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.DemandOK).ForAwait();
                 }
@@ -1035,7 +1159,7 @@ namespace StackExchange.Redis
                     var libName = Multiplexer.GetFullLibraryName();
                     if (!string.IsNullOrWhiteSpace(libName))
                     {
-                        msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.CLIENT, RedisLiterals.SETINFO, RedisLiterals.lib_name, libName);
+                        msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.CLIENT, RedisLiterals.SETINFO, RedisLiterals.lib_name, libName.AsRedisValue());
                         msg.SetInternalCall();
                         await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.DemandOK).ForAwait();
                     }
@@ -1043,13 +1167,13 @@ namespace StackExchange.Redis
                     var version = ClientInfoSanitize(Utils.GetLibVersion());
                     if (!string.IsNullOrWhiteSpace(version))
                     {
-                        msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.CLIENT, RedisLiterals.SETINFO, RedisLiterals.lib_ver, version);
+                        msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.CLIENT, RedisLiterals.SETINFO, RedisLiterals.lib_ver, version.AsRedisValue());
                         msg.SetInternalCall();
                         await WriteDirectOrQueueFireAndForgetAsync(connection, msg, ResultProcessor.DemandOK).ForAwait();
                     }
                 }
 
-                msg = Message.Create(-1, CommandFlags.FireAndForget, RedisCommand.CLIENT, RedisLiterals.ID);
+                msg = Message.Create(-1, CommandFlags.FireAndForget | Message.NoFlushFlag, RedisCommand.CLIENT, RedisLiterals.ID);
                 msg.SetInternalCall();
                 await WriteDirectOrQueueFireAndForgetAsync(connection, msg, autoConfig ??= ResultProcessor.AutoConfigureProcessor.Create(log)).ForAwait();
             }
@@ -1063,12 +1187,15 @@ namespace StackExchange.Redis
             var connType = bridge.ConnectionType;
             if (connType == ConnectionType.Interactive)
             {
-                await AutoConfigureAsync(connection, log).ForAwait();
+                await AutoConfigureAsync(connection, log, extraFlags: Message.NoFlushFlag, helloPending: helloAvailable).ForAwait();
             }
 
+            // note that the final messages *are* flushed (no Message.NoFlushFlag)
             var tracer = GetTracerMessage(true);
+            tracer.SetHandshakeCompletion();
             tracer = LoggingMessage.Create(log, tracer);
             log?.LogInformationSendingCriticalTracer(new(this), tracer.CommandAndKey);
+            Debug.Assert(tracer.IsHandshakeCompletion, "Tracer message should identify as handshake completion");
             await WriteDirectOrQueueFireAndForgetAsync(connection, tracer, ResultProcessor.EstablishConnection).ForAwait();
 
             // Note: this **must** be the last thing on the subscription handshake, because after this
@@ -1084,7 +1211,7 @@ namespace StackExchange.Redis
                 }
             }
             log?.LogInformationFlushingOutboundBuffer(new(this));
-            await connection.FlushAsync().ForAwait();
+            connection.Flush();
         }
 
         private void SetConfig<T>(ref T field, T value, [CallerMemberName] string? caller = null)
@@ -1107,6 +1234,8 @@ namespace StackExchange.Redis
             supportsPrimaryWrites = null;
         }
 
+        internal bool CanSimulateConnectionFailure => interactive?.CanSimulateConnectionFailure == true;
+
         /// <summary>
         /// For testing only.
         /// </summary>
@@ -1121,6 +1250,36 @@ namespace StackExchange.Redis
             // check whichever bridges exist
             if (interactive?.HasPendingCallerFacingItems() == true) return true;
             return subscription?.HasPendingCallerFacingItems() ?? false;
+        }
+
+        public void SetLatency(DateTime startTime)
+        {
+            try
+            {
+                LatencyTicks = ConnectionGroupMember.ToLatencyTicks(DateTime.UtcNow - startTime);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine(ex.Message);
+            }
+        }
+
+        internal uint LatencyTicks { get; private set; } = uint.MaxValue;
+
+        private ProductVariant _productVariant = ProductVariant.Redis;
+        private string _productVersion = "";
+
+        internal void SetProductVariant(ProductVariant variant, string productVersion)
+        {
+            _productVariant = variant;
+            _productVersion = productVersion;
+            ClearMemoized(); // variant impacts multi-DB rules for cluster
+        }
+
+        internal ProductVariant GetProductVariant(out string productVersion)
+        {
+            productVersion = _productVersion;
+            return _productVariant;
         }
     }
 }

@@ -45,8 +45,13 @@ namespace StackExchange.Redis
                                          v7_2_0_rc1 = new Version(7, 1, 240), // 7.2 RC1 is version 7.1.240
                                          v7_4_0_rc1 = new Version(7, 3, 240), // 7.4 RC1 is version 7.3.240
                                          v7_4_0_rc2 = new Version(7, 3, 241), // 7.4 RC2 is version 7.3.241
+                                         v7_4_0 = new Version(7, 4, 0),
                                          v8_0_0_M04 = new Version(7, 9, 227), // 8.0 M04 is version 7.9.227
-                                         v8_2_0_rc1 = new Version(8, 1, 240); // 8.2 RC1 is version 8.1.240
+                                         v8_2_0_rc1 = new Version(8, 1, 240), // 8.2 RC1 is version 8.1.240
+                                         v8_4_0_rc1 = new Version(8, 3, 224), // 8.4 RC1 is version 8.3.224
+                                         v8_6_0 = new Version(8, 6, 0),
+                                         v8_8_0 = new Version(8, 7, 225), // 8.8 is version 8.7.225
+                                         v8_10_0 = new Version(8, 9, 241); // 8.10 preview is version 8.9.241
 
 #pragma warning restore SA1310 // Field names should not contain underscore
 #pragma warning restore SA1311 // Static readonly fields should begin with upper-case letter
@@ -240,7 +245,7 @@ namespace StackExchange.Redis
         public bool ScriptingDatabaseSafe => Version.IsAtLeast(v2_8_12);
 
         /// <inheritdoc cref="HyperLogLogCountReplicaSafe"/>
-        [Obsolete("Starting with Redis version 5, Redis has moved to 'replica' terminology. Please use " + nameof(HyperLogLogCountReplicaSafe) + " instead, this will be removed in 3.0.")]
+        [Obsolete("Starting with Redis version 5, Redis has moved to 'replica' terminology. Please use " + nameof(HyperLogLogCountReplicaSafe) + " instead, this will be removed in 3.2.", error: true)]
         [Browsable(false), EditorBrowsable(EditorBrowsableState.Never)]
         public bool HyperLogLogCountSlaveSafe => HyperLogLogCountReplicaSafe;
 
@@ -283,6 +288,28 @@ namespace StackExchange.Redis
         /// Is the RESP3 protocol available?
         /// </summary>
         public bool Resp3 => Version.IsAtLeast(v6_0_0);
+
+        /// <summary>
+        /// Is the <see href="https://redis.io/commands/hello/">HELLO</see> handshake available?
+        /// </summary>
+        /// <remarks>This is useful even when staying on RESP2; <c>HELLO 2</c> reports the server
+        /// version, role, mode and connection identifier without needing <c>INFO</c> or <c>CONFIG</c>.</remarks>
+        public bool Hello => Version.IsAtLeast(v6_0_0);
+
+        /// <summary>
+        /// Are the <c>IF*</c> modifiers on <see href="https://redis.io/commands/set/">SET</see> available?
+        /// </summary>
+        public bool SetWithValueCheck => Version.IsAtLeast(v8_4_0_rc1);
+
+        /// <summary>
+        /// Are the <c>IF*</c> modifiers on <see href="https://redis.io/commands/del/">DEL</see> available?
+        /// </summary>
+        public bool DeleteWithValueCheck => Version.IsAtLeast(v8_4_0_rc1);
+
+        /// <summary>
+        /// Is session-based bulk hash import (<c>HIMPORT</c>) available?
+        /// </summary>
+        public bool HashImport => Version.IsAtLeast(v8_10_0);
 
 #pragma warning restore 1629 // Documentation text should end with a period.
 

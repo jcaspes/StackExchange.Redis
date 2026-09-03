@@ -1,8 +1,10 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Threading.Tasks;
+using RESPite;
 
 // ReSharper disable once CheckNamespace
 namespace StackExchange.Redis
@@ -12,6 +14,19 @@ namespace StackExchange.Redis
     /// </summary>
     public partial interface IDatabaseAsync : IRedisAsync
     {
+        /// <inheritdoc cref="IDatabase.Database" />
+        int Database { get; }
+
+        /// <summary>
+        /// Creates a transaction exposing only asynchronous completion; see <see cref="ITransactionAsync"/>.
+        /// </summary>
+        /// <param name="asyncState">The async state to set on the created transaction.</param>
+        /// <remarks>Unlike <see cref="IDatabase.CreateTransaction(object?)"/>, this offers no synchronous
+        /// execution, so it is usable from async-only databases such as one created via
+        /// <see cref="Availability.DatabaseExtensions.WithRetry"/>.</remarks>
+        [Experimental(Experiments.GeoRedundantFailover, UrlFormat = Experiments.UrlFormat)]
+        ITransactionAsync CreateTransaction(object? asyncState = null);
+
         /// <summary>
         /// Indicates whether the instance can communicate with the server (resolved using the supplied key and optional flags).
         /// </summary>
@@ -178,6 +193,10 @@ namespace StackExchange.Redis
         /// <inheritdoc cref="IDatabase.HashScanNoValues(RedisKey, RedisValue, int, long, int, CommandFlags)"/>
         IAsyncEnumerable<RedisValue> HashScanNoValuesAsync(RedisKey key, RedisValue pattern = default, int pageSize = RedisBase.CursorUtils.DefaultLibraryPageSize, long cursor = RedisBase.CursorUtils.Origin, int pageOffset = 0, CommandFlags flags = CommandFlags.None);
 
+        /// <inheritdoc cref="IDatabase.HashImport(RedisKey, HashImport, ReadOnlyMemory{RedisValue}, CommandFlags)"/>
+        [Experimental(Experiments.Server_8_10, UrlFormat = Experiments.UrlFormat)]
+        Task HashImportAsync(RedisKey key, HashImport fieldSet, ReadOnlyMemory<RedisValue> values, CommandFlags flags = CommandFlags.None);
+
         /// <inheritdoc cref="IDatabase.HashSet(RedisKey, HashEntry[], CommandFlags)"/>
         Task HashSetAsync(RedisKey key, HashEntry[] hashFields, CommandFlags flags = CommandFlags.None);
 
@@ -324,6 +343,11 @@ namespace StackExchange.Redis
         /// <inheritdoc cref="IDatabase.ListMove(RedisKey, RedisKey, ListSide, ListSide, CommandFlags)"/>
         Task<RedisValue> ListMoveAsync(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, CommandFlags flags = CommandFlags.None);
 
+        /// <inheritdoc cref="IDatabase.ListMove(RedisKey, RedisKey, ListSide, ListSide, long, ListMoveCount, ListMoveOrder, CommandFlags)"/>
+#pragma warning disable RS0026 // competing overloads - disambiguated by the required count parameter
+        Task<RedisValue[]?> ListMoveAsync(RedisKey sourceKey, RedisKey destinationKey, ListSide sourceSide, ListSide destinationSide, long count, ListMoveCount mode = ListMoveCount.UpTo, ListMoveOrder order = ListMoveOrder.Bulk, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0026
+
         /// <inheritdoc cref="IDatabase.ListRange(RedisKey, long, long, CommandFlags)"/>
         Task<RedisValue[]> ListRangeAsync(RedisKey key, long start = 0, long stop = -1, CommandFlags flags = CommandFlags.None);
 
@@ -424,6 +448,9 @@ namespace StackExchange.Redis
         /// <inheritdoc cref="IDatabase.SetIntersectionLength(RedisKey[], long, CommandFlags)"/>
         Task<long> SetIntersectionLengthAsync(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None);
 
+        /// <inheritdoc cref="IDatabase.SetCombineLength(SetOperation, RedisKey[], long, bool, CommandFlags)"/>
+        Task<long> SetCombineLengthAsync(SetOperation operation, RedisKey[] keys, long limit = 0, bool approximate = false, CommandFlags flags = CommandFlags.None);
+
         /// <inheritdoc cref="IDatabase.SetLength(RedisKey, CommandFlags)"/>
         Task<long> SetLengthAsync(RedisKey key, CommandFlags flags = CommandFlags.None);
 
@@ -498,7 +525,12 @@ namespace StackExchange.Redis
         Task<double> SortedSetDecrementAsync(RedisKey key, RedisValue member, double value, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.SortedSetIncrement(RedisKey, RedisValue, double, CommandFlags)"/>
+#pragma warning disable RS0027 // conditional overload needs an additional required ValueCondition parameter
         Task<double> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0027
+
+        /// <inheritdoc cref="IDatabase.SortedSetIncrement(RedisKey, RedisValue, double, ValueCondition, CommandFlags)"/>
+        Task<double?> SortedSetIncrementAsync(RedisKey key, RedisValue member, double value, ValueCondition when, CommandFlags flags);
 
         /// <inheritdoc cref="IDatabase.SortedSetIntersectionLength(RedisKey[], long, CommandFlags)"/>
         Task<long> SortedSetIntersectionLengthAsync(RedisKey[] keys, long limit = 0, CommandFlags flags = CommandFlags.None);
@@ -642,6 +674,12 @@ namespace StackExchange.Redis
         Task<StreamTrimResult[]> StreamAcknowledgeAndDeleteAsync(RedisKey key, RedisValue groupName, StreamTrimMode mode, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None);
 #pragma warning restore RS0026
 
+        /// <inheritdoc cref="IDatabase.StreamNegativeAcknowledge(RedisKey, RedisValue, StreamNackMode, RedisValue, CommandFlags)"/>
+        Task<long> StreamNegativeAcknowledgeAsync(RedisKey key, RedisValue groupName, StreamNackMode mode, RedisValue messageId, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StreamNegativeAcknowledge(RedisKey, RedisValue, StreamNackMode, RedisValue[], CommandFlags)"/>
+        Task<long> StreamNegativeAcknowledgeAsync(RedisKey key, RedisValue groupName, StreamNackMode mode, RedisValue[] messageIds, CommandFlags flags = CommandFlags.None);
+
         /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, RedisValue, RedisValue, RedisValue?, int?, bool, CommandFlags)"/>
         Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, RedisValue? messageId, int? maxLength, bool useApproximateMaxLength, CommandFlags flags);
 
@@ -654,7 +692,24 @@ namespace StackExchange.Redis
 
         /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, NameValueEntry[], RedisValue?, long?, bool, long?, StreamTrimMode, CommandFlags)"/>
         Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, RedisValue? messageId = null, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode trimMode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, RedisValue, RedisValue, StreamIdempotentId, long?, bool, long?, StreamTrimMode, CommandFlags)"/>
+        Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode trimMode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, NameValueEntry[], StreamIdempotentId, long?, bool, long?, StreamTrimMode, CommandFlags)"/>
+        Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, StreamIdempotentId idempotentId, long? maxLength = null, bool useApproximateMaxLength = false, long? limit = null, StreamTrimMode trimMode = StreamTrimMode.KeepReferences, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, RedisValue, RedisValue, StreamAddOptions, CommandFlags)"/>
+#pragma warning disable RS0027 // additive overload: `options` is required, so existing calls still bind to the overloads above
+        Task<RedisValue> StreamAddAsync(RedisKey key, RedisValue streamField, RedisValue streamValue, StreamAddOptions options, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StreamAdd(RedisKey, NameValueEntry[], StreamAddOptions, CommandFlags)"/>
+        Task<RedisValue> StreamAddAsync(RedisKey key, NameValueEntry[] streamPairs, StreamAddOptions options, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0027
 #pragma warning restore RS0026
+
+        /// <inheritdoc cref="IDatabase.StreamConfigure(RedisKey, StreamConfiguration, CommandFlags)"/>
+        Task StreamConfigureAsync(RedisKey key, StreamConfiguration configuration, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.StreamAutoClaim(RedisKey, RedisValue, RedisValue, long, RedisValue, int?, CommandFlags)"/>
         Task<StreamAutoClaimResult> StreamAutoClaimAsync(RedisKey key, RedisValue consumerGroup, RedisValue claimingConsumer, long minIdleTimeInMs, RedisValue startAtId, int? count = null, CommandFlags flags = CommandFlags.None);
@@ -719,19 +774,35 @@ namespace StackExchange.Redis
         Task<StreamEntry[]> StreamReadAsync(RedisKey key, RedisValue position, int? count = null, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.StreamRead(StreamPosition[], int?, CommandFlags)"/>
-        Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, CommandFlags flags = CommandFlags.None);
+        Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream, CommandFlags flags);
+
+        /// <inheritdoc cref="IDatabase.StreamRead(StreamPosition[], int?, int?, int?, CommandFlags)"/>
+#pragma warning disable RS0026 // additive overload: the existing overload's parameters are required, so shorter calls bind here
+        Task<RedisStream[]> StreamReadAsync(StreamPosition[] streamPositions, int? countPerStream = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0026
 
         /// <inheritdoc cref="IDatabase.StreamReadGroup(RedisKey, RedisValue, RedisValue, RedisValue?, int?, CommandFlags)"/>
         Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position, int? count, CommandFlags flags);
 
         /// <inheritdoc cref="IDatabase.StreamReadGroup(RedisKey, RedisValue, RedisValue, RedisValue?, int?, bool, CommandFlags)"/>
-        Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, CommandFlags flags = CommandFlags.None);
+        Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position, int? count, bool noAck, CommandFlags flags);
+
+        /// <inheritdoc cref="IDatabase.StreamReadGroup(RedisKey, RedisValue, RedisValue, RedisValue?, int?, bool, TimeSpan?, CommandFlags)"/>
+        Task<StreamEntry[]> StreamReadGroupAsync(RedisKey key, RedisValue groupName, RedisValue consumerName, RedisValue? position = null, int? count = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.StreamReadGroup(StreamPosition[], RedisValue, RedisValue, int?, CommandFlags)"/>
         Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, CommandFlags flags);
 
         /// <inheritdoc cref="IDatabase.StreamReadGroup(StreamPosition[], RedisValue, RedisValue, int?, bool, CommandFlags)"/>
-        Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, CommandFlags flags = CommandFlags.None);
+        Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, CommandFlags flags);
+
+        /// <inheritdoc cref="IDatabase.StreamReadGroup(StreamPosition[], RedisValue, RedisValue, int?, bool, TimeSpan?, CommandFlags)"/>
+        Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream, bool noAck, TimeSpan? claimMinIdleTime, CommandFlags flags);
+
+        /// <inheritdoc cref="IDatabase.StreamReadGroup(StreamPosition[], RedisValue, RedisValue, int?, bool, TimeSpan?, int?, int?, CommandFlags)"/>
+#pragma warning disable RS0026 // additive overload: the existing overload's parameters are required, so shorter calls bind there
+        Task<RedisStream[]> StreamReadGroupAsync(StreamPosition[] streamPositions, RedisValue groupName, RedisValue consumerName, int? countPerStream = null, bool noAck = false, TimeSpan? claimMinIdleTime = null, int? maxCount = null, int? maxSize = null, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0026
 
         /// <inheritdoc cref="IDatabase.StreamTrim(RedisKey, int, bool, CommandFlags)"/>
         Task<long> StreamTrimAsync(RedisKey key, int maxLength, bool useApproximateMaxLength, CommandFlags flags);
@@ -768,8 +839,14 @@ namespace StackExchange.Redis
         /// <inheritdoc cref="IDatabase.StringDecrement(RedisKey, long, CommandFlags)"/>
         Task<long> StringDecrementAsync(RedisKey key, long value = 1, CommandFlags flags = CommandFlags.None);
 
+        /// <inheritdoc cref="IDatabase.StringDelete(RedisKey, ValueCondition, CommandFlags)"/>
+        Task<bool> StringDeleteAsync(RedisKey key, ValueCondition when, CommandFlags flags = CommandFlags.None);
+
         /// <inheritdoc cref="IDatabase.StringDecrement(RedisKey, double, CommandFlags)"/>
         Task<double> StringDecrementAsync(RedisKey key, double value, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StringDigest(RedisKey, CommandFlags)"/>
+        Task<ValueCondition?> StringDigestAsync(RedisKey key, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.StringGet(RedisKey, CommandFlags)"/>
         Task<RedisValue> StringGetAsync(RedisKey key, CommandFlags flags = CommandFlags.None);
@@ -807,6 +884,14 @@ namespace StackExchange.Redis
         /// <inheritdoc cref="IDatabase.StringIncrement(RedisKey, double, CommandFlags)"/>
         Task<double> StringIncrementAsync(RedisKey key, double value, CommandFlags flags = CommandFlags.None);
 
+        /// <inheritdoc cref="IDatabase.StringIncrement(RedisKey, long, Expiration, long?, long?, IncrementOptions, CommandFlags)"/>
+#pragma warning disable RS0026 // Public API with optional parameter(s) should have the most parameters amongst its public overloads
+        Task<StringIncrementResult<long>> StringIncrementAsync(RedisKey key, long value, Expiration expiry, long? lowerBound = null, long? upperBound = null, IncrementOptions options = IncrementOptions.None, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StringIncrement(RedisKey, double, Expiration, double?, double?, IncrementOptions, CommandFlags)"/>
+        Task<StringIncrementResult<double>> StringIncrementAsync(RedisKey key, double value, Expiration expiry, double? lowerBound = null, double? upperBound = null, IncrementOptions options = IncrementOptions.None, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0026
+
         /// <inheritdoc cref="IDatabase.StringLength(RedisKey, CommandFlags)"/>
         Task<long> StringLengthAsync(RedisKey key, CommandFlags flags = CommandFlags.None);
 
@@ -828,10 +913,18 @@ namespace StackExchange.Redis
         Task<bool> StringSetAsync(RedisKey key, RedisValue value, TimeSpan? expiry, When when, CommandFlags flags);
 
         /// <inheritdoc cref="IDatabase.StringSet(RedisKey, RedisValue, TimeSpan?, bool, When, CommandFlags)"/>
-        Task<bool> StringSetAsync(RedisKey key, RedisValue value, TimeSpan? expiry = null, bool keepTtl = false, When when = When.Always, CommandFlags flags = CommandFlags.None);
+        Task<bool> StringSetAsync(RedisKey key, RedisValue value, TimeSpan? expiry, bool keepTtl, When when = When.Always, CommandFlags flags = CommandFlags.None);
+
+        /// <inheritdoc cref="IDatabase.StringSet(RedisKey, RedisValue, Expiration, ValueCondition, CommandFlags)"/>
+#pragma warning disable RS0027 // Public API with optional parameter(s) should have the most parameters amongst its public overloads
+        Task<bool> StringSetAsync(RedisKey key, RedisValue value, Expiration expiry = default, ValueCondition when = default, CommandFlags flags = CommandFlags.None);
+#pragma warning restore RS0027
 
         /// <inheritdoc cref="IDatabase.StringSet(KeyValuePair{RedisKey, RedisValue}[], When, CommandFlags)"/>
-        Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, CommandFlags flags = CommandFlags.None);
+        Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when, CommandFlags flags);
+
+        /// <inheritdoc cref="IDatabase.StringSet(KeyValuePair{RedisKey, RedisValue}[], When, Expiration, CommandFlags)"/>
+        Task<bool> StringSetAsync(KeyValuePair<RedisKey, RedisValue>[] values, When when = When.Always, Expiration expiry = default, CommandFlags flags = CommandFlags.None);
 
         /// <inheritdoc cref="IDatabase.StringSetAndGet(RedisKey, RedisValue, TimeSpan?, When, CommandFlags)"/>
         Task<RedisValue> StringSetAndGetAsync(RedisKey key, RedisValue value, TimeSpan? expiry, When when, CommandFlags flags);

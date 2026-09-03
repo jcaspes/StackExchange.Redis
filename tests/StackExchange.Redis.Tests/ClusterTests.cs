@@ -13,7 +13,17 @@ namespace StackExchange.Redis.Tests;
 [RunPerProtocol]
 public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixture) : TestBase(output, fixture)
 {
-    protected override string GetConfiguration() => TestConfig.Current.ClusterServersAndPorts + ",connectTimeout=10000";
+    private const int NoRedirectRoutingProbeCount = 10;
+
+    public enum StreamConsumerGroupRoutingOperation
+    {
+        SetPosition,
+        ConsumerInfo,
+        DeleteConsumer,
+        DeleteConsumerGroup,
+    }
+
+    protected override string GetConfiguration() => GetClusterConfiguration();
 
     [Fact]
     public async Task ExportConfiguration()
@@ -136,8 +146,9 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
     [Fact]
     public async Task IntentionalWrongServer()
     {
+        SkipOnWindowsRelease();
         static string? StringGet(IServer server, RedisKey key, CommandFlags flags = CommandFlags.None)
-            => (string?)server.Execute("GET", [key], flags);
+            => (string?)server.Execute(0, "GET", [key], flags);
 
         await using var conn = Create();
 
@@ -190,6 +201,155 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
 
             var ex = Assert.Throws<RedisServerException>(() => StringGet(conn.GetServer(node.EndPoint), key, CommandFlags.NoRedirect));
             Assert.StartsWith($"Key has MOVED to Endpoint {rightPrimaryNode.EndPoint} and hashslot {slot}", ex.Message);
+        }
+    }
+
+    [Fact]
+    public async Task ClusterNoRedirectRoutesStreamCreateConsumerGroupByKey()
+    {
+        await using var conn = Create(require: RedisFeatures.v7_0_0_rc1);
+
+        var db = conn.GetDatabase();
+        for (var i = 0; i < NoRedirectRoutingProbeCount; i++)
+        {
+            var tag = Guid.NewGuid().ToString("N");
+            RedisKey key = $"{{{tag}}}:stream:create-group";
+            RedisValue group = $"group-{i}";
+            Log("Probe {0}: key={1}, slot={2}", i, key, conn.HashSlot(key));
+
+            await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+
+            Assert.True(await db.StreamCreateConsumerGroupAsync(
+                key,
+                group,
+                StreamPosition.NewMessages,
+                createStream: true,
+                flags: CommandFlags.NoRedirect));
+        }
+    }
+
+    [Theory]
+    [InlineData(StreamConsumerGroupRoutingOperation.SetPosition)]
+    [InlineData(StreamConsumerGroupRoutingOperation.ConsumerInfo)]
+    [InlineData(StreamConsumerGroupRoutingOperation.DeleteConsumer)]
+    [InlineData(StreamConsumerGroupRoutingOperation.DeleteConsumerGroup)]
+    public async Task ClusterNoRedirectRoutesStreamConsumerGroupMetadataByKey(StreamConsumerGroupRoutingOperation operation)
+    {
+        await using var conn = Create(require: RedisFeatures.v7_0_0_rc1);
+
+        var db = conn.GetDatabase();
+        for (var i = 0; i < NoRedirectRoutingProbeCount; i++)
+        {
+            var tag = Guid.NewGuid().ToString("N");
+            RedisKey key = $"{{{tag}}}:stream:consumer-group-metadata";
+            RedisValue group = $"group-{i}";
+            RedisValue consumer = $"consumer-{i}";
+            Log("Probe {0}: key={1}, slot={2}", i, key, conn.HashSlot(key));
+
+            await db.KeyDeleteAsync(key, CommandFlags.FireAndForget);
+            await db.StreamAddAsync(key, "field", "value", flags: CommandFlags.FireAndForget);
+            await db.StreamCreateConsumerGroupAsync(key, group, StreamPosition.Beginning, flags: CommandFlags.FireAndForget);
+            await db.StreamReadGroupAsync(key, group, consumer, StreamPosition.NewMessages, flags: CommandFlags.FireAndForget);
+
+            switch (operation)
+            {
+                case StreamConsumerGroupRoutingOperation.SetPosition:
+                    Assert.True(await db.StreamConsumerGroupSetPositionAsync(key, group, StreamPosition.Beginning, CommandFlags.NoRedirect));
+                    break;
+                case StreamConsumerGroupRoutingOperation.ConsumerInfo:
+                    var consumers = await db.StreamConsumerInfoAsync(key, group, CommandFlags.NoRedirect);
+                    Assert.Contains(consumers, consumerInfo => consumerInfo.Name == consumer);
+                    break;
+                case StreamConsumerGroupRoutingOperation.DeleteConsumer:
+                    Assert.Equal(1, await db.StreamDeleteConsumerAsync(key, group, consumer, CommandFlags.NoRedirect));
+                    break;
+                case StreamConsumerGroupRoutingOperation.DeleteConsumerGroup:
+                    Assert.True(await db.StreamDeleteConsumerGroupAsync(key, group, CommandFlags.NoRedirect));
+                    break;
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ClusterNoRedirectRoutesSetIntersectionLengthByKeys()
+    {
+        await using var conn = Create(require: RedisFeatures.v7_0_0_rc1);
+
+        var db = conn.GetDatabase();
+        for (var i = 0; i < NoRedirectRoutingProbeCount; i++)
+        {
+            var tag = Guid.NewGuid().ToString("N");
+            RedisKey key1 = $"{{{tag}}}:set:1";
+            RedisKey key2 = $"{{{tag}}}:set:2";
+            Log("Probe {0}: key={1}, slot={2}", i, key1, conn.HashSlot(key1));
+            Assert.Equal(conn.HashSlot(key1), conn.HashSlot(key2));
+
+            await db.KeyDeleteAsync([key1, key2], CommandFlags.FireAndForget);
+            await db.SetAddAsync(key1, ["shared", "key1-only"], CommandFlags.FireAndForget);
+            await db.SetAddAsync(key2, ["shared", "key2-only"], CommandFlags.FireAndForget);
+
+            Assert.Equal(1, await db.SetIntersectionLengthAsync([key1, key2], flags: CommandFlags.NoRedirect));
+        }
+    }
+
+    [Theory]
+    [InlineData(SetOperation.Difference)]
+    [InlineData(SetOperation.Intersect)]
+    [InlineData(SetOperation.Union)]
+    public async Task ClusterNoRedirectRoutesSortedSetCombineByKeys(SetOperation operation)
+    {
+        await using var conn = Create(require: RedisFeatures.v7_0_0_rc1);
+
+        var db = conn.GetDatabase();
+        for (var i = 0; i < NoRedirectRoutingProbeCount; i++)
+        {
+            var tag = Guid.NewGuid().ToString("N");
+            RedisKey key1 = $"{{{tag}}}:zset:1";
+            RedisKey key2 = $"{{{tag}}}:zset:2";
+            Log("Probe {0}: key={1}, slot={2}", i, key1, conn.HashSlot(key1));
+            Assert.Equal(conn.HashSlot(key1), conn.HashSlot(key2));
+
+            await db.KeyDeleteAsync([key1, key2], CommandFlags.FireAndForget);
+            await db.SortedSetAddAsync(key1, [new("shared", 1), new("key1-only", 2)], CommandFlags.FireAndForget);
+            await db.SortedSetAddAsync(key2, [new("shared", 1), new("key2-only", 3)], CommandFlags.FireAndForget);
+
+            var result = await db.SortedSetCombineAsync(operation, [key1, key2], flags: CommandFlags.NoRedirect);
+            switch (operation)
+            {
+                case SetOperation.Difference:
+                    Assert.Equal(["key1-only"], result);
+                    break;
+                case SetOperation.Intersect:
+                    Assert.Equal(["shared"], result);
+                    break;
+                case SetOperation.Union:
+                    Assert.Equal(3, result.Length);
+                    Assert.Contains((RedisValue)"shared", result);
+                    Assert.Contains((RedisValue)"key1-only", result);
+                    Assert.Contains((RedisValue)"key2-only", result);
+                    break;
+            }
+        }
+    }
+
+    [Fact]
+    public async Task ClusterNoRedirectRoutesSortedSetIntersectionLengthByKeys()
+    {
+        await using var conn = Create(require: RedisFeatures.v7_0_0_rc1);
+
+        var db = conn.GetDatabase();
+        for (var i = 0; i < NoRedirectRoutingProbeCount; i++)
+        {
+            var tag = Guid.NewGuid().ToString("N");
+            RedisKey key1 = $"{{{tag}}}:zset:1";
+            RedisKey key2 = $"{{{tag}}}:zset:2";
+            Log("Probe {0}: key={1}, slot={2}", i, key1, conn.HashSlot(key1));
+            Assert.Equal(conn.HashSlot(key1), conn.HashSlot(key2));
+
+            await db.KeyDeleteAsync([key1, key2], CommandFlags.FireAndForget);
+            await db.SortedSetAddAsync(key1, [new("shared", 1), new("key1-only", 2)], CommandFlags.FireAndForget);
+            await db.SortedSetAddAsync(key2, [new("shared", 1), new("key2-only", 3)], CommandFlags.FireAndForget);
+            Assert.Equal(1, await db.SortedSetIntersectionLengthAsync([key1, key2], flags: CommandFlags.NoRedirect));
         }
     }
 
@@ -351,8 +511,10 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
         Assert.False(setY.IsCanceled, "set y cancelled");
         var existsX = cluster.KeyExistsAsync(x);
         var existsY = cluster.KeyExistsAsync(y);
+        #pragma warning disable SER308 // deliberate: test code blocking on a task, and the Wait helpers apply the configured timeout that a bare await would not
         Assert.True(cluster.Wait(existsX), "x exists");
         Assert.True(cluster.Wait(existsY), "y exists");
+        #pragma warning restore SER308
     }
 
     [Theory]
@@ -362,6 +524,8 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
     [InlineData("abc", 100)]
     public async Task Keys(string? pattern, int pageSize)
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true);
 
         var dbId = TestConfig.GetDedicatedDB(conn);
@@ -416,7 +580,7 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
     {
         await using var conn = Create();
 
-        RedisKey key = "a";
+        RedisKey key = Me();
         var db = conn.GetDatabase();
         db.KeyDelete(key, CommandFlags.FireAndForget);
 
@@ -462,6 +626,8 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
     [Fact(Skip = "FlushAllDatabases")]
     public async Task AccessRandomKeys()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true);
 
         var cluster = conn.GetDatabase();
@@ -503,7 +669,9 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
             actual[index] = cluster.StringGetAsync(pair.Key);
             index++;
         }
+        #pragma warning disable SER308 // deliberate: test code blocking on a task, and the Wait helpers apply the configured timeout that a bare await would not
         cluster.WaitAll(actual);
+        #pragma warning restore SER308
         for (int i = 0; i < COUNT; i++)
         {
             Assert.Equal(expected[i], actual[i].Result);
@@ -525,9 +693,9 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
             var counters = server.GetCounters();
             Log(counters.ToString());
         }
-        int final = Interlocked.CompareExchange(ref total, 0, 0);
+        int final = Volatile.Read(ref total);
         Assert.Equal(COUNT, final);
-        Assert.Equal(0, Interlocked.CompareExchange(ref slotMovedCount, 0, 0));
+        Assert.Equal(0, Volatile.Read(ref slotMovedCount));
     }
 
     [Theory]
@@ -669,14 +837,14 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
         Assert.NotNull(rightPrimaryNode);
 
         Assert.NotNull(rightPrimaryNode.EndPoint);
-        string? a = (string?)conn.GetServer(rightPrimaryNode.EndPoint).Execute("GET", key);
+        string? a = (string?)conn.GetServer(rightPrimaryNode.EndPoint).Execute(0, "GET", [key]);
         Assert.Equal(Value, a); // right primary
 
         var wrongPrimaryNode = config.Nodes.FirstOrDefault(x => !x.IsReplica && x.NodeId != rightPrimaryNode.NodeId);
         Assert.NotNull(wrongPrimaryNode);
 
         Assert.NotNull(wrongPrimaryNode.EndPoint);
-        string? b = (string?)conn.GetServer(wrongPrimaryNode.EndPoint).Execute("GET", key);
+        string? b = (string?)conn.GetServer(wrongPrimaryNode.EndPoint).Execute(0, "GET", [key]);
         Assert.Equal(Value, b); // wrong primary, allow redirect
 
         var msgs = profiler.GetSession().FinishProfiling().ToList();
@@ -743,18 +911,51 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
     }
 
     [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public async Task ClusterPubSub(bool sharded)
+    [InlineData(true, false, false)]
+    [InlineData(true, true, false)]
+    [InlineData(false, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, false, true)]
+    [InlineData(true, true, true)]
+    [InlineData(false, false, true)]
+    [InlineData(false, true, true)]
+    public async Task ClusterPubSub(bool sharded, bool withKeyRouting, bool withKeyPrefix)
     {
         var guid = Guid.NewGuid().ToString();
         var channel = sharded ? RedisChannel.Sharded(guid) : RedisChannel.Literal(guid);
-        await using var conn = Create(keepAlive: 1, connectTimeout: 3000, shared: false, require: sharded ? RedisFeatures.v7_0_0_rc1 : RedisFeatures.v2_0_0);
+        if (withKeyRouting)
+        {
+            channel = channel.WithKeyRouting();
+        }
+        await using var conn = Create(
+            keepAlive: 1,
+            connectTimeout: 3000,
+            shared: false,
+            require: sharded ? RedisFeatures.v7_0_0_rc1 : RedisFeatures.v2_0_0,
+            channelPrefix: withKeyPrefix ? "c_prefix:" : null);
         Assert.True(conn.IsConnected);
 
         var pubsub = conn.GetSubscriber();
+        HashSet<string> eps = [];
+        for (int i = 0; i < 10; i++)
+        {
+            var ep = Format.ToString(await pubsub.IdentifyEndpointAsync(channel));
+            Log($"Channel {channel} => {ep}");
+            eps.Add(ep);
+        }
+
+        if (sharded | withKeyRouting)
+        {
+            Assert.Single(eps);
+        }
+        else
+        {
+            // if not routed: we should have at least two different endpoints
+            Assert.True(eps.Count > 1);
+        }
+
         List<(RedisChannel, RedisValue)> received = [];
-        var queue = await pubsub.SubscribeAsync(channel);
+        var queue = await pubsub.SubscribeAsync(channel, CommandFlags.NoRedirect);
         _ = Task.Run(async () =>
         {
             // use queue API to have control over order
@@ -766,16 +967,28 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
                 }
             }
         });
-
+        var subscribedEp = Format.ToString(pubsub.SubscribedEndpoint(channel));
+        Log($"Subscribed to {subscribedEp}");
+        Assert.NotNull(subscribedEp);
+        if (sharded | withKeyRouting)
+        {
+            Assert.Equal(eps.Single(), subscribedEp);
+        }
         var db = conn.GetDatabase();
         await Task.Delay(50); // let the sub settle (this isn't needed on RESP3, note)
         await db.PingAsync();
         for (int i = 0; i < 10; i++)
         {
-            // check we get a hit
-            Assert.Equal(1, await db.PublishAsync(channel, i.ToString()));
+            // publish
+            var receivers = await db.PublishAsync(channel, i.ToString());
+
+            // check we get a hit (we are the only subscriber, and because we prefer to
+            // use our own subscribed connection: we can reliably expect to see this hit)
+            Log($"Published {i} to {receivers} receiver(s) against the receiving server.");
+            Assert.Equal(1, receivers);
         }
-        await Task.Delay(50); // let the sub settle (this isn't needed on RESP3, note)
+
+        await Task.Delay(250); // let the sub settle (this isn't needed on RESP3, note)
         await db.PingAsync();
         await pubsub.UnsubscribeAsync(channel);
 
@@ -792,6 +1005,8 @@ public class ClusterTests(ITestOutputHelper output, SharedConnectionFixture fixt
             var pair = snap[i];
             Log("element {0}: {1}/{2}", i, pair.Channel, pair.Value);
         }
+        // even if not routed: we can expect the *order* to be correct, since there's
+        // only one publisher (us), and we prefer to publish via our own subscription
         for (int i = 0; i < 10; i++)
         {
             var pair = snap[i];

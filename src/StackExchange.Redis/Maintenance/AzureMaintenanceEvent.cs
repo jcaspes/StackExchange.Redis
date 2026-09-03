@@ -2,9 +2,6 @@
 using System.Globalization;
 using System.Net;
 using System.Threading.Tasks;
-#if NETCOREAPP
-using System.Buffers.Text;
-#endif
 
 namespace StackExchange.Redis.Maintenance
 {
@@ -58,7 +55,7 @@ namespace StackExchange.Redis.Maintenance
 
                     if (key.Length > 0 && value.Length > 0)
                     {
-#if NETCOREAPP
+#if NET
                         switch (key)
                         {
                             case var _ when key.SequenceEqual(nameof(NotificationType).AsSpan()):
@@ -124,24 +121,32 @@ namespace StackExchange.Redis.Maintenance
             try
             {
                 var sub = multiplexer.GetSubscriber();
-                if (sub == null)
+                // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+                if (sub is null)
                 {
                     log?.Invoke("Failed to GetSubscriber for AzureRedisEvents");
                     return;
                 }
 
-                await sub.SubscribeAsync(RedisChannel.Literal(PubSubChannelName), async (_, message) =>
+                await sub.SubscribeAsync(RedisChannel.Literal(PubSubChannelName), (_, message) =>
                 {
-                    var newMessage = new AzureMaintenanceEvent(message!);
-                    newMessage.NotifyMultiplexer(multiplexer);
-
-                    switch (newMessage.NotificationType)
+                    try
                     {
-                        case AzureNotificationType.NodeMaintenanceEnded:
-                        case AzureNotificationType.NodeMaintenanceFailoverComplete:
-                        case AzureNotificationType.NodeMaintenanceScaleComplete:
-                            await multiplexer.ReconfigureAsync($"Azure Event: {newMessage.NotificationType}").ForAwait();
-                            break;
+                        var newMessage = new AzureMaintenanceEvent(message!);
+                        newMessage.NotifyMultiplexer(multiplexer);
+
+                        switch (newMessage.NotificationType)
+                        {
+                            case AzureNotificationType.NodeMaintenanceEnded:
+                            case AzureNotificationType.NodeMaintenanceFailoverComplete:
+                            case AzureNotificationType.NodeMaintenanceScaleComplete:
+                                multiplexer.ReconfigureAsync($"Azure Event: {newMessage.NotificationType.ToString()}").RedisFireAndForget();
+                                break;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        log?.Invoke($"Encountered exception: {e}");
                     }
                 }).ForAwait();
             }

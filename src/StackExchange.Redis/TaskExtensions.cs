@@ -25,7 +25,12 @@ namespace StackExchange.Redis
             return task;
         }
 
-#if !NET6_0_OR_GREATER
+#if !NET
+        extension(Task task)
+        {
+            public bool IsCompletedSuccessfully => task.Status is TaskStatus.RanToCompletion;
+        }
+
         // suboptimal polyfill version of the .NET 6+ API, but reasonable for light use
         internal static Task<T> WaitAsync<T>(this Task<T> task, CancellationToken cancellationToken)
         {
@@ -46,7 +51,7 @@ namespace StackExchange.Redis
                         else tcs.TrySetResult(t.Result);
                     },
                     tcs);
-                return await tcs.Task;
+                return await tcs.Task.ForAwait();
             }
         }
 

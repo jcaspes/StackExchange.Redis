@@ -7,8 +7,10 @@ using System.Runtime.CompilerServices;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
-using Pipelines.Sockets.Unofficial.Arenas;
+using RESPite;
+using RESPite.Messages;
 
 namespace StackExchange.Redis
 {
@@ -170,8 +172,14 @@ namespace StackExchange.Redis
             }
 
             if (values.Length == 0) return Array.Empty<RedisValue>();
-            return Array.ConvertAll(values, x => (RedisValue)x);
+            return Array.ConvertAll(values, x => x.AsRedisValue());
         }
+
+        // just like the implicit conversion operator, but by making it
+        // explicit, we're making it very clear that this is intentional,
+        // and avoiding the DEBUG check
+        internal static RedisValue AsRedisValue(this string? value)
+            => value is null ? RedisValue.Null : new(value);
 
         /// <summary>
         /// Create an array of strings from an array of values.
@@ -329,13 +337,5 @@ namespace StackExchange.Redis
             return -1;
         }
 #endif
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static T[]? ToArray<T>(in this RawResult result, Projection<RawResult, T> selector)
-            => result.IsNull ? null : result.GetItems().ToArray(selector);
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal static TTo[]? ToArray<TTo, TState>(in this RawResult result, Projection<RawResult, TState, TTo> selector, in TState state)
-            => result.IsNull ? null : result.GetItems().ToArray(selector, in state);
     }
 }

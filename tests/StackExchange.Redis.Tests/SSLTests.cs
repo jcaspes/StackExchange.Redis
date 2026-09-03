@@ -126,7 +126,7 @@ public class SSLTests(ITestOutputHelper output, SSLTests.SSLServerFixture fixtur
             {
                 conn.ExportConfiguration(file);
             }
-            RedisKey key = "SE.Redis";
+            RedisKey key = Me();
 
             const int AsyncLoop = 2000;
             // perf; async
@@ -163,7 +163,7 @@ public class SSLTests(ITestOutputHelper output, SSLTests.SSLServerFixture fixtur
         }
     }
 
-#if NETCOREAPP3_1_OR_GREATER
+#if NET
 #pragma warning disable CS0618 // Type or member is obsolete
     // Docker configured with only TLS_AES_256_GCM_SHA384 for testing
     [Theory]
@@ -240,7 +240,9 @@ public class SSLTests(ITestOutputHelper output, SSLTests.SSLServerFixture fixtur
         Skip.IfNoConfig(nameof(TestConfig.Config.RedisLabsSslServer), TestConfig.Current.RedisLabsSslServer);
         Skip.IfNoConfig(nameof(TestConfig.Config.RedisLabsPfxPath), TestConfig.Current.RedisLabsPfxPath);
 
+#pragma warning disable SYSLIB0057
         var cert = new X509Certificate2(TestConfig.Current.RedisLabsPfxPath, "");
+#pragma warning restore SYSLIB0057
         Assert.NotNull(cert);
         Log("Thumbprint: " + cert.Thumbprint);
 
@@ -414,6 +416,8 @@ public class SSLTests(ITestOutputHelper output, SSLTests.SSLServerFixture fixtur
                     Ssl = true,
                     AbortOnConnectFail = false,
                 };
+                _ = a.Defaults;
+                _ = b.Defaults; // ensure the lazily materialized provider matches the parsed shape
                 Log($"computed: {b.ToString(true)}");
 
                 Log("Checking endpoints...");
@@ -427,6 +431,14 @@ public class SSLTests(ITestOutputHelper output, SSLTests.SSLServerFixture fixtur
                 Array.Sort(fields, (x, y) => string.CompareOrdinal(x.Name, y.Name));
                 foreach (var field in fields)
                 {
+                    if (field.Name == "defaultOptions")
+                    {
+                        var x = field.GetValue(a);
+                        var y = field.GetValue(b);
+                        Log($"{field.Name}: {(x == null ? "(null)" : x.GetType().Name)} vs {(y == null ? "(null)" : y.GetType().Name)}");
+                        Check(field.Name + ".Type", x?.GetType(), y?.GetType());
+                        continue;
+                    }
                     Check(field.Name, field.GetValue(a), field.GetValue(b));
                 }
             }

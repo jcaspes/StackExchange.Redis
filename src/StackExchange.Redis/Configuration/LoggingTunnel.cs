@@ -3,15 +3,16 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.IO;
-using System.IO.Pipelines;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Pipelines.Sockets.Unofficial;
-using Pipelines.Sockets.Unofficial.Arenas;
+using RESPite;
+using RESPite.Buffers;
+using RESPite.Messages;
+using RESPite.Transports;
 using static StackExchange.Redis.PhysicalConnection;
 
 namespace StackExchange.Redis.Configuration;
@@ -27,25 +28,158 @@ public abstract class LoggingTunnel : Tunnel
     private readonly bool _ssl;
     private readonly Tunnel? _tail;
 
+    internal sealed class StreamRespReader(Stream source, bool isInbound) : IDisposable
+    {
+        private CycleBuffer _readBuffer = CycleBuffer.Create();
+        private RespScanState _state;
+        private bool _reading, _disposed; // we need to track the state of the reader to avoid releasing the buffer while it's in use
+
+        public long Position { get; private set; }
+        internal bool TryTakeOne(out ContextualRedisResult result, bool withData = true)
+        {
+            var fullBuffer = _readBuffer.GetAllCommitted();
+            var newData = fullBuffer.Slice(_state.TotalBytes);
+            var status = RespFrameScanner.Default.TryRead(ref _state, newData);
+            switch (status)
+            {
+                case OperationStatus.Done:
+                    var frame = fullBuffer.Slice(0, _state.TotalBytes);
+                    var reader = new RespReader(frame);
+                    reader.MovePastBof();
+                    bool isOutOfBand = reader.Prefix is RespPrefix.Push
+                                       || (isInbound && reader.IsAggregate &&
+                                           !IsArrayOutOfBand(in reader));
+
+                    RedisResult? parsed;
+                    if (withData)
+                    {
+                        if (!RedisResult.TryCreate(null, ref reader, out parsed))
+                        {
+                            ThrowInvalidReadStatus(OperationStatus.InvalidData);
+                        }
+                    }
+                    else
+                    {
+                        parsed = null;
+                    }
+                    result = new(parsed, isOutOfBand);
+                    Position += _state.TotalBytes;
+                    _readBuffer.DiscardCommitted((int)_state.TotalBytes);
+                    _state = default;
+                    return true;
+                case OperationStatus.NeedMoreData:
+                    result = default;
+                    return false;
+                default:
+                    ThrowInvalidReadStatus(status);
+                    goto case OperationStatus.NeedMoreData; // never reached
+            }
+        }
+
+        private static bool IsArrayOutOfBand(in RespReader source)
+        {
+            var reader = source;
+            int len;
+            if (!reader.IsStreaming
+                && (len = reader.AggregateLength()) >= 2
+                && (reader.SafeTryMoveNext() & reader.IsInlineScalar & !reader.IsError))
+            {
+                const int MAX_TYPE_LEN = 16;
+                var span = reader.TryGetSpan(out var tmp)
+                    ? tmp
+                    : StackCopyLengthChecked(in reader, stackalloc byte[MAX_TYPE_LEN]);
+
+                if (PushKindMetadata.TryParse(span, out var kind))
+                {
+                    return kind switch
+                    {
+                        PushKind.Message => len >= 3,
+                        PushKind.PMessage => len >= 4,
+                        PushKind.SMessage => len >= 3,
+                        _ => false,
+                    };
+                }
+            }
+
+            return false;
+        }
+
+        public ValueTask<ContextualRedisResult> ReadOneAsync(CancellationToken cancellationToken = default)
+            => TryTakeOne(out var result) ? new(result) : ReadMoreAsync(cancellationToken);
+
+        [DoesNotReturn]
+        private static void ThrowInvalidReadStatus(OperationStatus status)
+            => throw new InvalidOperationException($"Unexpected read status: {status}");
+
+        private async ValueTask<ContextualRedisResult> ReadMoreAsync(CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                var buffer = _readBuffer.GetUncommittedMemory();
+                Debug.Assert(!buffer.IsEmpty, "rule out zero-length reads");
+                _reading = true;
+                var read = await source.ReadAsync(buffer, cancellationToken).ForAwait();
+                _reading = false;
+                if (read <= 0)
+                {
+                    // EOF
+                    return default;
+                }
+                _readBuffer.Commit(read);
+
+                if (TryTakeOne(out var result)) return result;
+            }
+        }
+
+        public void Dispose()
+        {
+            bool disposed = _disposed;
+            _disposed = true;
+            _state = default;
+
+            if (!(_reading | disposed)) _readBuffer.Release();
+            _readBuffer = default;
+            if (!disposed) source.Dispose();
+        }
+
+        public async ValueTask<long> ValidateAsync(CancellationToken cancellationToken = default)
+        {
+            long count = 0;
+            while (true)
+            {
+                var buffer = _readBuffer.GetUncommittedMemory();
+                Debug.Assert(!buffer.IsEmpty, "rule out zero-length reads");
+                _reading = true;
+                var read = await source.ReadAsync(buffer, cancellationToken).ForAwait();
+                _reading = false;
+                if (read <= 0)
+                {
+                    // EOF
+                    return count;
+                }
+                _readBuffer.Commit(read);
+                while (TryTakeOne(out _, withData: false)) count++;
+            }
+        }
+    }
+
     /// <summary>
     /// Replay the RESP messages for a pair of streams, invoking a callback per operation.
     /// </summary>
     public static async Task<long> ReplayAsync(Stream @out, Stream @in, Action<RedisResult, RedisResult> pair)
     {
-        using Arena<RawResult> arena = new();
-        var outPipe = StreamConnection.GetReader(@out);
-        var inPipe = StreamConnection.GetReader(@in);
-
         long count = 0;
+        using var outReader = new StreamRespReader(@out, isInbound: false);
+        using var inReader = new StreamRespReader(@in, isInbound: true);
         while (true)
         {
-            var sent = await ReadOneAsync(outPipe, arena, isInbound: false).ForAwait();
+            if (!outReader.TryTakeOne(out var sent)) sent = await outReader.ReadOneAsync().ForAwait();
             ContextualRedisResult received;
             try
             {
                 do
                 {
-                    received = await ReadOneAsync(inPipe, arena, isInbound: true).ForAwait();
+                    if (!inReader.TryTakeOne(out received)) received = await inReader.ReadOneAsync().ForAwait();
                     if (received.IsOutOfBand && received.Result is not null)
                     {
                         // spoof an empty request for OOB messages
@@ -60,7 +194,7 @@ public abstract class LoggingTunnel : Tunnel
                 // so we see the message that had a corrupted reply
                 if (sent.Result is not null)
                 {
-                    pair(sent.Result, RedisResult.Create(ex.Message, ResultType.Error));
+                    pair(sent.Result, RedisResult.Create(ex.Message.AsRedisValue(), ResultType.Error));
                 }
                 throw; // still surface the original exception
             }
@@ -91,26 +225,6 @@ public abstract class LoggingTunnel : Tunnel
             total += await ReplayAsync(outFile, inFile, pair).ForAwait();
         }
         return total;
-    }
-
-    private static async ValueTask<ContextualRedisResult> ReadOneAsync(PipeReader input, Arena<RawResult> arena, bool isInbound)
-    {
-        while (true)
-        {
-            var readResult = await input.ReadAsync().ForAwait();
-            var buffer = readResult.Buffer;
-            int handled = 0;
-            var result = buffer.IsEmpty ? default : ProcessBuffer(arena, ref buffer, isInbound);
-            input.AdvanceTo(buffer.Start, buffer.End);
-
-            if (result.Result is not null) return result;
-
-            if (handled == 0 && readResult.IsCompleted)
-            {
-                break; // no more data, or trailing incomplete messages
-            }
-        }
-        return default;
     }
 
     /// <summary>
@@ -152,63 +266,11 @@ public abstract class LoggingTunnel : Tunnel
     /// </summary>
     public static async Task<long> ValidateAsync(Stream stream)
     {
-        using var arena = new Arena<RawResult>();
-        var input = StreamConnection.GetReader(stream);
-        long total = 0, position = 0;
-        while (true)
-        {
-            var readResult = await input.ReadAsync().ForAwait();
-            var buffer = readResult.Buffer;
-            int handled = 0;
-            if (!buffer.IsEmpty)
-            {
-                try
-                {
-                    ProcessBuffer(arena, ref buffer, ref position, ref handled); // updates buffer.Start
-                }
-                catch (Exception ex)
-                {
-                    throw new InvalidOperationException($"Invalid fragment starting at {position} (fragment {total + handled})", ex);
-                }
-                total += handled;
-            }
-
-            input.AdvanceTo(buffer.Start, buffer.End);
-
-            if (handled == 0 && readResult.IsCompleted)
-            {
-                break; // no more data, or trailing incomplete messages
-            }
-        }
-        return total;
-    }
-    private static void ProcessBuffer(Arena<RawResult> arena, ref ReadOnlySequence<byte> buffer, ref long position, ref int messageCount)
-    {
-        while (!buffer.IsEmpty)
-        {
-            var reader = new BufferReader(buffer);
-            try
-            {
-                var result = TryParseResult(true, arena, in buffer, ref reader, true, null);
-                if (result.HasValue)
-                {
-                    buffer = reader.SliceFromCurrent();
-                    position += reader.TotalConsumed;
-                    messageCount++;
-                }
-                else
-                {
-                    break; // remaining buffer isn't enough; give up
-                }
-            }
-            finally
-            {
-                arena.Reset();
-            }
-        }
+        using var reader = new StreamRespReader(stream, isInbound: false);
+        return await reader.ValidateAsync().ForAwait();
     }
 
-    private readonly struct ContextualRedisResult
+    internal readonly struct ContextualRedisResult
     {
         public readonly RedisResult? Result;
         public readonly bool IsOutOfBand;
@@ -218,42 +280,6 @@ public abstract class LoggingTunnel : Tunnel
             IsOutOfBand = isOutOfBand;
         }
     }
-
-    private static ContextualRedisResult ProcessBuffer(Arena<RawResult> arena, ref ReadOnlySequence<byte> buffer, bool isInbound)
-    {
-        if (!buffer.IsEmpty)
-        {
-            var reader = new BufferReader(buffer);
-            try
-            {
-                var result = TryParseResult(true, arena, in buffer, ref reader, true, null);
-                bool isOutOfBand = result.Resp3Type == ResultType.Push
-                    || (isInbound && result.Resp2TypeArray == ResultType.Array && IsArrayOutOfBand(result));
-                if (result.HasValue)
-                {
-                    buffer = reader.SliceFromCurrent();
-                    if (!RedisResult.TryCreate(null, result, out var parsed))
-                    {
-                        throw new InvalidOperationException("Unable to parse raw result to RedisResult");
-                    }
-                    return new(parsed, isOutOfBand);
-                }
-            }
-            finally
-            {
-                arena.Reset();
-            }
-        }
-        return default;
-
-        static bool IsArrayOutOfBand(in RawResult result)
-        {
-            var items = result.GetItems();
-            return (items.Length >= 3 && (items[0].IsEqual(message) || items[0].IsEqual(smessage)))
-                || (items.Length >= 4 && items[0].IsEqual(pmessage));
-        }
-    }
-    private static readonly CommandBytes message = "message", pmessage = "pmessage", smessage = "smessage";
 
     /// <summary>
     /// Create a new instance of a <see cref="LoggingTunnel"/>.
@@ -291,6 +317,18 @@ public abstract class LoggingTunnel : Tunnel
 
         protected override Stream Log(Stream stream, EndPoint endpoint, ConnectionType connectionType)
         {
+            CreateLogFiles(endpoint, connectionType, out var reads, out var writes);
+            return new LoggingDuplexStream(stream, reads, writes);
+        }
+
+        protected override DuplexTransport Log(DuplexTransport transport, EndPoint endpoint, ConnectionType connectionType)
+        {
+            CreateLogFiles(endpoint, connectionType, out var reads, out var writes);
+            return new LoggingDuplexTransport(transport, reads, writes);
+        }
+
+        private void CreateLogFiles(EndPoint endpoint, ConnectionType connectionType, out Stream reads, out Stream writes)
+        {
             int index = Interlocked.Increment(ref _nextIndex);
             var name = $"{Format.ToString(endpoint)} {connectionType} {index}.tmp";
             foreach (var c in InvalidChars)
@@ -298,9 +336,8 @@ public abstract class LoggingTunnel : Tunnel
                 name = name.Replace(c, ' ');
             }
             name = Path.Combine(path, name);
-            var reads = File.Create(Path.ChangeExtension(name, ".in"));
-            var writes = File.Create(Path.ChangeExtension(name, ".out"));
-            return new LoggingDuplexStream(stream, reads, writes);
+            reads = File.Create(Path.ChangeExtension(name, ".in"));
+            writes = File.Create(Path.ChangeExtension(name, ".out"));
         }
 
         private static readonly char[] InvalidChars = Path.GetInvalidFileNameChars();
@@ -326,6 +363,30 @@ public abstract class LoggingTunnel : Tunnel
     /// Perform logging on the provided stream.
     /// </summary>
     protected abstract Stream Log(Stream stream, EndPoint endpoint, ConnectionType connectionType);
+
+    /// <inheritdoc/>
+    public override async ValueTask<DuplexTransport?> ConnectTransportAsync(EndPoint endpoint, ConnectionType connectionType, TlsOptions tls, CancellationToken cancellationToken)
+    {
+        if (_tail is null) return null; // nothing to wrap; the socket path applies
+
+        // in transport mode the tail owns connect *and* TLS, so it needs the original TLS intent - which
+        // our constructor deliberately cleared from the live options, since when we do the handshake
+        // ourselves the library must not also wrap the connection. Note that what we log here is
+        // therefore the plaintext RESP either way: we sit above the tail's own encryption.
+        if (_ssl) tls = tls.WithTls();
+
+        var transport = await _tail.ConnectTransportAsync(endpoint, connectionType, tls, cancellationToken).ForAwait();
+        return transport is null ? null : Log(transport, endpoint, connectionType);
+    }
+
+    /// <summary>
+    /// Perform logging on the provided transport (push-mode transports, i.e. tunnels that supply an
+    /// entire <see cref="DuplexTransport"/> rather than a socket or <see cref="Stream"/>).
+    /// </summary>
+    /// <remarks>The default implementation returns the transport unchanged, i.e. connects but does not
+    /// log; override it (typically returning a <see cref="LoggingDuplexTransport"/>) to capture traffic
+    /// in transport mode.</remarks>
+    protected virtual DuplexTransport Log(DuplexTransport transport, EndPoint endpoint, ConnectionType connectionType) => transport;
 
     /// <inheritdoc/>
     public override ValueTask BeforeSocketConnectAsync(EndPoint endPoint, ConnectionType connectionType, Socket? socket, CancellationToken cancellationToken)
@@ -359,7 +420,7 @@ public abstract class LoggingTunnel : Tunnel
             userCertificateSelectionCallback: _options.CertificateSelectionCallback ?? PhysicalConnection.GetAmbientClientCertificateCallback(),
             encryptionPolicy: EncryptionPolicy.RequireEncryption);
 
-#if NETCOREAPP3_1_OR_GREATER
+#if NET
         var configOptions = _options.SslClientAuthenticationOptions?.Invoke(host);
         if (configOptions is not null)
         {
@@ -461,6 +522,120 @@ public abstract class LoggingTunnel : Tunnel
     }
 
 #pragma warning disable CS1591 // Missing XML comment for publicly visible type or member
+    /// <summary>
+    /// Captures the traffic of a push-mode <see cref="DuplexTransport"/> into a pair of streams, in the
+    /// same format <see cref="LoggingDuplexStream"/> produces, so the same replay/validate tooling reads
+    /// both. Outbound bytes are captured at <see cref="Advance"/> (the last point at which they are still
+    /// ours to read); inbound bytes are captured as they are delivered, before the consumer sees them.
+    /// </summary>
+    protected sealed class LoggingDuplexTransport : DuplexTransport
+    {
+        private readonly DuplexTransport _inner;
+        private readonly Stream _reads, _writes;
+        private Memory<byte> _pending; // the buffer most recently handed out, so Advance can log from it
+        private volatile bool _logsClosed;
+
+        internal LoggingDuplexTransport(DuplexTransport inner, Stream reads, Stream writes)
+        {
+            _inner = inner;
+            _reads = reads;
+            _writes = writes;
+        }
+
+        // the wrapper adds capture, not encryption; whether the bytes are encrypted is the inner
+        // transport's assertion to make
+        public override bool IsEncrypted => _inner.IsEncrypted;
+
+        public override Memory<byte> GetMemory(int sizeHint = 0) => _pending = _inner.GetMemory(sizeHint);
+
+        // deliberately NOT delegating to _inner.GetSpan: we need the memory to still be reachable at
+        // Advance, which is the only point where we learn how much of it was actually written
+        public override Span<byte> GetSpan(int sizeHint = 0) => GetMemory(sizeHint).Span;
+
+        public override void Advance(int count)
+        {
+            if (count > 0 && !_logsClosed)
+            {
+                // capture *before* advancing; from Advance onwards the bytes belong to the transport,
+                // which is free to send and recycle them
+                WriteLog(_writes, _pending.Span.Slice(0, count));
+            }
+            _pending = default;
+            _inner.Advance(count);
+        }
+
+        public override bool Flush()
+        {
+            // capture first, so the log is never behind the wire
+            if (!_logsClosed) _writes.Flush();
+            return _inner.Flush();
+        }
+
+        public override void Start(TransportReceiver receiver) => _inner.Start(new LoggingReceiver(this, receiver));
+
+        public override async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await _inner.DisposeAsync().ForAwait();
+            }
+            finally
+            {
+                CloseLogs();
+            }
+        }
+
+        private void CloseLogs()
+        {
+            if (_logsClosed) return;
+            _logsClosed = true;
+            try { _reads.Flush(); } catch { }
+            try { _reads.Dispose(); } catch { }
+            try { _writes.Flush(); } catch { }
+            try { _writes.Dispose(); } catch { }
+        }
+
+        private static void WriteLog(Stream target, ReadOnlySpan<byte> payload)
+        {
+#if NET
+            target.Write(payload);
+#else
+            var lease = ArrayPool<byte>.Shared.Rent(payload.Length);
+            payload.CopyTo(lease);
+            target.Write(lease, 0, payload.Length);
+            ArrayPool<byte>.Shared.Return(lease);
+#endif
+        }
+
+        private sealed class LoggingReceiver(LoggingDuplexTransport parent, TransportReceiver tail) : TransportReceiver
+        {
+            public override bool OnReceived(ReadOnlySpan<byte> payload)
+            {
+                // capture before handing on, so a capture exists even if the consumer faults on it
+                if (!parent._logsClosed)
+                {
+                    WriteLog(parent._reads, payload);
+                    parent._reads.Flush();
+                }
+                return tail.OnReceived(payload);
+            }
+
+            public override void OnBatchEnd() => tail.OnBatchEnd();
+
+            public override void OnClosed(Exception? fault)
+            {
+                try
+                {
+                    tail.OnClosed(fault);
+                }
+                finally
+                {
+                    parent.CloseLogs();
+                }
+            }
+        }
+    }
+
     protected sealed class LoggingDuplexStream : Stream
     {
         private readonly Stream _inner, _reads, _writes;
@@ -504,9 +679,9 @@ public abstract class LoggingTunnel : Tunnel
 
         public override async Task FlushAsync(CancellationToken cancellationToken)
         {
-            var writesTask = _writes.FlushAsync().ForAwait();
+            var writesTask = _writes.FlushAsync();
             await _inner.FlushAsync().ForAwait();
-            await writesTask;
+            await writesTask.ForAwait();
         }
 
         protected override void Dispose(bool disposing)
@@ -532,7 +707,7 @@ public abstract class LoggingTunnel : Tunnel
             base.Close();
         }
 
-#if NETCOREAPP3_0_OR_GREATER
+#if NET
         public override async ValueTask DisposeAsync()
         {
             await _inner.DisposeAsync().ForAwait();
@@ -574,7 +749,7 @@ public abstract class LoggingTunnel : Tunnel
             }
             return len;
         }
-#if NETCOREAPP3_0_OR_GREATER
+#if NET
         public override int Read(Span<byte> buffer)
         {
             var len = _inner.Read(buffer);
@@ -609,21 +784,22 @@ public abstract class LoggingTunnel : Tunnel
         }
         public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
         {
-            var writesTask = _writes.WriteAsync(buffer, offset, count, cancellationToken).ForAwait();
+            var writesTask = _writes.WriteAsync(buffer, offset, count, cancellationToken);
             await _inner.WriteAsync(buffer, offset, count, cancellationToken).ForAwait();
-            await writesTask;
+            await writesTask.ForAwait();
         }
-#if NETCOREAPP3_0_OR_GREATER
+#if NET
         public override void Write(ReadOnlySpan<byte> buffer)
         {
             _writes.Write(buffer);
             _inner.Write(buffer);
         }
+        // ReSharper disable once OptionalParameterHierarchyMismatch
         public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken)
         {
-            var writesTask = _writes.WriteAsync(buffer, cancellationToken).ForAwait();
+            var writesTask = _writes.WriteAsync(buffer, cancellationToken);
             await _inner.WriteAsync(buffer, cancellationToken).ForAwait();
-            await writesTask;
+            await writesTask.ForAwait();
         }
 #endif
     }

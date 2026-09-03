@@ -1,6 +1,6 @@
-﻿using System;
-using System.Diagnostics.CodeAnalysis;
+﻿using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
+using RESPite;
 
 // ReSharper disable once CheckNamespace
 namespace StackExchange.Redis.KeyspaceIsolation;
@@ -8,7 +8,6 @@ namespace StackExchange.Redis.KeyspaceIsolation;
 internal partial class KeyPrefixed<TInner>
 {
     // Vector Set operations - async methods
-    [Experimental(Experiments.VectorSets, UrlFormat = Experiments.UrlFormat)]
     public Task<bool> VectorSetAddAsync(
         RedisKey key,
         VectorSetAddRequest request,
@@ -56,4 +55,22 @@ internal partial class KeyPrefixed<TInner>
         VectorSetSimilaritySearchRequest query,
         CommandFlags flags = CommandFlags.None) =>
         Inner.VectorSetSimilaritySearchAsync(ToInner(key), query, flags);
+
+    public Task<Lease<RedisValue>?> VectorSetRangeAsync(
+        RedisKey key,
+        RedisValue start = default,
+        RedisValue end = default,
+        long count = -1,
+        Exclude exclude = Exclude.None,
+        CommandFlags flags = CommandFlags.None) =>
+        Inner.VectorSetRangeAsync(ToInner(key), start, end, count, exclude, flags);
+
+    public System.Collections.Generic.IAsyncEnumerable<RedisValue> VectorSetRangeEnumerateAsync(
+        RedisKey key,
+        RedisValue start = default,
+        RedisValue end = default,
+        long count = 100,
+        Exclude exclude = Exclude.None,
+        CommandFlags flags = CommandFlags.None) =>
+        Inner.VectorSetRangeEnumerateAsync(ToInner(key), start, end, count, exclude, flags);
 }

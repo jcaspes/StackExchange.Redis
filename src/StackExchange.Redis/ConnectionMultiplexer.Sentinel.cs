@@ -6,7 +6,6 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-using Pipelines.Sockets.Unofficial;
 
 namespace StackExchange.Redis;
 
@@ -23,7 +22,7 @@ public partial class ConnectionMultiplexer
     /// <param name="log">The <see cref="ILogger"/> to log to, if any.</param>
     internal void InitializeSentinel(ILogger? log)
     {
-        if (ServerSelectionStrategy.ServerType != ServerType.Sentinel)
+        if (!_isSentinel)
         {
             return;
         }
@@ -41,6 +40,13 @@ public partial class ConnectionMultiplexer
                     // We don't care about the result of this - we're just trying
                     _ = Format.TryParseEndPoint(string.Format("{0}:{1}", messageParts[1], messageParts[2]), out var switchBlame);
 
+                    // Resolve the child under the lock, but run the (potentially multi-second,
+                    // blocking) SwitchPrimary reconfigure OUTSIDE it: otherwise a failover for one
+                    // service would block +switch-master handling and GetSentinelMasterConnection
+                    // for every other service sharing this sentinel connection. SwitchPrimary is
+                    // already invoked without this lock from the reconnect timer and the restore
+                    // handlers, so holding it here is not a required invariant.
+                    ConnectionMultiplexer? switchTarget = null;
                     lock (sentinelConnectionChildren)
                     {
                         // Switch the primary if we have connections for that service
@@ -55,9 +61,14 @@ public partial class ConnectionMultiplexer
                             }
                             else
                             {
-                                SwitchPrimary(switchBlame, child);
+                                switchTarget = child;
                             }
                         }
+                    }
+
+                    if (switchTarget is not null)
+                    {
+                        SwitchPrimary(switchBlame, switchTarget);
                     }
                 },
                 CommandFlags.FireAndForget);
@@ -106,7 +117,7 @@ public partial class ConnectionMultiplexer
     /// <param name="log">The <see cref="TextWriter"/> to log to.</param>
     public static ConnectionMultiplexer SentinelConnect(ConfigurationOptions configuration, TextWriter? log = null)
     {
-        SocketConnection.AssertDependencies();
+        Dependencies.Assert();
         Validate(configuration);
 
         return ConnectImpl(configuration, log, ServerType.Sentinel);
@@ -119,7 +130,7 @@ public partial class ConnectionMultiplexer
     /// <param name="log">The <see cref="TextWriter"/> to log to.</param>
     public static Task<ConnectionMultiplexer> SentinelConnectAsync(ConfigurationOptions configuration, TextWriter? log = null)
     {
-        SocketConnection.AssertDependencies();
+        Dependencies.Assert();
         Validate(configuration);
 
         return ConnectImplAsync(configuration, log, ServerType.Sentinel);
@@ -133,7 +144,12 @@ public partial class ConnectionMultiplexer
     /// <param name="log">The <see cref="TextWriter"/> to log to.</param>
     private static ConnectionMultiplexer SentinelPrimaryConnect(ConfigurationOptions configuration, TextWriter? log = null)
     {
-        var sentinelConnection = SentinelConnect(configuration, log);
+        // Use separate sentinel credentials when provided on the configuration
+        var sentinelConfig = configuration.Clone();
+        sentinelConfig.User = configuration.SentinelUser;
+        sentinelConfig.Password = configuration.SentinelPassword;
+
+        var sentinelConnection = SentinelConnect(sentinelConfig, log);
 
         var muxer = sentinelConnection.GetSentinelMasterConnection(configuration, log);
         // Set reference to sentinel connection so that we can dispose it
@@ -150,7 +166,12 @@ public partial class ConnectionMultiplexer
     /// <param name="writer">The <see cref="TextWriter"/> to log to.</param>
     private static async Task<ConnectionMultiplexer> SentinelPrimaryConnectAsync(ConfigurationOptions configuration, TextWriter? writer = null)
     {
-        var sentinelConnection = await SentinelConnectAsync(configuration, writer).ForAwait();
+        // Use separate sentinel credentials when provided on the configuration
+        var sentinelConfig = configuration.Clone();
+        sentinelConfig.User = configuration.SentinelUser;
+        sentinelConfig.Password = configuration.SentinelPassword;
+
+        var sentinelConnection = await SentinelConnectAsync(sentinelConfig, writer).ForAwait();
 
         var muxer = sentinelConnection.GetSentinelMasterConnection(configuration, writer);
         // Set reference to sentinel connection so that we can dispose it
@@ -170,6 +191,7 @@ public partial class ConnectionMultiplexer
         {
             throw new RedisConnectionException(
                 ConnectionFailureType.UnableToConnect,
+                CommandFlags.None,
                 "Sentinel: The ConnectionMultiplexer is not a Sentinel connection. Detected as: " + ServerSelectionStrategy.ServerType);
         }
 
@@ -205,6 +227,7 @@ public partial class ConnectionMultiplexer
             {
                 throw new RedisConnectionException(
                     ConnectionFailureType.UnableToConnect,
+                    CommandFlags.None,
                     $"Sentinel: Failed connecting to configured primary for service: {config.ServiceName}");
             }
 
@@ -240,10 +263,28 @@ public partial class ConnectionMultiplexer
 
             // verify role is primary according to:
             // https://redis.io/topics/sentinel-clients
-            if (connection.GetServer(newPrimaryEndPoint)?.Role()?.Value == RedisLiterals.master)
+            bool isPrimary;
+            var server = connection.GetServer(newPrimaryEndPoint);
+            // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+            if (server is { })
             {
-                success = true;
-                break;
+                try
+                {
+                    isPrimary = connection.CommandMap.IsAvailable(RedisCommand.ROLE)
+                        ? server.Role()?.Value == Role.LabelForMaster
+                        : !server.IsReplica;
+                }
+                catch
+                {
+                    // fallback if ROLE unavailable but not declared; see #3064
+                    isPrimary = !server.IsReplica;
+                }
+
+                if (isPrimary)
+                {
+                    success = true;
+                    break;
+                }
             }
 
             Thread.Sleep(100);
@@ -254,6 +295,7 @@ public partial class ConnectionMultiplexer
         {
             throw new RedisConnectionException(
                 ConnectionFailureType.UnableToConnect,
+                CommandFlags.None,
                 $"Sentinel: Failed connecting to configured primary for service: {config.ServiceName}");
         }
 
@@ -401,12 +443,34 @@ public partial class ConnectionMultiplexer
         // Get new primary - try twice
         EndPoint newPrimaryEndPoint = GetConfiguredPrimaryForService(serviceName)
                                     ?? GetConfiguredPrimaryForService(serviceName)
-                                    ?? throw new RedisConnectionException(ConnectionFailureType.UnableToConnect, $"Sentinel: Failed connecting to switch primary for service: {serviceName}");
+                                    ?? throw new RedisConnectionException(ConnectionFailureType.UnableToConnect, CommandFlags.None, $"Sentinel: Failed connecting to switch primary for service: {serviceName}");
 
         connection.currentSentinelPrimaryEndPoint = newPrimaryEndPoint;
 
+        // Trigger a blocking reconfigure for the switch, then refresh the sentinel address list.
+        // reconfigureAll:true forces every already-connected node to re-read its role before the
+        // primary is re-elected (see IsStalePrimaryView); reconfigureAll:false matches the legacy
+        // behavior for the "unknown endpoint" rebuild path.
+        void TriggerReconfigure(bool reconfigureAll)
+        {
+            Trace($"Switching primary to {newPrimaryEndPoint}");
+            connection.ReconfigureAsync(
+                first: false,
+                reconfigureAll: reconfigureAll,
+                log: logger,
+                blame: switchBlame,
+                cause: $"Primary switch {serviceName}",
+                publishReconfigure: false,
+                publishReconfigureFlags: CommandFlags.PreferMaster).Wait();
+
+            UpdateSentinelAddressList(serviceName);
+        }
+
         if (!connection.servers.Contains(newPrimaryEndPoint))
         {
+            // The sentinel-reported primary is an endpoint we have never seen (e.g. a
+            // recreated node that came back on a brand-new IP). Rebuild the endpoint set
+            // from scratch around it and reconfigure.
             EndPoint[]? replicaEndPoints = GetReplicasForService(serviceName)
                                         ?? GetReplicasForService(serviceName);
 
@@ -420,19 +484,61 @@ public partial class ConnectionMultiplexer
                     connection.EndPoints.TryAdd(replicaEndPoint);
                 }
             }
-            Trace($"Switching primary to {newPrimaryEndPoint}");
-            // Trigger a reconfigure
-            connection.ReconfigureAsync(
-                first: false,
-                reconfigureAll: false,
-                log: logger,
-                blame: switchBlame,
-                cause: $"Primary switch {serviceName}",
-                publishReconfigure: false,
-                publishReconfigureFlags: CommandFlags.PreferMaster).Wait();
 
-            UpdateSentinelAddressList(serviceName);
+            TriggerReconfigure(reconfigureAll: false);
         }
+        else if (IsStalePrimaryView(connection, newPrimaryEndPoint))
+        {
+            // The sentinel-reported primary IS an endpoint we already know about, but our
+            // cached view of the topology is stale (failover between known nodes: the old
+            // primary was demoted to a replica in-place and a former replica was promoted).
+            // A plain reconfigure with reconfigureAll:false would NOT re-read the role of an
+            // already-connected node, so the primary election would re-pick the stale demoted
+            // node. Force a full reconfigure so every connected node's role is refreshed before
+            // the primary is re-elected.
+            TriggerReconfigure(reconfigureAll: true);
+        }
+    }
+
+    /// <summary>
+    /// Determines whether the multiplexer's cached view of the topology disagrees with the
+    /// sentinel-reported primary for a known endpoint, and therefore needs a full reconfigure.
+    /// </summary>
+    /// <remarks>
+    /// This is the self-clearing guard that keeps the per-second <see cref="OnManagedConnectionFailed"/>
+    /// timer from storming reconfigures: once a switch has succeeded, a full reconfigure has refreshed
+    /// the new primary's role (<see cref="ServerEndPoint.IsReplica"/> becomes <c>false</c>, it is
+    /// connected, and no other node is still seen as a primary), so every subsequent tick observes a
+    /// healthy, correct primary and returns <c>false</c>.
+    /// </remarks>
+    /// <param name="connection">The managed connection whose view is being validated.</param>
+    /// <param name="newPrimaryEndPoint">The primary endpoint reported by sentinel (already known to the connection).</param>
+    private static bool IsStalePrimaryView(ConnectionMultiplexer connection, EndPoint newPrimaryEndPoint)
+    {
+        var newPrimaryServer = connection.GetServerEndPoint(newPrimaryEndPoint, activate: false);
+
+        // We do not know this endpoint yet, or we still think the sentinel-reported primary is a
+        // replica, or we are not actually connected to it: our view is stale.
+        if (newPrimaryServer is null || newPrimaryServer.IsReplica || !newPrimaryServer.IsConnected)
+        {
+            return true;
+        }
+
+        // The sentinel-reported primary looks correct locally, but double-check that no *other*
+        // node is still being treated as a connected primary (a demoted node whose role has not
+        // yet been refreshed). If one exists, our view is split and needs a full reconfigure.
+        foreach (var server in connection.GetServerSnapshot())
+        {
+            if (server.ServerType != ServerType.Sentinel
+                && server.IsConnected
+                && !server.IsReplica
+                && !Equals(server.EndPoint, newPrimaryEndPoint))
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     internal void UpdateSentinelAddressList(string serviceName)

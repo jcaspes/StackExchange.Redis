@@ -9,6 +9,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
     protected override string GetConfiguration() => TestConfig.Current.PrimaryServerAndPort + "," + TestConfig.Current.ReplicaServerAndPort;
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task FailFast()
     {
         void PrintSnapshot(ConnectionMultiplexer muxer)
@@ -43,6 +44,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
                 KeepAlive = 10000,
                 AsyncTimeout = 5000,
                 AllowAdmin = true,
+                AllowSimulateConnectionFailure = true,
             };
             options.EndPoints.Add(TestConfig.Current.PrimaryServerAndPort);
 
@@ -53,12 +55,14 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             await db.PingAsync();
 
             var server = conn.GetServerSnapshot()[0];
+            Assert.SkipUnless(server.CanSimulateConnectionFailure, "Skipping because server cannot simulate connection failure");
             var stats = server.GetBridgeStatus(ConnectionType.Interactive);
             Assert.Equal(0, stats.BacklogMessagesPending); // Everything's normal
 
             // Fail the connection
             Log("Test: Simulating failure");
             conn.AllowConnect = false;
+
             server.SimulateConnectionFailure(SimulatedFailureType.All);
             Assert.False(conn.IsConnected);
 
@@ -101,6 +105,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
     }
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task QueuesAndFlushesAfterReconnectingAsync()
     {
         try
@@ -115,11 +120,12 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
                 KeepAlive = 10000,
                 AsyncTimeout = 5000,
                 AllowAdmin = true,
-                SocketManager = SocketManager.ThreadPool,
+                AllowSimulateConnectionFailure = true,
             };
             options.EndPoints.Add(TestConfig.Current.PrimaryServerAndPort);
 
             await using var conn = await ConnectionMultiplexer.ConnectAsync(options, Writer);
+            Assert.SkipUnless(conn.IsConnected, "no initial connection");
             conn.ErrorMessage += (s, e) => Log($"Error Message {e.EndPoint}: {e.Message}");
             conn.InternalError += (s, e) => Log($"Internal Error {e.EndPoint}: {e.Exception.Message}");
             conn.ConnectionFailed += (s, a) => Log("Disconnected: " + EndPointCollection.ToString(a.EndPoint));
@@ -130,6 +136,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             await db.PingAsync();
 
             var server = conn.GetServerSnapshot()[0];
+            Assert.SkipUnless(server.CanSimulateConnectionFailure, "Skipping because server cannot simulate connection failure");
             var stats = server.GetBridgeStatus(ConnectionType.Interactive);
             Assert.Equal(0, stats.BacklogMessagesPending); // Everything's normal
 
@@ -192,6 +199,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
     }
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task QueuesAndFlushesAfterReconnecting()
     {
         try
@@ -206,7 +214,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
                 KeepAlive = 10000,
                 AsyncTimeout = 5000,
                 AllowAdmin = true,
-                SocketManager = SocketManager.ThreadPool,
+                AllowSimulateConnectionFailure = true,
             };
             options.EndPoints.Add(TestConfig.Current.PrimaryServerAndPort);
 
@@ -221,6 +229,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             await db.PingAsync();
 
             var server = conn.GetServerSnapshot()[0];
+            Assert.SkipUnless(server.CanSimulateConnectionFailure, "Skipping because server cannot simulate connection failure");
             var stats = server.GetBridgeStatus(ConnectionType.Interactive);
             Assert.Equal(0, stats.BacklogMessagesPending); // Everything's normal
 
@@ -295,6 +304,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
     }
 
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task QueuesAndFlushesAfterReconnectingClusterAsync()
     {
         try
@@ -308,9 +318,10 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             options.KeepAlive = 10000;
             options.AsyncTimeout = 5000;
             options.AllowAdmin = true;
-            options.SocketManager = SocketManager.ThreadPool;
+            options.AllowSimulateConnectionFailure = true;
 
             await using var conn = await ConnectionMultiplexer.ConnectAsync(options, Writer);
+            Assert.SkipUnless(conn.IsConnected, "no initial connection");
             conn.ErrorMessage += (s, e) => Log($"Error Message {e.EndPoint}: {e.Message}");
             conn.InternalError += (s, e) => Log($"Internal Error {e.EndPoint}: {e.Exception.Message}");
             conn.ConnectionFailed += (s, a) => Log("Disconnected: " + EndPointCollection.ToString(a.EndPoint));
@@ -327,6 +338,7 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             await UntilConditionAsync(TimeSpan.FromSeconds(10), () => (server = conn.SelectServer(getMsg)) != null);
 
             Assert.NotNull(server);
+            Assert.SkipUnless(server.CanSimulateConnectionFailure, "Skipping because server cannot simulate connection failure");
             var stats = server.GetBridgeStatus(ConnectionType.Interactive);
             Assert.Equal(0, stats.BacklogMessagesPending); // Everything's normal
 
@@ -391,6 +403,80 @@ public class BacklogTests(ITestOutputHelper output) : TestBase(output)
             Assert.Equal(0, stats.BacklogMessagesPending);
             Log("Test: Awaiting lastPing 2");
             await lastPing;
+            Log("Test: Done");
+        }
+        finally
+        {
+            ClearAmbientFailures();
+        }
+    }
+
+    [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
+    public async Task TotalOutstandingIncludesBacklogQueue()
+    {
+        try
+        {
+            var options = new ConfigurationOptions()
+            {
+                BacklogPolicy = BacklogPolicy.Default,
+                AbortOnConnectFail = false,
+                ConnectTimeout = 1000,
+                ConnectRetry = 2,
+                SyncTimeout = 10000,
+                KeepAlive = 10000,
+                AsyncTimeout = 5000,
+                AllowAdmin = true,
+                AllowSimulateConnectionFailure = true,
+            };
+            options.EndPoints.Add(TestConfig.Current.PrimaryServerAndPort);
+
+            using var conn = await ConnectionMultiplexer.ConnectAsync(options, Writer);
+            var db = conn.GetDatabase();
+            Log("Test: Initial (connected) ping");
+            await db.PingAsync();
+
+            var server = conn.GetServerSnapshot()[0];
+            Assert.SkipUnless(server.CanSimulateConnectionFailure, "Skipping because server cannot simulate connection failure");
+
+            // Verify TotalOutstanding is 0 when connected and idle
+            Log("Test: asserting connected counters");
+            var connectedServerCounters = server.GetCounters();
+            var connectedConnCounters = conn.GetCounters();
+            Assert.Equal(0, connectedServerCounters.Interactive.TotalOutstanding);
+            Assert.Equal(0, connectedConnCounters.TotalOutstanding);
+
+            Log("Test: Simulating failure");
+            conn.AllowConnect = false;
+            server.SimulateConnectionFailure(SimulatedFailureType.All);
+
+            // Queue up some commands
+            Log("Test: Disconnected pings");
+            _ = db.PingAsync();
+            _ = db.PingAsync();
+            var lastPing = db.PingAsync();
+
+            Log("Test: asserting disconnected counters");
+            var disconnectedServerCounters = server.GetCounters();
+            var disconnectedConnCounters = conn.GetCounters();
+            Assert.True(disconnectedServerCounters.Interactive.PendingUnsentItems >= 3, $"Expected PendingUnsentItems >= 3, got {disconnectedServerCounters.Interactive.PendingUnsentItems}");
+            Assert.True(disconnectedConnCounters.TotalOutstanding >= 3, $"Expected TotalOutstanding >= 3, got {disconnectedServerCounters.Interactive.TotalOutstanding}");
+
+            Log("Test: Awaiting reconnect");
+            conn.AllowConnect = true;
+            await UntilConditionAsync(TimeSpan.FromSeconds(3), () => conn.IsConnected).ForAwait();
+
+            Log("Test: Awaiting lastPing");
+            await lastPing;
+
+            Log("Test: Checking reconnected");
+            Assert.True(conn.IsConnected);
+
+            Log("Test: asserting reconnected counters");
+            var reconnectedServerCounters = server.GetCounters();
+            var reconnectedConnCounters = conn.GetCounters();
+            Assert.Equal(0, reconnectedServerCounters.Interactive.PendingUnsentItems);
+            Assert.Equal(0, reconnectedConnCounters.TotalOutstanding);
             Log("Test: Done");
         }
         finally

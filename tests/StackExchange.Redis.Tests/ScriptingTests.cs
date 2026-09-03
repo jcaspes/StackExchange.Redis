@@ -184,6 +184,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task FlushDetection()
     {
+        NoConcurrentRuntime();
+
         // we don't expect this to handle everything; we just expect it to be predictable
         await using var conn = GetScriptConn(allowAdmin: true);
 
@@ -206,6 +208,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task PrepareScript()
     {
+        NoConcurrentRuntime();
+
         string[] scripts = ["return redis.call('get', KEYS[1])", "return {KEYS[1],KEYS[2],ARGV[1],ARGV[2]}"];
         await using (var conn = GetScriptConn(allowAdmin: true))
         {
@@ -286,7 +290,9 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
             var c = tran.StringIncrementAsync(key);
             var complete = tran.ExecuteAsync();
 
+            #pragma warning disable SER308 // deliberate: test code blocking on a task, and the Wait helpers apply the configured timeout that a bare await would not
             Assert.True(conn.Wait(complete));
+            #pragma warning restore SER308
             Assert.True(QuickWait(a).IsCompleted, a.Status.ToString());
             Assert.True(QuickWait(c).IsCompleted, "State: " + c.Status);
             Assert.Equal(1L, a.Result);
@@ -301,7 +307,9 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
             Assert.Contains(ex.Message, new[] { "ERR oops", "oops" });
         }
         var afterTran = db.StringGetAsync(key);
+        #pragma warning disable SER308 // deliberate: test code blocking on a task, and the Wait helpers apply the configured timeout that a bare await would not
         Assert.Equal(2L, (long)db.Wait(afterTran));
+        #pragma warning restore SER308
     }
     private static Task<T> QuickWait<T>(Task<T> task)
     {
@@ -389,6 +397,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [InlineData(false)]
     public async Task CheckLoads(bool async)
     {
+        NoConcurrentRuntime();
+
         await using var conn0 = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
         await using var conn1 = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
@@ -437,6 +447,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task CompareScriptToDirect()
     {
+        NoConcurrentRuntime();
+
         Skip.UnlessLongRunning();
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
@@ -484,6 +496,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task TestCallByHash()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "return redis.call('incr', KEYS[1])";
@@ -501,16 +515,18 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
         string hexHash = string.Concat(hash.Select(x => x.ToString("X2")));
         Assert.Equal("2BAB3B661081DB58BD2341920E0BA7CF5DC77B25", hexHash);
 
-        db.ScriptEvaluate(script: hexHash, keys: keys, flags: CommandFlags.FireAndForget);
-        db.ScriptEvaluate(hash, keys, flags: CommandFlags.FireAndForget);
+        await db.ScriptEvaluateAsync(script: hexHash, keys: keys);
+        await db.ScriptEvaluateAsync(hash, keys);
 
-        var count = (int)db.StringGet(keys)[0];
+        var count = (int)db.StringGet(key);
         Assert.Equal(2, count);
     }
 
     [Fact]
     public async Task SimpleLuaScript()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "return @ident";
@@ -565,6 +581,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task SimpleRawScriptEvaluate()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "return ARGV[1]";
@@ -617,6 +635,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task LuaScriptWithKeys()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "redis.call('set', @key, @value)";
@@ -645,6 +665,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task NoInlineReplacement()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "redis.call('set', @key, 'hello@example')";
@@ -678,6 +700,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task SimpleLoadedLuaScript()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "return @ident";
@@ -733,6 +757,8 @@ public class ScriptingTests(ITestOutputHelper output, SharedConnectionFixture fi
     [Fact]
     public async Task LoadedLuaScriptWithKeys()
     {
+        NoConcurrentRuntime();
+
         await using var conn = Create(allowAdmin: true, require: RedisFeatures.v2_6_0);
 
         const string Script = "redis.call('set', @key, @value)";
@@ -1059,11 +1085,12 @@ return arr;
         var db = conn.GetDatabase();
 
         string script = "return KEYS[1]";
-        RedisKey[] keys = ["key1"];
+        RedisKey key = Me();
+        RedisKey[] keys = [key];
         RedisValue[] values = ["first"];
 
         var result = db.ScriptEvaluateReadOnly(script, keys, values);
-        Assert.Equal("key1", result.ToString());
+        Assert.Equal(key.ToString(), result.ToString());
     }
 
     [Fact]
@@ -1073,11 +1100,12 @@ return arr;
         var db = conn.GetDatabase();
 
         string script = "return KEYS[1]";
-        RedisKey[] keys = ["key1"];
+        RedisKey key = Me();
+        RedisKey[] keys = [key];
         RedisValue[] values = ["first"];
 
         var result = await db.ScriptEvaluateReadOnlyAsync(script, keys, values);
-        Assert.Equal("key1", result.ToString());
+        Assert.Equal(key.ToString(), result.ToString());
     }
 
     [Fact]

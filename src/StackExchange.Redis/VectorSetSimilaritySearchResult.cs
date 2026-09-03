@@ -5,7 +5,6 @@ namespace StackExchange.Redis;
 /// <summary>
 /// Represents a result from vector similarity search operations.
 /// </summary>
-[Experimental(Experiments.VectorSets, UrlFormat = Experiments.UrlFormat)]
 public readonly struct VectorSetSimilaritySearchResult(RedisValue member, double score = double.NaN, string? attributesJson = null)
 {
     /// <summary>
@@ -22,7 +21,7 @@ public readonly struct VectorSetSimilaritySearchResult(RedisValue member, double
     /// <summary>
     /// The JSON attributes associated with the member when WITHATTRIBS is used, null otherwise.
     /// </summary>
-#if NET7_0_OR_GREATER
+#if NET8_0_OR_GREATER
     [StringSyntax(StringSyntaxAttribute.Json)]
 #endif
     public string? AttributesJson { get; } = attributesJson;

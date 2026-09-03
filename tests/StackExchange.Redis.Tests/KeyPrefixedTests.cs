@@ -104,6 +104,20 @@ namespace StackExchange.Redis.Tests
         }
 
         [Fact]
+        public async Task StringIncrementAsync_3()
+        {
+            await prefixed.StringIncrementAsync("key", 123L, TimeSpan.FromSeconds(5), lowerBound: 10, upperBound: 200, flags: CommandFlags.None, options: IncrementOptions.None);
+            await mock.Received().StringIncrementAsync("prefix:key", 123L, TimeSpan.FromSeconds(5), 10, 200, IncrementOptions.None, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task StringIncrementAsync_4()
+        {
+            await prefixed.StringIncrementAsync("key", 1.23, TimeSpan.FromSeconds(5), lowerBound: -1.0, upperBound: 2.0, flags: CommandFlags.None, options: IncrementOptions.Saturate);
+            await mock.Received().StringIncrementAsync("prefix:key", 1.23, TimeSpan.FromSeconds(5), -1.0, 2.0, IncrementOptions.Saturate, CommandFlags.None);
+        }
+
+        [Fact]
         public async Task HashKeysAsync()
         {
             await prefixed.HashKeysAsync("key", CommandFlags.None);
@@ -619,6 +633,13 @@ namespace StackExchange.Redis.Tests
         }
 
         [Fact]
+        public async Task SetCombineLengthAsync()
+        {
+            await prefixed.SetCombineLengthAsync(SetOperation.Union, ["key1", "key2"]);
+            await mock.Received().SetCombineLengthAsync(SetOperation.Union, IsKeys("prefix:key1", "prefix:key2"), 0, false, CommandFlags.None);
+        }
+
+        [Fact]
         public async Task SetLengthAsync()
         {
             await prefixed.SetLengthAsync("key", CommandFlags.None);
@@ -773,6 +794,13 @@ namespace StackExchange.Redis.Tests
         {
             await prefixed.SortedSetIncrementAsync("key", "member", 1.23, CommandFlags.None);
             await mock.Received().SortedSetIncrementAsync("prefix:key", "member", 1.23, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task SortedSetIncrementAsync_When()
+        {
+            await prefixed.SortedSetIncrementAsync("key", "member", 1.23, ValueCondition.Exists, CommandFlags.None);
+            await mock.Received().SortedSetIncrementAsync("prefix:key", "member", 1.23, ValueCondition.Exists, CommandFlags.None);
         }
 
         [Fact]
@@ -938,6 +966,21 @@ namespace StackExchange.Redis.Tests
             var messageIds = new RedisValue[] { "0-0", "0-1", "0-2" };
             await prefixed.StreamAcknowledgeAsync("key", "group", messageIds, CommandFlags.None);
             await mock.Received().StreamAcknowledgeAsync("prefix:key", "group", messageIds, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task StreamNegativeAcknowledgeAsync_1()
+        {
+            await prefixed.StreamNegativeAcknowledgeAsync("key", "group", StreamNackMode.Fail, "0-0", CommandFlags.None);
+            await mock.Received().StreamNegativeAcknowledgeAsync("prefix:key", "group", StreamNackMode.Fail, "0-0", CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task StreamNegativeAcknowledgeAsync_2()
+        {
+            var messageIds = new RedisValue[] { "0-0", "0-1", "0-2" };
+            await prefixed.StreamNegativeAcknowledgeAsync("key", "group", StreamNackMode.Fail, messageIds, CommandFlags.None);
+            await mock.Received().StreamNegativeAcknowledgeAsync("prefix:key", "group", StreamNackMode.Fail, messageIds, CommandFlags.None);
         }
 
         [Fact]
@@ -1660,6 +1703,23 @@ namespace StackExchange.Redis.Tests
             var fields = new NameValueEntry[] { new NameValueEntry("field", "value") };
             await prefixed.StreamAddAsync("key", fields, "*", 1000, false, 100, StreamTrimMode.KeepReferences, CommandFlags.None);
             await mock.Received().StreamAddAsync("prefix:key", fields, "*", 1000, false, 100, StreamTrimMode.KeepReferences, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task StreamAddAsync_WithOptions_1()
+        {
+            var options = new StreamAddOptions { MaxLength = 1000, CreateStream = false };
+            await prefixed.StreamAddAsync("key", "field", "value", options, CommandFlags.None);
+            await mock.Received().StreamAddAsync("prefix:key", "field", "value", options, CommandFlags.None);
+        }
+
+        [Fact]
+        public async Task StreamAddAsync_WithOptions_2()
+        {
+            var fields = new NameValueEntry[] { new NameValueEntry("field", "value") };
+            var options = new StreamAddOptions { MinId = "5-5", CreateStream = false };
+            await prefixed.StreamAddAsync("key", fields, options, CommandFlags.None);
+            await mock.Received().StreamAddAsync("prefix:key", fields, options, CommandFlags.None);
         }
 
         [Fact]

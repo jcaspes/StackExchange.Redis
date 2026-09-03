@@ -1,7 +1,7 @@
-StackExchange.Redis
+﻿StackExchange.Redis
 ===================
 
-- [Release Notes](ReleaseNotes)
+- [Release Notes](https://github.com/StackExchange/StackExchange.Redis/releases) (3.0 onwards; [earlier releases](ReleaseNotes))
 
 ## Overview
 
@@ -31,24 +31,35 @@ Documentation
 ---
 
 - [Server](Server) - running a redis server
+- [Authentication](Authentication) - connecting to a Redis server with user authentication
 - [Basic Usage](Basics) - getting started and basic usage
 - [Async Timeouts](AsyncTimeouts) - async timeouts and cancellation
 - [Configuration](Configuration) - options available when connecting to redis
+- [Client-side geographic failover](Failover) (Active-Active / "multi-DB client") - connecting to multiple redundant Redis endpoints for high availability
 - [Pipelines and Multiplexers](PipelinesMultiplexers) - what is a multiplexer?
 - [Keys, Values and Channels](KeysValues) - discusses the data-types used on the API
 - [Transactions](Transactions) - how atomic transactions work in redis
+- [Compare-And-Swap / Compare-And-Delete (CAS/CAD)](CompareAndSwap) - atomic conditional operations using value comparison
 - [Events](Events) - the events available for logging / information purposes
 - [Pub/Sub Message Order](PubSubOrder) - advice on sequential and concurrent processing
+- [Pub/Sub Key Notifications](KeyspaceNotifications) - how to use keyspace and keyevent notifications
+- [Hot Keys](HotKeys) - how to use `HOTKEYS` profiling
 - [Using RESP3](Resp3) - information on using RESP3
 - [ServerMaintenanceEvent](ServerMaintenanceEvent) - how to listen and prepare for hosted server maintenance (e.g. Azure Cache for Redis)
 - [Streams](Streams) - how to use the Stream data type
+- [Arrays](Arrays) - how to use Redis Arrays as sparse arrays of values
+- [Vector Sets](VectorSets) - how to use Vector Sets for similarity search with embeddings
+- [Hash Import](HImport) - bulk-importing many hashes that share a common set of field names
+- [Hash Tags and Slots](HashTags) - co-locating keys in the same cluster slot for multi-key operations
 - [Where are `KEYS` / `SCAN` / `FLUSH*`?](KeysScan) - how to use server-based commands
 - [Profiling](Profiling) - profiling interfaces, as well as how to profile in an `async` world
 - [Scripting](Scripting) - running Lua scripts with convenient named parameter replacement
 - [Testing](Testing) - running the `StackExchange.Redis.Tests` suite to validate changes
 - [Timeouts](Timeouts) - guidance on dealing with timeout problems
 - [Thread Theft](ThreadTheft) - guidance on avoiding TPL threading problems
+- [Sync over async](SyncOverAsync) - why blocking on an async redis call starves the thread-pool, and what to do
 - [RESP Logging](RespLogging) - capturing and validating RESP streams
+- [Analyzer rules](rules/) - the `SER3xx` suggestions reported by the analyzer shipped in the package
 
 Questions and Contributions
 ---

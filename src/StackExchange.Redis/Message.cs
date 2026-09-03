@@ -7,7 +7,12 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
+using RESPite;
+using RESPite.Internal;
+using RESPite.Messages;
 using StackExchange.Redis.Profiling;
+
+#pragma warning disable SA1117 // params all same line; just noise here
 
 namespace StackExchange.Redis
 {
@@ -34,51 +39,61 @@ namespace StackExchange.Redis
 
         public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => tail.GetHashSlot(serverSelectionStrategy);
 
-        protected override void WriteImpl(PhysicalConnection physical)
+        protected override void WriteImpl(in MessageWriter writer)
         {
-            try
-            {
-                var bridge = physical.BridgeCouldBeNull;
-                log?.LogTrace($"{bridge?.Name}: Writing: {tail.CommandAndKey}");
-            }
-            catch { }
-            tail.WriteTo(physical);
+#if VERBOSE
+            log?.LogTrace($"Writing: {tail.CommandAndKey}");
+#endif
+            tail.WriteTo(writer);
         }
         public override int ArgCount => tail.ArgCount;
 
         public ILogger Log => log;
     }
 
-    internal abstract class Message : ICompletable
+    internal abstract partial class Message : ICompletable
     {
         public readonly int Db;
 
         private uint _highIntegrityToken;
 
-        internal const CommandFlags InternalCallFlag = (CommandFlags)128;
+        internal const CommandFlags
+            InternalCallFlag = (CommandFlags)128,
+            NoFlushFlag = (CommandFlags)1024,
+            // "server specific" (bit 18): tied to a specific endpoint, never retry elsewhere. Not (yet) a
+            // public CommandFlags member - see the note on the hidden bit-18 value in CommandFlags.cs.
+            CommandServerSpecific = (CommandFlags)(1 << 18);
 
         protected RedisCommand command;
 
         private const CommandFlags AskingFlag = (CommandFlags)32,
                                    ScriptUnavailableFlag = (CommandFlags)256,
-                                   DemandSubscriptionConnection = (CommandFlags)2048;
+                                   DemandSubscriptionConnection = (CommandFlags)2048,
+                                   HandshakeCompletionFlag = (CommandFlags)4096;
 
         private const CommandFlags MaskPrimaryServerPreference = CommandFlags.DemandMaster
-                                                               | CommandFlags.DemandReplica
-                                                               | CommandFlags.PreferMaster
-                                                               | CommandFlags.PreferReplica;
+                                                                 | CommandFlags.DemandReplica
+                                                                 | CommandFlags.PreferMaster
+                                                                 | CommandFlags.PreferReplica;
 
-        private const CommandFlags UserSelectableFlags = CommandFlags.None
-                                                       | CommandFlags.DemandMaster
-                                                       | CommandFlags.DemandReplica
-                                                       | CommandFlags.PreferMaster
-                                                       | CommandFlags.PreferReplica
-#pragma warning disable CS0618 // Type or member is obsolete
-                                                       | CommandFlags.HighPriority
-#pragma warning restore CS0618
-                                                       | CommandFlags.FireAndForget
-                                                       | CommandFlags.NoRedirect
-                                                       | CommandFlags.NoScriptCache;
+        // the 5-bit retry-category severity region (bits 13-17); numerically equal to CommandRetryNever.
+        // deliberately excludes CommandServerSpecific (bit 18), which is an orthogonal flag, not part of
+        // the <=-comparable severity ladder.
+        internal const CommandFlags MaskRetryCategory = CommandFlags.CommandRetryNever;
+
+        internal const CommandFlags UserSelectableFlags = CommandFlags.None
+                                                         | CommandFlags.DemandMaster
+                                                         | CommandFlags.DemandReplica
+                                                         | CommandFlags.PreferMaster
+                                                         | CommandFlags.PreferReplica
+                                                         | (CommandFlags)1 // CommandFlags.HighPriority; obsolete-as-error, but still tolerated from callers
+                                                         | CommandFlags.FireAndForget
+                                                         | CommandFlags.NoRedirect
+                                                         | CommandFlags.NoScriptCache
+                                                         | MaskRetryCategory // caller may override the retry category...
+                                                         | CommandServerSpecific // ...and the server-specific flag
+                                                         | NoFlushFlag; // we'll allow this one even though not advertised
+
         private IResultBox? resultBox;
 
         private ResultProcessor? resultProcessor;
@@ -113,7 +128,9 @@ namespace StackExchange.Redis
             bool primaryOnly = command.IsPrimaryOnly();
             Db = db;
             this.command = command;
-            Flags = flags & UserSelectableFlags;
+            // apply the user-selectable flags, then fill in the default retry-category for this command
+            // (WithDefaultCategory is a no-op if the caller already specified a CommandRetry* category)
+            Flags = (flags & UserSelectableFlags).WithDefaultCategory(command);
             if (primaryOnly) SetPrimaryOnly();
 
             CreatedDateTime = DateTime.UtcNow;
@@ -165,6 +182,29 @@ namespace StackExchange.Redis
         public RedisCommand Command => command;
         public virtual string CommandAndKey => Command.ToString();
 
+        [AsciiHash(nameof(SubCommandMetadata))]
+        internal enum SubCommand
+        {
+            [AsciiHash("")]
+            Unknown = 0,
+            [AsciiHash("GETNAME")]
+            GetName,
+            [AsciiHash("ID")]
+            Id,
+            [AsciiHash("INFO")]
+            Info,
+            [AsciiHash("SETINFO")]
+            SetInfo,
+            [AsciiHash("SETNAME")]
+            SetName,
+        }
+
+        protected virtual bool TryGetSubCommand(out SubCommand subCommand)
+        {
+            subCommand = SubCommand.Unknown;
+            return false;
+        }
+
         /// <summary>
         /// Things with the potential to cause harm, or to reveal configuration information.
         /// </summary>
@@ -174,6 +214,21 @@ namespace StackExchange.Redis
             {
                 switch (Command)
                 {
+                    case RedisCommand.CLIENT when TryGetSubCommand(out var subCommand):
+                        switch (subCommand)
+                        {
+                            case SubCommand.GetName:
+                            case SubCommand.SetName:
+                            case SubCommand.Id:
+                            case SubCommand.Info:
+                            case SubCommand.SetInfo:
+                                return false;
+                        }
+                        return true;
+                    /* possible? reasonable?
+                    case RedisCommand.CONFIG when TryGetSubCommand(out var subCommand):
+                        // allow .Get?
+                    */
                     case RedisCommand.BGREWRITEAOF:
                     case RedisCommand.BGSAVE:
                     case RedisCommand.CLIENT:
@@ -182,6 +237,7 @@ namespace StackExchange.Redis
                     case RedisCommand.DEBUG:
                     case RedisCommand.FLUSHALL:
                     case RedisCommand.FLUSHDB:
+                    case RedisCommand.HOTKEYS:
                     case RedisCommand.INFO:
                     case RedisCommand.KEYS:
                     case RedisCommand.MONITOR:
@@ -229,39 +285,48 @@ namespace StackExchange.Redis
         public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key) =>
             new CommandKeyMessage(db, flags, command, key);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, in RedisKey key1) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0,
+            in RedisKey key1) =>
             new CommandKeyKeyMessage(db, flags, command, key0, key1);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, in RedisKey key1, in RedisValue value) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0,
+            in RedisKey key1, in RedisValue value) =>
             new CommandKeyKeyValueMessage(db, flags, command, key0, key1, value);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, in RedisKey key1, in RedisKey key2) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0,
+            in RedisKey key1, in RedisKey key2) =>
             new CommandKeyKeyKeyMessage(db, flags, command, key0, key1, key2);
 
         public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value) =>
             new CommandValueMessage(db, flags, command, value);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value) =>
             new CommandKeyValueMessage(db, flags, command, key, value);
 
         public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel) =>
             new CommandChannelMessage(db, flags, command, channel);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel, in RedisValue value) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel,
+            in RedisValue value) =>
             new CommandChannelValueMessage(db, flags, command, channel, value);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value, in RedisChannel channel) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value,
+            in RedisChannel channel) =>
             new CommandValueChannelMessage(db, flags, command, value, channel);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1) =>
             new CommandKeyValueValueMessage(db, flags, command, key, value0, value1);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue value2) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue value2) =>
             new CommandKeyValueValueValueMessage(db, flags, command, key, value0, value1, value2);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, GeoEntry[] values)
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            GeoEntry[] values)
         {
-#if NET6_0_OR_GREATER
+#if NET
             ArgumentNullException.ThrowIfNull(values);
 #else
             if (values == null) throw new ArgumentNullException(nameof(values));
@@ -270,11 +335,13 @@ namespace StackExchange.Redis
             {
                 throw new ArgumentOutOfRangeException(nameof(values));
             }
+
             if (values.Length == 1)
             {
                 var value = values[0];
                 return Create(db, flags, command, key, value.Longitude, value.Latitude, value.Member);
             }
+
             var arr = new RedisValue[3 * values.Length];
             int index = 0;
             foreach (var value in values)
@@ -283,34 +350,50 @@ namespace StackExchange.Redis
                 arr[index++] = value.Latitude;
                 arr[index++] = value.Member;
             }
+
             return new CommandKeyValuesMessage(db, flags, command, key, arr);
         }
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3) =>
             new CommandKeyValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3, in RedisValue value4) =>
-            new CommandKeyValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3, value4);
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3,
+            in RedisValue value4) =>
+            new CommandKeyValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3,
+                value4);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3, in RedisValue value4, in RedisValue value5) =>
-            new CommandKeyValueValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3, value4, value5);
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3,
+            in RedisValue value4, in RedisValue value5) =>
+            new CommandKeyValueValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3,
+                value4, value5);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3, in RedisValue value4, in RedisValue value5, in RedisValue value6) =>
-            new CommandKeyValueValueValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2, value3, value4, value5, value6);
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3,
+            in RedisValue value4, in RedisValue value5, in RedisValue value6) =>
+            new CommandKeyValueValueValueValueValueValueValueMessage(db, flags, command, key, value0, value1, value2,
+                value3, value4, value5, value6);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0, in RedisValue value1) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0,
+            in RedisValue value1) =>
             new CommandValueValueMessage(db, flags, command, value0, value1);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value, in RedisKey key) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value,
+            in RedisKey key) =>
             new CommandValueKeyMessage(db, flags, command, value, key);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0, in RedisValue value1, in RedisValue value2) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0,
+            in RedisValue value1, in RedisValue value2) =>
             new CommandValueValueValueMessage(db, flags, command, value0, value1, value2);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0, in RedisValue value1, in RedisValue value2, in RedisValue value3, in RedisValue value4) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisValue value0,
+            in RedisValue value1, in RedisValue value2, in RedisValue value3, in RedisValue value4) =>
             new CommandValueValueValueValueValueMessage(db, flags, command, value0, value1, value2, value3, value4);
 
-        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, in RedisValue[] values) =>
+        public static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            in RedisValue value0, in RedisValue value1, in RedisValue[] values) =>
             new CommandKeyValueValueValuesMessage(db, flags, command, key, value0, value1, values);
 
         public static Message Create(
@@ -344,7 +427,8 @@ namespace StackExchange.Redis
             in RedisValue value1,
             in RedisValue value2,
             in RedisValue value3) =>
-            new CommandKeyKeyValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2, value3);
+            new CommandKeyKeyValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2,
+                value3);
 
         public static Message Create(
             int db,
@@ -357,7 +441,8 @@ namespace StackExchange.Redis
             in RedisValue value2,
             in RedisValue value3,
             in RedisValue value4) =>
-            new CommandKeyKeyValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2, value3, value4);
+            new CommandKeyKeyValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2,
+                value3, value4);
 
         public static Message Create(
             int db,
@@ -371,7 +456,8 @@ namespace StackExchange.Redis
             in RedisValue value3,
             in RedisValue value4,
             in RedisValue value5) =>
-            new CommandKeyKeyValueValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2, value3, value4, value5);
+            new CommandKeyKeyValueValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1,
+                value2, value3, value4, value5);
 
         public static Message Create(
             int db,
@@ -386,10 +472,21 @@ namespace StackExchange.Redis
             in RedisValue value4,
             in RedisValue value5,
             in RedisValue value6) =>
-            new CommandKeyKeyValueValueValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1, value2, value3, value4, value5, value6);
+            new CommandKeyKeyValueValueValueValueValueValueValueMessage(db, flags, command, key0, key1, value0, value1,
+                value2, value3, value4, value5, value6);
 
-        public static Message CreateInSlot(int db, int slot, CommandFlags flags, RedisCommand command, RedisValue[] values) =>
+        public static Message CreateInSlot(int db, int slot, CommandFlags flags, RedisCommand command,
+            RedisValue[] values) =>
             new CommandSlotValuesMessage(db, slot, flags, command, values);
+
+        // The key here is used only to route the message in cluster mode; it is not written as an argument.
+        // Use this for command shapes where the key appears in a non-standard position in the values payload.
+        public static Message CreateInKeySlot(int db, in RedisKey key, CommandFlags flags, RedisCommand command, RedisValue[] values) =>
+            new CommandKeySlotValuesMessage(db, flags, command, key, values);
+
+        public static Message Create(int db, CommandFlags flags, RedisCommand command,
+            KeyValuePair<RedisKey, RedisValue>[] values, Expiration expiry, When when)
+            => new MultiSetMessage(db, flags, command, values, expiry, when);
 
         /// <summary>Gets whether this is primary-only.</summary>
         /// <remarks>
@@ -405,7 +502,8 @@ namespace StackExchange.Redis
             sb.Append(CommandAndKey);
         }
 
-        public virtual int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => ServerSelectionStrategy.NoSlot;
+        public virtual int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) =>
+            ServerSelectionStrategy.NoSlot;
 
         /// <summary>
         /// This does a few important things:
@@ -434,24 +532,28 @@ namespace StackExchange.Redis
 
         bool ICompletable.TryComplete(bool isAsync)
         {
-            Complete();
+            Complete(null);
             return true;
         }
 
-        public void Complete()
+        public void Complete(PhysicalConnection? connection)
         {
             // Ensure we can never call Complete on the same resultBox from two threads by grabbing it now
             var currBox = Interlocked.Exchange(ref resultBox, null);
 
             // set the completion/performance data
             performance?.SetCompleted();
-
+            if (currBox is not null)
+            {
+                connection?.ObserveMessageResult(currBox.Fault);
+            }
             currBox?.ActivateContinuations();
         }
 
         internal bool ResultBoxIsAsync => Volatile.Read(ref resultBox)?.IsAsync == true;
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, RedisKey[] keys) => keys.Length switch
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            RedisKey[] keys) => keys.Length switch
         {
             0 => new CommandKeyMessage(db, flags, command, key),
             1 => new CommandKeyKeyMessage(db, flags, command, key, keys[0]),
@@ -459,29 +561,33 @@ namespace StackExchange.Redis
             _ => new CommandKeyKeysMessage(db, flags, command, key, keys),
         };
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, IList<RedisKey> keys) => keys.Count switch
-        {
-            0 => new CommandMessage(db, flags, command),
-            1 => new CommandKeyMessage(db, flags, command, keys[0]),
-            2 => new CommandKeyKeyMessage(db, flags, command, keys[0], keys[1]),
-            3 => new CommandKeyKeyKeyMessage(db, flags, command, keys[0], keys[1], keys[2]),
-            _ => new CommandKeysMessage(db, flags, command, (keys as RedisKey[]) ?? keys.ToArray()),
-        };
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, IList<RedisKey> keys) =>
+            keys.Count switch
+            {
+                0 => new CommandMessage(db, flags, command),
+                1 => new CommandKeyMessage(db, flags, command, keys[0]),
+                2 => new CommandKeyKeyMessage(db, flags, command, keys[0], keys[1]),
+                3 => new CommandKeyKeyKeyMessage(db, flags, command, keys[0], keys[1], keys[2]),
+                _ => new CommandKeysMessage(db, flags, command, (keys as RedisKey[]) ?? keys.ToArray()),
+            };
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, IList<RedisValue> values) => values.Count switch
-        {
-            0 => new CommandMessage(db, flags, command),
-            1 => new CommandValueMessage(db, flags, command, values[0]),
-            2 => new CommandValueValueMessage(db, flags, command, values[0], values[1]),
-            3 => new CommandValueValueValueMessage(db, flags, command, values[0], values[1], values[2]),
-            // no 4; not worth adding
-            5 => new CommandValueValueValueValueValueMessage(db, flags, command, values[0], values[1], values[2], values[3], values[4]),
-            _ => new CommandValuesMessage(db, flags, command, (values as RedisValue[]) ?? values.ToArray()),
-        };
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, IList<RedisValue> values) =>
+            values.Count switch
+            {
+                0 => new CommandMessage(db, flags, command),
+                1 => new CommandValueMessage(db, flags, command, values[0]),
+                2 => new CommandValueValueMessage(db, flags, command, values[0], values[1]),
+                3 => new CommandValueValueValueMessage(db, flags, command, values[0], values[1], values[2]),
+                // no 4; not worth adding
+                5 => new CommandValueValueValueValueValueMessage(db, flags, command, values[0], values[1], values[2],
+                    values[3], values[4]),
+                _ => new CommandValuesMessage(db, flags, command, (values as RedisValue[]) ?? values.ToArray()),
+            };
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key, RedisValue[] values)
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key,
+            RedisValue[] values)
         {
-#if NET6_0_OR_GREATER
+#if NET
             ArgumentNullException.ThrowIfNull(values);
 #else
             if (values == null) throw new ArgumentNullException(nameof(values));
@@ -492,14 +598,16 @@ namespace StackExchange.Redis
                 1 => new CommandKeyValueMessage(db, flags, command, key, values[0]),
                 2 => new CommandKeyValueValueMessage(db, flags, command, key, values[0], values[1]),
                 3 => new CommandKeyValueValueValueMessage(db, flags, command, key, values[0], values[1], values[2]),
-                4 => new CommandKeyValueValueValueValueMessage(db, flags, command, key, values[0], values[1], values[2], values[3]),
+                4 => new CommandKeyValueValueValueValueMessage(db, flags, command, key, values[0], values[1], values[2],
+                    values[3]),
                 _ => new CommandKeyValuesMessage(db, flags, command, key, values),
             };
         }
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, in RedisKey key1, RedisValue[] values)
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0,
+            in RedisKey key1, RedisValue[] values)
         {
-#if NET6_0_OR_GREATER
+#if NET
             ArgumentNullException.ThrowIfNull(values);
 #else
             if (values == null) throw new ArgumentNullException(nameof(values));
@@ -509,18 +617,24 @@ namespace StackExchange.Redis
                 0 => new CommandKeyKeyMessage(db, flags, command, key0, key1),
                 1 => new CommandKeyKeyValueMessage(db, flags, command, key0, key1, values[0]),
                 2 => new CommandKeyKeyValueValueMessage(db, flags, command, key0, key1, values[0], values[1]),
-                3 => new CommandKeyKeyValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1], values[2]),
-                4 => new CommandKeyKeyValueValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1], values[2], values[3]),
-                5 => new CommandKeyKeyValueValueValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1], values[2], values[3], values[4]),
-                6 => new CommandKeyKeyValueValueValueValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1], values[2], values[3], values[4], values[5]),
-                7 => new CommandKeyKeyValueValueValueValueValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1], values[2], values[3], values[4], values[5], values[6]),
+                3 => new CommandKeyKeyValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1],
+                    values[2]),
+                4 => new CommandKeyKeyValueValueValueValueMessage(db, flags, command, key0, key1, values[0], values[1],
+                    values[2], values[3]),
+                5 => new CommandKeyKeyValueValueValueValueValueMessage(db, flags, command, key0, key1, values[0],
+                    values[1], values[2], values[3], values[4]),
+                6 => new CommandKeyKeyValueValueValueValueValueValueMessage(db, flags, command, key0, key1, values[0],
+                    values[1], values[2], values[3], values[4], values[5]),
+                7 => new CommandKeyKeyValueValueValueValueValueValueValueMessage(db, flags, command, key0, key1,
+                    values[0], values[1], values[2], values[3], values[4], values[5], values[6]),
                 _ => new CommandKeyKeyValuesMessage(db, flags, command, key0, key1, values),
             };
         }
 
-        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, RedisValue[] values, in RedisKey key1)
+        internal static Message Create(int db, CommandFlags flags, RedisCommand command, in RedisKey key0,
+            RedisValue[] values, in RedisKey key1)
         {
-#if NET6_0_OR_GREATER
+#if NET
             ArgumentNullException.ThrowIfNull(values);
 #else
             if (values == null) throw new ArgumentNullException(nameof(values));
@@ -532,6 +646,12 @@ namespace StackExchange.Redis
         {
             // for the purposes of the switch, we only care about two bits
             return flags & MaskPrimaryServerPreference;
+        }
+
+        internal static CommandFlags GetRetryCategory(CommandFlags flags)
+        {
+            // isolate the retry-category region; 0 here means "not specified" (resolved downstream)
+            return flags & MaskRetryCategory;
         }
 
         internal static bool RequiresDatabase(RedisCommand command)
@@ -550,6 +670,7 @@ namespace StackExchange.Redis
                 case RedisCommand.ECHO:
                 case RedisCommand.FLUSHALL:
                 case RedisCommand.HELLO:
+                case RedisCommand.HOTKEYS:
                 case RedisCommand.INFO:
                 case RedisCommand.LASTSAVE:
                 case RedisCommand.LATENCY:
@@ -589,43 +710,64 @@ namespace StackExchange.Redis
         internal static CommandFlags SetPrimaryReplicaFlags(CommandFlags everything, CommandFlags primaryReplica)
         {
             // take away the two flags we don't want, and add back the ones we care about
-            return (everything & ~(CommandFlags.DemandMaster | CommandFlags.DemandReplica | CommandFlags.PreferMaster | CommandFlags.PreferReplica))
-                            | primaryReplica;
+            return (everything & ~(CommandFlags.DemandMaster | CommandFlags.DemandReplica | CommandFlags.PreferMaster |
+                                   CommandFlags.PreferReplica))
+                   | primaryReplica;
         }
 
         internal void Cancel() => resultBox?.Cancel();
 
         // true if ready to be completed (i.e. false if re-issued to another server)
-        internal bool ComputeResult(PhysicalConnection connection, in RawResult result)
+        internal bool ComputeResult(PhysicalConnection connection, ref RespReader reader)
         {
+            var prefix = RespPrefix.None;
+
+            // intentionally "frame" is an isolated copy
             var box = resultBox;
             try
             {
-                if (box != null && box.IsFaulted) return false; // already failed (timeout, etc)
-                if (resultProcessor == null) return true;
+                // we don't want to mutate reader, so that processors can consume attributes; however,
+                // we also don't want to force the entire reader to copy each time, so: snapshot
+                // just the prefix
+                prefix = reader.GetFirstPrefix();
+
+                if (box != null && box.IsFaulted)
+                {
+                    connection.OnDetailLog($"already faulted for {Command}");
+                    return false; // already failed (timeout, etc)
+                }
+
+                if (resultProcessor == null)
+                {
+                    connection.OnDetailLog($"no result processor for {Command}");
+                    return true;
+                }
 
                 // false here would be things like resends (MOVED) - the message is not yet complete
-                return resultProcessor.SetResult(connection, this, result);
+                connection.OnDetailLog($"computing result for {Command} with {resultProcessor.GetType().Name}");
+                return resultProcessor.SetResult(connection, this, ref reader);
             }
             catch (Exception ex)
             {
-                ex.Data.Add("got", result.ToString());
+                connection?.OnDetailLog($"{ex.GetType().Name}: {ex.Message}");
+                ex.Data.Add("got", prefix.ToString());
                 connection?.BridgeCouldBeNull?.Multiplexer?.OnMessageFaulted(this, ex);
                 box?.SetException(ex);
                 return box != null; // we still want to pulse/complete
             }
         }
 
-        internal void Fail(ConnectionFailureType failure, Exception? innerException, string? annotation, ConnectionMultiplexer? muxer)
+        internal void Fail(ConnectionFailureType failure, Exception? innerException, string? annotation,
+            ConnectionMultiplexer? muxer)
         {
             PhysicalConnection.IdentifyFailureType(innerException, ref failure);
             resultProcessor?.ConnectionFail(this, failure, innerException, annotation, muxer);
         }
 
-        internal virtual void SetExceptionAndComplete(Exception exception, PhysicalBridge? bridge)
+        internal virtual void SetExceptionAndComplete(Exception exception, PhysicalConnection? connection)
         {
             resultBox?.SetException(exception);
-            Complete();
+            Complete(connection);
         }
 
         internal bool TrySetResult<T>(T value)
@@ -635,6 +777,7 @@ namespace StackExchange.Redis
                 typed.SetResult(value);
                 return true;
             }
+
             return false;
         }
 
@@ -702,8 +845,11 @@ namespace StackExchange.Redis
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void SetWriteTime()
         {
-            _writeTickCount = Environment.TickCount; // note this might be reset if we resend a message, cluster-moved etc; I'm OK with that
+            _writeTickCount =
+                Environment
+                    .TickCount; // note this might be reset if we resend a message, cluster-moved etc; I'm OK with that
         }
+
         private int _writeTickCount;
 
         public int GetWriteTime() => Volatile.Read(ref _writeTickCount);
@@ -714,6 +860,13 @@ namespace StackExchange.Redis
         internal bool IsForSubscriptionBridge => (Flags & DemandSubscriptionConnection) != 0;
 
         public virtual string CommandString => Command.ToString();
+
+        internal bool IsFlushRequiredAsync => (Flags & NoFlushFlag) == 0;
+
+        // for sync to skip flush, we need *both* NoFlush and FireAndForget; we absolutely need to flush if someone is doing a sync call
+        internal bool IsFlushRequiredSync => (Flags & (NoFlushFlag | CommandFlags.FireAndForget)) != (NoFlushFlag | CommandFlags.FireAndForget);
+
+        public bool IsHandshakeCompletion => (Flags & HandshakeCompletionFlag) != 0;
 
         /// <summary>
         /// Sends this command to the subscription connection rather than the interactive.
@@ -736,6 +889,8 @@ namespace StackExchange.Redis
             if (value) Flags |= AskingFlag; // the bits giveth
             else Flags &= ~AskingFlag; // and the bits taketh away
         }
+
+        internal void SetHandshakeCompletion() => Flags |= HandshakeCompletionFlag;
 
         internal void SetNoRedirect() => Flags |= CommandFlags.NoRedirect;
 
@@ -770,19 +925,75 @@ namespace StackExchange.Redis
             this.resultProcessor = resultProcessor;
         }
 
-        protected abstract void WriteImpl(PhysicalConnection physical);
+        internal void WriteTo(in MessageWriter writer) => WriteImpl(in writer);
+        protected abstract void WriteImpl(in MessageWriter writer);
+
+        internal string GetRespString(PhysicalConnection connection)
+        {
+            MessageWriter writer = new MessageWriter(connection, BlockBufferSerializer.Shared);
+            try
+            {
+                WriteImpl(in writer);
+                var bytes = MessageWriter.FlushBlockBuffer();
+                string s = Encoding.UTF8.GetString(bytes.Span);
+                MessageWriter.ReleaseBlockBuffer(bytes);
+                return s;
+            }
+            finally
+            {
+                MessageWriter.RevertBlockBuffer();
+            }
+        }
 
         internal void WriteTo(PhysicalConnection physical)
         {
+            MessageWriter writer = new MessageWriter(physical, physical.Output);
             try
             {
-                WriteImpl(physical);
+                WriteImpl(in writer);
             }
             catch (Exception ex) when (ex is not RedisCommandException) // these have specific meaning; don't wrap
             {
-                physical?.OnInternalError(ex);
-                Fail(ConnectionFailureType.InternalFailure, ex, null, physical?.BridgeCouldBeNull?.Multiplexer);
+                FailWrite(physical, ex);
+                // Re-throw so the outer write path (PhysicalBridge.HandleWriteException) can tear down the
+                // connection. A partial write would otherwise leave bytes on the wire while the response
+                // queue still considers the slot healthy, allowing a subsequent reply to match the wrong
+                // in-flight message.
+                throw;
             }
+        }
+
+        internal void WriteTo(PhysicalConnection physical, CommandMap commandMap, byte[]? channelPrefix)
+        {
+            MessageWriter writer = new MessageWriter(channelPrefix, commandMap, physical.Output);
+            try
+            {
+                WriteImpl(in writer);
+            }
+            catch (Exception ex) when (ex is not RedisCommandException) // these have specific meaning; don't wrap
+            {
+                FailWrite(physical, ex);
+                // Re-throw so the outer write path (PhysicalBridge.HandleWriteException) can tear down the
+                // connection. A partial write would otherwise leave bytes on the wire while the response
+                // queue still considers the slot healthy, allowing a subsequent reply to match the wrong
+                // in-flight message.
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Fail this message after a write fault, only shouting via OnInternalError when it really was an internal
+        /// fault; see <see cref="PhysicalConnection.ClassifyWriteFailure"/>.
+        /// </summary>
+        private void FailWrite(PhysicalConnection? physical, Exception ex)
+        {
+            var failureType = PhysicalConnection.ClassifyWriteFailure(ex, physical);
+            if (failureType == ConnectionFailureType.InternalFailure)
+            {
+                physical?.OnInternalError(ex);
+            }
+
+            Fail(failureType, ex, null, physical?.BridgeCouldBeNull?.Multiplexer);
         }
 
         private static ReadOnlySpan<byte> ChecksumTemplate => "$4\r\nXXXX\r\n"u8;
@@ -790,20 +1001,20 @@ namespace StackExchange.Redis
         internal void WriteHighIntegrityChecksumRequest(PhysicalConnection physical)
         {
             Debug.Assert(IsHighIntegrity, "should only be used for high-integrity");
+            var writer = new MessageWriter(physical, physical.Output);
             try
             {
-                physical.WriteHeader(RedisCommand.ECHO, 1); // use WriteHeader to allow command-rewrite
+                writer.WriteHeader(RedisCommand.ECHO, 1); // use WriteHeader to allow command-rewrite
 
                 Span<byte> chk = stackalloc byte[10];
                 Debug.Assert(ChecksumTemplate.Length == chk.Length, "checksum template length error");
                 ChecksumTemplate.CopyTo(chk);
                 BinaryPrimitives.WriteUInt32LittleEndian(chk.Slice(4, 4), _highIntegrityToken);
-                physical.WriteRaw(chk);
+                writer.WriteRaw(chk);
             }
             catch (Exception ex)
             {
-                physical?.OnInternalError(ex);
-                Fail(ConnectionFailureType.InternalFailure, ex, null, physical?.BridgeCouldBeNull?.Multiplexer);
+                FailWrite(physical, ex);
             }
         }
 
@@ -836,27 +1047,27 @@ namespace StackExchange.Redis
                     return count;
                 }
             }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.WriteBulkString(_protocolVersion);
+                writer.WriteHeader(Command, ArgCount);
+                writer.WriteBulkString(_protocolVersion);
                 if (!string.IsNullOrWhiteSpace(_password))
                 {
-                    physical.WriteBulkString(RedisLiterals.AUTH);
-                    physical.WriteBulkString(string.IsNullOrWhiteSpace(_username) ? RedisLiterals.@default : _username);
-                    physical.WriteBulkString(_password);
+                    writer.WriteRaw("$4\r\nAUTH\r\n"u8);
+                    writer.WriteBulkString(string.IsNullOrWhiteSpace(_username) ? RedisLiterals.@default : _username);
+                    writer.WriteBulkString(_password);
                 }
                 if (!string.IsNullOrWhiteSpace(_clientName))
                 {
-                    physical.WriteBulkString(RedisLiterals.SETNAME);
-                    physical.WriteBulkString(_clientName);
+                    writer.WriteRaw("$7\r\nSETNAME\r\n"u8);
+                    writer.WriteBulkString(_clientName);
                 }
             }
         }
 
         internal abstract class CommandChannelBase : Message
         {
-            protected readonly RedisChannel Channel;
+            internal readonly RedisChannel Channel;
 
             protected CommandChannelBase(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel) : base(db, flags, command)
             {
@@ -866,7 +1077,8 @@ namespace StackExchange.Redis
 
             public override string CommandAndKey => Command + " " + Channel;
 
-            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => serverSelectionStrategy.HashSlot(Channel);
+            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
+                => Channel.IsKeyRouted ? serverSelectionStrategy.HashSlot(Channel) : ServerSelectionStrategy.NoSlot;
         }
 
         internal abstract class CommandKeyBase : Message
@@ -886,12 +1098,13 @@ namespace StackExchange.Redis
 
         private sealed class CommandChannelMessage : CommandChannelBase
         {
-            public CommandChannelMessage(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel) : base(db, flags, command, channel)
+            public CommandChannelMessage(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel)
+                : base(db, flags, command, channel)
             { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 1);
-                physical.Write(Channel);
+                writer.WriteHeader(Command, 1);
+                writer.Write(Channel);
             }
             public override int ArgCount => 1;
         }
@@ -899,17 +1112,18 @@ namespace StackExchange.Redis
         private sealed class CommandChannelValueMessage : CommandChannelBase
         {
             private readonly RedisValue value;
-            public CommandChannelValueMessage(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel, in RedisValue value) : base(db, flags, command, channel)
+            public CommandChannelValueMessage(int db, CommandFlags flags, RedisCommand command, in RedisChannel channel, in RedisValue value)
+                : base(db, flags, command, channel)
             {
                 value.AssertNotNull();
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.Write(Channel);
-                physical.WriteBulkString(value);
+                writer.WriteHeader(Command, 2);
+                writer.Write(Channel);
+                writer.WriteBulkString(value);
             }
             public override int ArgCount => 2;
         }
@@ -932,12 +1146,12 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key2);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 3);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.Write(key2);
+                writer.WriteHeader(Command, 3);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.Write(key2);
             }
             public override int ArgCount => 3;
         }
@@ -957,11 +1171,11 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key1);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.Write(Key);
-                physical.Write(key1);
+                writer.WriteHeader(Command, 2);
+                writer.Write(Key);
+                writer.Write(key1);
             }
             public override int ArgCount => 2;
         }
@@ -971,30 +1185,22 @@ namespace StackExchange.Redis
             private readonly RedisKey[] keys;
             public CommandKeyKeysMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key, RedisKey[] keys) : base(db, flags, command, key)
             {
-                for (int i = 0; i < keys.Length; i++)
-                {
-                    keys[i].AssertNotNull();
-                }
-                this.keys = keys;
+                this.keys = keys.AssertAllNonNull();
             }
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
             {
                 var slot = serverSelectionStrategy.HashSlot(Key);
-                for (int i = 0; i < keys.Length; i++)
-                {
-                    slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
-                }
-                return slot;
+                return serverSelectionStrategy.CombineSlot(slot, keys);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(command, keys.Length + 1);
-                physical.Write(Key);
+                writer.WriteHeader(command, keys.Length + 1);
+                writer.Write(Key);
                 for (int i = 0; i < keys.Length; i++)
                 {
-                    physical.Write(keys[i]);
+                    writer.Write(keys[i]);
                 }
             }
             public override int ArgCount => keys.Length + 1;
@@ -1009,12 +1215,12 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 3);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value);
+                writer.WriteHeader(Command, 3);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value);
             }
 
             public override int ArgCount => 3;
@@ -1024,10 +1230,10 @@ namespace StackExchange.Redis
         {
             public CommandKeyMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key) : base(db, flags, command, key)
             { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 1);
-                physical.Write(Key);
+                writer.WriteHeader(Command, 1);
+                writer.Write(Key);
             }
             public override int ArgCount => 1;
         }
@@ -1037,19 +1243,15 @@ namespace StackExchange.Redis
             private readonly RedisValue[] values;
             public CommandValuesMessage(int db, CommandFlags flags, RedisCommand command, RedisValue[] values) : base(db, flags, command)
             {
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-                this.values = values;
+                this.values = values.AssertAllNonNull();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(command, values.Length);
+                writer.WriteHeader(command, values.Length);
                 for (int i = 0; i < values.Length; i++)
                 {
-                    physical.WriteBulkString(values[i]);
+                    writer.WriteBulkString(values[i]);
                 }
             }
             public override int ArgCount => values.Length;
@@ -1060,29 +1262,17 @@ namespace StackExchange.Redis
             private readonly RedisKey[] keys;
             public CommandKeysMessage(int db, CommandFlags flags, RedisCommand command, RedisKey[] keys) : base(db, flags, command)
             {
-                for (int i = 0; i < keys.Length; i++)
-                {
-                    keys[i].AssertNotNull();
-                }
-                this.keys = keys;
+                this.keys = keys.AssertAllNonNull();
             }
 
-            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
-            {
-                int slot = ServerSelectionStrategy.NoSlot;
-                for (int i = 0; i < keys.Length; i++)
-                {
-                    slot = serverSelectionStrategy.CombineSlot(slot, keys[i]);
-                }
-                return slot;
-            }
+            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => serverSelectionStrategy.HashSlot(keys);
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(command, keys.Length);
+                writer.WriteHeader(command, keys.Length);
                 for (int i = 0; i < keys.Length; i++)
                 {
-                    physical.Write(keys[i]);
+                    writer.Write(keys[i]);
                 }
             }
             public override int ArgCount => keys.Length;
@@ -1097,11 +1287,11 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.Write(Key);
-                physical.WriteBulkString(value);
+                writer.WriteHeader(Command, 2);
+                writer.Write(Key);
+                writer.WriteBulkString(value);
             }
             public override int ArgCount => 2;
         }
@@ -1112,11 +1302,7 @@ namespace StackExchange.Redis
             private readonly RedisValue[] values;
             public CommandKeyValuesKeyMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key0, RedisValue[] values, in RedisKey key1) : base(db, flags, command, key0)
             {
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-                this.values = values;
+                this.values = values.AssertAllNonNull();
                 key1.AssertNotNull();
                 this.key1 = key1;
             }
@@ -1127,12 +1313,12 @@ namespace StackExchange.Redis
                 return serverSelectionStrategy.CombineSlot(slot, key1);
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, values.Length + 2);
-                physical.Write(Key);
-                for (int i = 0; i < values.Length; i++) physical.WriteBulkString(values[i]);
-                physical.Write(key1);
+                writer.WriteHeader(Command, values.Length + 2);
+                writer.Write(Key);
+                for (int i = 0; i < values.Length; i++) writer.WriteBulkString(values[i]);
+                writer.Write(key1);
             }
             public override int ArgCount => values.Length + 2;
         }
@@ -1142,18 +1328,14 @@ namespace StackExchange.Redis
             private readonly RedisValue[] values;
             public CommandKeyValuesMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key, RedisValue[] values) : base(db, flags, command, key)
             {
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-                this.values = values;
+                this.values = values.AssertAllNonNull();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, values.Length + 1);
-                physical.Write(Key);
-                for (int i = 0; i < values.Length; i++) physical.WriteBulkString(values[i]);
+                writer.WriteHeader(Command, values.Length + 1);
+                writer.Write(Key);
+                for (int i = 0; i < values.Length; i++) writer.WriteBulkString(values[i]);
             }
             public override int ArgCount => values.Length + 1;
         }
@@ -1164,22 +1346,17 @@ namespace StackExchange.Redis
             private readonly RedisValue[] values;
             public CommandKeyKeyValuesMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisKey key1, RedisValue[] values) : base(db, flags, command, key)
             {
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-
                 key1.AssertNotNull();
                 this.key1 = key1;
-                this.values = values;
+                this.values = values.AssertAllNonNull();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, values.Length + 2);
-                physical.Write(Key);
-                physical.Write(key1);
-                for (int i = 0; i < values.Length; i++) physical.WriteBulkString(values[i]);
+                writer.WriteHeader(Command, values.Length + 2);
+                writer.Write(Key);
+                writer.Write(key1);
+                for (int i = 0; i < values.Length; i++) writer.WriteBulkString(values[i]);
             }
             public override int ArgCount => values.Length + 1;
         }
@@ -1191,25 +1368,20 @@ namespace StackExchange.Redis
             private readonly RedisValue[] values;
             public CommandKeyValueValueValuesMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key, in RedisValue value0, in RedisValue value1, RedisValue[] values) : base(db, flags, command, key)
             {
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-
                 value0.AssertNotNull();
                 value1.AssertNotNull();
                 this.value0 = value0;
                 this.value1 = value1;
-                this.values = values;
+                this.values = values.AssertAllNonNull();
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, values.Length + 3);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                for (int i = 0; i < values.Length; i++) physical.WriteBulkString(values[i]);
+                writer.WriteHeader(Command, values.Length + 3);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                for (int i = 0; i < values.Length; i++) writer.WriteBulkString(values[i]);
             }
             public override int ArgCount => values.Length + 3;
         }
@@ -1225,12 +1397,12 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 3);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
+                writer.WriteHeader(Command, 3);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
             }
             public override int ArgCount => 3;
         }
@@ -1248,13 +1420,13 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 4);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
+                writer.WriteHeader(Command, 4);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
             }
             public override int ArgCount => 4;
         }
@@ -1274,14 +1446,14 @@ namespace StackExchange.Redis
                 this.value3 = value3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 5);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
+                writer.WriteHeader(Command, 5);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
             }
             public override int ArgCount => 5;
         }
@@ -1303,15 +1475,15 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 6);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
+                writer.WriteHeader(Command, 6);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
             }
             public override int ArgCount => 6;
         }
@@ -1336,16 +1508,16 @@ namespace StackExchange.Redis
                 this.value5 = value5;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
-                physical.WriteBulkString(value5);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
+                writer.WriteBulkString(value5);
             }
             public override int ArgCount => 7;
         }
@@ -1372,17 +1544,17 @@ namespace StackExchange.Redis
                 this.value6 = value6;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
-                physical.WriteBulkString(value5);
-                physical.WriteBulkString(value6);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
+                writer.WriteBulkString(value5);
+                writer.WriteBulkString(value6);
             }
             public override int ArgCount => 8;
         }
@@ -1409,13 +1581,13 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
             }
 
             public override int ArgCount => 4;
@@ -1446,14 +1618,14 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
             }
 
             public override int ArgCount => 5;
@@ -1487,15 +1659,15 @@ namespace StackExchange.Redis
                 this.value3 = value3;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
             }
 
             public override int ArgCount => 6;
@@ -1532,16 +1704,16 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
             }
 
             public override int ArgCount => 7;
@@ -1581,17 +1753,17 @@ namespace StackExchange.Redis
                 this.value5 = value5;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
-                physical.WriteBulkString(value5);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
+                writer.WriteBulkString(value5);
             }
 
             public override int ArgCount => 8;
@@ -1634,18 +1806,18 @@ namespace StackExchange.Redis
                 this.value6 = value6;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, ArgCount);
-                physical.Write(Key);
-                physical.Write(key1);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
-                physical.WriteBulkString(value5);
-                physical.WriteBulkString(value6);
+                writer.WriteHeader(Command, ArgCount);
+                writer.Write(Key);
+                writer.Write(key1);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
+                writer.WriteBulkString(value5);
+                writer.WriteBulkString(value6);
             }
 
             public override int ArgCount => 9;
@@ -1654,9 +1826,9 @@ namespace StackExchange.Redis
         private sealed class CommandMessage : Message
         {
             public CommandMessage(int db, CommandFlags flags, RedisCommand command) : base(db, flags, command) { }
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 0);
+                writer.WriteHeader(Command, 0);
             }
             public override int ArgCount => 0;
         }
@@ -1670,40 +1842,108 @@ namespace StackExchange.Redis
                 : base(db, flags, command)
             {
                 this.slot = slot;
-                for (int i = 0; i < values.Length; i++)
-                {
-                    values[i].AssertNotNull();
-                }
-                this.values = values;
+                this.values = values.AssertAllNonNull();
             }
 
             public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy) => slot;
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(command, values.Length);
+                writer.WriteHeader(command, values.Length);
                 for (int i = 0; i < values.Length; i++)
                 {
-                    physical.WriteBulkString(values[i]);
+                    writer.WriteBulkString(values[i]);
                 }
             }
             public override int ArgCount => values.Length;
         }
 
+        private sealed class CommandKeySlotValuesMessage : CommandKeyBase
+        {
+            private readonly RedisValue[] values;
+
+            public CommandKeySlotValuesMessage(int db, CommandFlags flags, RedisCommand command, in RedisKey key, RedisValue[] values)
+                : base(db, flags, command, key)
+            {
+                // Key is captured by CommandKeyBase for routing only; values are the complete serialized arguments.
+                this.values = values.AssertAllNonNull();
+            }
+
+            protected override void WriteImpl(in MessageWriter writer)
+            {
+                writer.WriteHeader(command, values.Length);
+                for (int i = 0; i < values.Length; i++)
+                {
+                    writer.WriteBulkString(values[i]);
+                }
+            }
+            public override int ArgCount => values.Length;
+        }
+
+        private sealed class MultiSetMessage(int db, CommandFlags flags, RedisCommand command, KeyValuePair<RedisKey, RedisValue>[] values, Expiration expiry, When when) : Message(db, flags, command)
+        {
+            public override int GetHashSlot(ServerSelectionStrategy serverSelectionStrategy)
+            {
+                int slot = ServerSelectionStrategy.NoSlot;
+                for (int i = 0; i < values.Length; i++)
+                {
+                    slot = serverSelectionStrategy.CombineSlot(slot, values[i].Key);
+                }
+                return slot;
+            }
+
+            // we support:
+            // - MSET {key1} {value1} [{key2} {value2}...]
+            // - MSETNX {key1} {value1} [{key2} {value2}...]
+            // - MSETEX {count} {key1} {value1} [{key2} {value2}...] [standard-expiry-tokens]
+            public override int ArgCount => Command == RedisCommand.MSETEX
+                ? (1 + (2 * values.Length) + expiry.GetTokenCount(false) + (when is When.Exists or When.NotExists ? 1 : 0))
+                : (2 * values.Length); // MSET/MSETNX only support simple syntax
+
+            protected override void WriteImpl(in MessageWriter writer)
+            {
+                var cmd = Command;
+                writer.WriteHeader(cmd, ArgCount);
+                if (cmd == RedisCommand.MSETEX) // need count prefix
+                {
+                    writer.WriteBulkString(values.Length);
+                }
+                for (int i = 0; i < values.Length; i++)
+                {
+                    writer.Write(values[i].Key);
+                    writer.WriteBulkString(values[i].Value);
+                }
+                if (cmd == RedisCommand.MSETEX) // allow expiry/mode tokens
+                {
+                    expiry.WriteTo(writer);
+                    switch (when)
+                    {
+                        case When.Exists:
+                            writer.WriteRaw("$2\r\nXX\r\n"u8);
+                            break;
+                        case When.NotExists:
+                            writer.WriteRaw("$2\r\nNX\r\n"u8);
+                            break;
+                    }
+                }
+            }
+        }
+
         private sealed class CommandValueChannelMessage : CommandChannelBase
         {
             private readonly RedisValue value;
-            public CommandValueChannelMessage(int db, CommandFlags flags, RedisCommand command, in RedisValue value, in RedisChannel channel) : base(db, flags, command, channel)
+            public CommandValueChannelMessage(int db, CommandFlags flags, RedisCommand command, in RedisValue value, in RedisChannel channel)
+                : base(db, flags, command, channel)
             {
                 value.AssertNotNull();
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.WriteBulkString(value);
-                physical.Write(Channel);
+                writer.WriteHeader(Command, 2);
+                writer.WriteBulkString(value);
+                writer.Write(Channel);
             }
             public override int ArgCount => 2;
         }
@@ -1724,11 +1964,11 @@ namespace StackExchange.Redis
                 sb.Append(" (").Append((string?)value).Append(')');
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.WriteBulkString(value);
-                physical.Write(Key);
+                writer.WriteHeader(Command, 2);
+                writer.WriteBulkString(value);
+                writer.Write(Key);
             }
             public override int ArgCount => 2;
         }
@@ -1742,10 +1982,10 @@ namespace StackExchange.Redis
                 this.value = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 1);
-                physical.WriteBulkString(value);
+                writer.WriteHeader(Command, 1);
+                writer.WriteBulkString(value);
             }
             public override int ArgCount => 1;
         }
@@ -1761,11 +2001,11 @@ namespace StackExchange.Redis
                 this.value1 = value1;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 2);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
+                writer.WriteHeader(Command, 2);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
             }
             public override int ArgCount => 2;
         }
@@ -1783,12 +2023,12 @@ namespace StackExchange.Redis
                 this.value2 = value2;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 3);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
+                writer.WriteHeader(Command, 3);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
             }
             public override int ArgCount => 3;
         }
@@ -1810,14 +2050,14 @@ namespace StackExchange.Redis
                 this.value4 = value4;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 5);
-                physical.WriteBulkString(value0);
-                physical.WriteBulkString(value1);
-                physical.WriteBulkString(value2);
-                physical.WriteBulkString(value3);
-                physical.WriteBulkString(value4);
+                writer.WriteHeader(Command, 5);
+                writer.WriteBulkString(value0);
+                writer.WriteBulkString(value1);
+                writer.WriteBulkString(value2);
+                writer.WriteBulkString(value3);
+                writer.WriteBulkString(value4);
             }
             public override int ArgCount => 5;
         }
@@ -1828,10 +2068,10 @@ namespace StackExchange.Redis
             {
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                physical.WriteHeader(Command, 1);
-                physical.WriteBulkString(Db);
+                writer.WriteHeader(Command, 1);
+                writer.WriteBulkString(Db);
             }
             public override int ArgCount => 1;
         }
@@ -1843,7 +2083,44 @@ namespace StackExchange.Redis
             public static UnknownMessage Instance { get; } = new();
             private UnknownMessage() : base(0, CommandFlags.None, RedisCommand.UNKNOWN) { }
             public override int ArgCount => 0;
-            protected override void WriteImpl(PhysicalConnection physical) => throw new InvalidOperationException("This message cannot be written");
+            protected override void WriteImpl(in MessageWriter writer) => throw new InvalidOperationException("This message cannot be written");
+        }
+
+        public void SetNoFlush() => Flags |= NoFlushFlag;
+
+        internal static partial class SubCommandMetadata
+        {
+            [AsciiHash(CaseSensitive = false)]
+            internal static partial bool TryParse(ReadOnlySpan<byte> value, out SubCommand subCommand);
+
+            [AsciiHash(CaseSensitive = false)]
+            internal static partial bool TryParse(ReadOnlySpan<char> value, out SubCommand subCommand);
+
+            internal static bool TryGetSubCommand(in RedisValue value, out SubCommand subCommand)
+            {
+                switch (value.Type)
+                {
+                    case RedisValue.StorageType.ByteArray:
+                    case RedisValue.StorageType.MemoryManager:
+                    case RedisValue.StorageType.ShortBlob:
+                        // all three contiguous byte-blob kinds expose their bytes directly
+                        // (the discard here *must* be stack-local; that's the "Unsafe" in this API)
+                        return TryParse(value.UnsafeRawSpan(out _), out subCommand);
+                    case RedisValue.StorageType.String:
+                        // char-backed: parse the chars directly, no UTF8 round-trip
+                        return TryParse(value.RawString().AsSpan(), out subCommand);
+                    case RedisValue.StorageType.Sequence when value.GetByteCount() <= BufferBytes:
+                        // non-contiguous: normalize into a small stack buffer
+                        // (sub-commands are short, so anything longer cannot match)
+                        Span<byte> tmp = stackalloc byte[BufferBytes];
+                        var len = value.CopyTo(tmp);
+                        return TryParse(tmp.Slice(0, len), out subCommand);
+                    // numeric / null / unknown are never a sub-command (e.g. it is never `123`);
+                    // if that ever changes, revisit
+                }
+                subCommand = SubCommand.Unknown;
+                return false;
+            }
         }
     }
 }

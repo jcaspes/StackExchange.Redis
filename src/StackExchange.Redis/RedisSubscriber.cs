@@ -2,10 +2,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Net;
-using System.Threading;
 using System.Threading.Tasks;
-using Pipelines.Sockets.Unofficial;
-using Pipelines.Sockets.Unofficial.Arenas;
 using static StackExchange.Redis.ConnectionMultiplexer;
 
 namespace StackExchange.Redis
@@ -13,7 +10,7 @@ namespace StackExchange.Redis
     public partial class ConnectionMultiplexer
     {
         private RedisSubscriber? _defaultSubscriber;
-        private RedisSubscriber DefaultSubscriber => _defaultSubscriber ??= new RedisSubscriber(this, null);
+        internal RedisSubscriber DefaultSubscriber => _defaultSubscriber ??= new RedisSubscriber(this, null);
 
         private readonly ConcurrentDictionary<RedisChannel, Subscription> subscriptions = new();
 
@@ -29,7 +26,7 @@ namespace StackExchange.Redis
             {
                 if (!subscriptions.TryGetValue(channel, out var sub))
                 {
-                    sub = new Subscription(flags);
+                    sub = channel.IsMultiNode ? new MultiNodeSubscription(flags) : new SingleNodeSubscription(flags);
                     subscriptions.TryAdd(channel, sub);
                 }
                 return sub;
@@ -70,7 +67,7 @@ namespace StackExchange.Redis
         {
             if (!channel.IsNullOrEmpty && subscriptions.TryGetValue(channel, out Subscription? sub))
             {
-                return sub.GetCurrentServer();
+                return sub.GetAnyCurrentServer();
             }
             return null;
         }
@@ -96,24 +93,6 @@ namespace StackExchange.Redis
             }
         }
 
-        internal void OnMessage(in RedisChannel subscription, in RedisChannel channel, Sequence<RawResult> payload)
-        {
-            if (payload.IsSingleSegment)
-            {
-                foreach (var message in payload.FirstSpan)
-                {
-                    OnMessage(subscription, channel, message.AsRedisValue());
-                }
-            }
-            else
-            {
-                foreach (var message in payload)
-                {
-                    OnMessage(subscription, channel, message.AsRedisValue());
-                }
-            }
-        }
-
         /// <summary>
         /// Updates all subscriptions re-evaluating their state.
         /// This clears the current server if it's not connected, prepping them to reconnect.
@@ -122,7 +101,7 @@ namespace StackExchange.Redis
         {
             foreach (var pair in subscriptions)
             {
-                pair.Value.UpdateServer();
+                pair.Value.RemoveDisconnectedEndpoints();
             }
         }
 
@@ -134,12 +113,16 @@ namespace StackExchange.Redis
         {
             // TODO: Subscribe with variadic commands to reduce round trips
             long count = 0;
+            var subscriber = DefaultSubscriber;
             foreach (var pair in subscriptions)
             {
-                if (!pair.Value.IsConnected)
+                try
                 {
-                    count++;
-                    DefaultSubscriber.EnsureSubscribedToServer(pair.Value, pair.Key, flags, true);
+                    count += pair.Value.EnsureSubscribedToServer(subscriber, pair.Key, flags, true);
+                }
+                catch (Exception ex)
+                {
+                    OnInternalError(ex);
                 }
             }
             return count;
@@ -149,152 +132,6 @@ namespace StackExchange.Redis
         {
             Subscribe,
             Unsubscribe,
-        }
-
-        /// <summary>
-        /// This is the record of a single subscription to a redis server.
-        /// It's the singular channel (which may or may not be a pattern), to one or more handlers.
-        /// We subscriber to a redis server once (for all messages) and execute 1-many handlers when a message arrives.
-        /// </summary>
-        internal sealed class Subscription
-        {
-            private Action<RedisChannel, RedisValue>? _handlers;
-            private readonly object _handlersLock = new object();
-            private ChannelMessageQueue? _queues;
-            private ServerEndPoint? CurrentServer;
-            public CommandFlags Flags { get; }
-            public ResultProcessor.TrackSubscriptionsProcessor Processor { get; }
-
-            /// <summary>
-            /// Whether the <see cref="CurrentServer"/> we have is connected.
-            /// Since we clear <see cref="CurrentServer"/> on a disconnect, this should stay correct.
-            /// </summary>
-            internal bool IsConnected => CurrentServer?.IsSubscriberConnected == true;
-
-            public Subscription(CommandFlags flags)
-            {
-                Flags = flags;
-                Processor = new ResultProcessor.TrackSubscriptionsProcessor(this);
-            }
-
-            /// <summary>
-            /// Gets the configured (P)SUBSCRIBE or (P)UNSUBSCRIBE <see cref="Message"/> for an action.
-            /// </summary>
-            internal Message GetMessage(RedisChannel channel, SubscriptionAction action, CommandFlags flags, bool internalCall)
-            {
-                var isPattern = channel.IsPattern;
-                var isSharded = channel.IsSharded;
-                var command = action switch
-                {
-                    SubscriptionAction.Subscribe => channel.Options switch
-                    {
-                        RedisChannel.RedisChannelOptions.None => RedisCommand.SUBSCRIBE,
-                        RedisChannel.RedisChannelOptions.Pattern => RedisCommand.PSUBSCRIBE,
-                        RedisChannel.RedisChannelOptions.Sharded => RedisCommand.SSUBSCRIBE,
-                        _ => Unknown(action, channel.Options),
-                    },
-                    SubscriptionAction.Unsubscribe => channel.Options switch
-                    {
-                        RedisChannel.RedisChannelOptions.None => RedisCommand.UNSUBSCRIBE,
-                        RedisChannel.RedisChannelOptions.Pattern => RedisCommand.PUNSUBSCRIBE,
-                        RedisChannel.RedisChannelOptions.Sharded => RedisCommand.SUNSUBSCRIBE,
-                        _ => Unknown(action, channel.Options),
-                    },
-                    _ => Unknown(action, channel.Options),
-                };
-
-                // TODO: Consider flags here - we need to pass Fire and Forget, but don't want to intermingle Primary/Replica
-                var msg = Message.Create(-1, Flags | flags, command, channel);
-                msg.SetForSubscriptionBridge();
-                if (internalCall)
-                {
-                    msg.SetInternalCall();
-                }
-                return msg;
-            }
-
-            private RedisCommand Unknown(SubscriptionAction action, RedisChannel.RedisChannelOptions options)
-                => throw new ArgumentException($"Unable to determine pub/sub operation for '{action}' against '{options}'");
-
-            public void Add(Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
-            {
-                if (handler != null)
-                {
-                    lock (_handlersLock)
-                    {
-                        _handlers += handler;
-                    }
-                }
-                if (queue != null)
-                {
-                    ChannelMessageQueue.Combine(ref _queues, queue);
-                }
-            }
-
-            public bool Remove(Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue)
-            {
-                if (handler != null)
-                {
-                    lock (_handlersLock)
-                    {
-                        _handlers -= handler;
-                    }
-                }
-                if (queue != null)
-                {
-                    ChannelMessageQueue.Remove(ref _queues, queue);
-                }
-                return _handlers == null & _queues == null;
-            }
-
-            public ICompletable? ForInvoke(in RedisChannel channel, in RedisValue message, out ChannelMessageQueue? queues)
-            {
-                var handlers = _handlers;
-                queues = Volatile.Read(ref _queues);
-                return handlers == null ? null : new MessageCompletable(channel, message, handlers);
-            }
-
-            internal void MarkCompleted()
-            {
-                lock (_handlersLock)
-                {
-                    _handlers = null;
-                }
-                ChannelMessageQueue.MarkAllCompleted(ref _queues);
-            }
-
-            internal void GetSubscriberCounts(out int handlers, out int queues)
-            {
-                queues = ChannelMessageQueue.Count(ref _queues);
-                var tmp = _handlers;
-                if (tmp == null)
-                {
-                    handlers = 0;
-                }
-                else if (tmp.IsSingle())
-                {
-                    handlers = 1;
-                }
-                else
-                {
-                    handlers = 0;
-                    foreach (var sub in tmp.AsEnumerable()) { handlers++; }
-                }
-            }
-
-            internal ServerEndPoint? GetCurrentServer() => Volatile.Read(ref CurrentServer);
-            internal void SetCurrentServer(ServerEndPoint? server) => CurrentServer = server;
-
-            /// <summary>
-            /// Evaluates state and if we're not currently connected, clears the server reference.
-            /// </summary>
-            internal void UpdateServer()
-            {
-                if (!IsConnected)
-                {
-                    CurrentServer = null;
-                }
-            }
         }
     }
 
@@ -383,15 +220,17 @@ namespace StackExchange.Redis
         public long Publish(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             ThrowIfNull(channel);
-            var msg = Message.Create(-1, flags, channel.PublishCommand, channel, message);
-            return ExecuteSync(msg, ResultProcessor.Int64);
+            var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
+            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
+            return ExecuteSync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
         }
 
         public Task<long> PublishAsync(RedisChannel channel, RedisValue message, CommandFlags flags = CommandFlags.None)
         {
             ThrowIfNull(channel);
-            var msg = Message.Create(-1, flags, channel.PublishCommand, channel, message);
-            return ExecuteAsync(msg, ResultProcessor.Int64);
+            var msg = Message.Create(-1, flags, channel.GetPublishCommand(), channel, message);
+            // if we're actively subscribed: send via that connection (otherwise, follow normal rules)
+            return ExecuteAsync(msg, ResultProcessor.Int64, server: multiplexer.GetSubscribedServer(channel));
         }
 
         void ISubscriber.Subscribe(RedisChannel channel, Action<RedisChannel, RedisValue> handler, CommandFlags flags)
@@ -404,56 +243,57 @@ namespace StackExchange.Redis
             return queue;
         }
 
-        public bool Subscribe(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags)
+        private int Subscribe(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags)
         {
             ThrowIfNull(channel);
-            if (handler == null && queue == null) { return true; }
+            if (handler == null && queue == null) { return 0; }
 
             var sub = multiplexer.GetOrAddSubscription(channel, flags);
             sub.Add(handler, queue);
-            return EnsureSubscribedToServer(sub, channel, flags, false);
+            return sub.EnsureSubscribedToServer(this, channel, flags, false);
         }
 
-        internal bool EnsureSubscribedToServer(Subscription sub, RedisChannel channel, CommandFlags flags, bool internalCall)
+        internal void ResubscribeToServer(Subscription sub, in RedisChannel channel, ServerEndPoint serverEndPoint, string cause)
         {
-            if (sub.IsConnected) { return true; }
-
-            // TODO: Cleanup old hangers here?
-            sub.SetCurrentServer(null); // we're not appropriately connected, so blank it out for eligible reconnection
-            var message = sub.GetMessage(channel, SubscriptionAction.Subscribe, flags, internalCall);
-            var selected = multiplexer.SelectServer(message);
-            return ExecuteSync(message, sub.Processor, selected);
+            // conditional: only if that's the server we were connected to, or "none"; we don't want to end up duplicated
+            if (sub.TryRemoveEndpoint(serverEndPoint) || !sub.IsConnectedAny())
+            {
+                if (serverEndPoint.IsSubscriberConnected)
+                {
+                    // we'll *try* for a simple resubscribe, following any -MOVED etc, but if that fails: fall back
+                    // to full reconfigure; importantly, note that we've already recorded the disconnect
+                    var message = sub.GetSubscriptionMessage(channel, SubscriptionAction.Subscribe, CommandFlags.None, false);
+                    _ = ExecuteAsync(message, sub.Processor, serverEndPoint).ContinueWith(
+                        t => multiplexer.ReconfigureIfNeeded(serverEndPoint.EndPoint, false, cause: cause),
+                        TaskContinuationOptions.OnlyOnFaulted);
+                }
+                else
+                {
+                    multiplexer.ReconfigureIfNeeded(serverEndPoint.EndPoint, false, cause: cause);
+                }
+            }
         }
 
         Task ISubscriber.SubscribeAsync(RedisChannel channel, Action<RedisChannel, RedisValue> handler, CommandFlags flags)
             => SubscribeAsync(channel, handler, null, flags);
 
-        public async Task<ChannelMessageQueue> SubscribeAsync(RedisChannel channel, CommandFlags flags = CommandFlags.None)
+        Task<ChannelMessageQueue> ISubscriber.SubscribeAsync(RedisChannel channel, CommandFlags flags) => SubscribeAsync(channel, flags);
+
+        public async Task<ChannelMessageQueue> SubscribeAsync(RedisChannel channel, CommandFlags flags = CommandFlags.None, ServerEndPoint? server = null)
         {
             var queue = new ChannelMessageQueue(channel, this);
-            await SubscribeAsync(channel, null, queue, flags).ForAwait();
+            await SubscribeAsync(channel, null, queue, flags, server).ForAwait();
             return queue;
         }
 
-        public Task<bool> SubscribeAsync(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags)
+        private Task<int> SubscribeAsync(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, ChannelMessageQueue? queue, CommandFlags flags, ServerEndPoint? server = null)
         {
             ThrowIfNull(channel);
-            if (handler == null && queue == null) { return CompletedTask<bool>.Default(null); }
+            if (handler == null && queue == null) { return CompletedTask<int>.Default(null); }
 
             var sub = multiplexer.GetOrAddSubscription(channel, flags);
             sub.Add(handler, queue);
-            return EnsureSubscribedToServerAsync(sub, channel, flags, false);
-        }
-
-        public Task<bool> EnsureSubscribedToServerAsync(Subscription sub, RedisChannel channel, CommandFlags flags, bool internalCall)
-        {
-            if (sub.IsConnected) { return CompletedTask<bool>.Default(null); }
-
-            // TODO: Cleanup old hangers here?
-            sub.SetCurrentServer(null); // we're not appropriately connected, so blank it out for eligible reconnection
-            var message = sub.GetMessage(channel, SubscriptionAction.Subscribe, flags, internalCall);
-            var selected = multiplexer.SelectServer(message);
-            return ExecuteAsync(message, sub.Processor, selected);
+            return sub.EnsureSubscribedToServerAsync(this, channel, flags, false, server);
         }
 
         public EndPoint? SubscribedEndpoint(RedisChannel channel) => multiplexer.GetSubscribedServer(channel)?.EndPoint;
@@ -465,19 +305,10 @@ namespace StackExchange.Redis
         {
             ThrowIfNull(channel);
             // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server
+            // ReSharper disable once SimplifyConditionalTernaryExpression
             return UnregisterSubscription(channel, handler, queue, out var sub)
-                ? UnsubscribeFromServer(sub, channel, flags, false)
+                ? sub.UnsubscribeFromServer(this, channel, flags, false)
                 : true;
-        }
-
-        private bool UnsubscribeFromServer(Subscription sub, RedisChannel channel, CommandFlags flags, bool internalCall)
-        {
-            if (sub.GetCurrentServer() is ServerEndPoint oldOwner)
-            {
-                var message = sub.GetMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                return multiplexer.ExecuteSyncImpl(message, sub.Processor, oldOwner);
-            }
-            return false;
         }
 
         Task ISubscriber.UnsubscribeAsync(RedisChannel channel, Action<RedisChannel, RedisValue>? handler, CommandFlags flags)
@@ -488,18 +319,8 @@ namespace StackExchange.Redis
             ThrowIfNull(channel);
             // Unregister the subscription handler/queue, and if that returns true (last handler removed), also disconnect from the server
             return UnregisterSubscription(channel, handler, queue, out var sub)
-                ? UnsubscribeFromServerAsync(sub, channel, flags, asyncState, false)
+                ? sub.UnsubscribeFromServerAsync(this, channel, flags, asyncState, false)
                 : CompletedTask<bool>.Default(asyncState);
-        }
-
-        private Task<bool> UnsubscribeFromServerAsync(Subscription sub, RedisChannel channel, CommandFlags flags, object? asyncState, bool internalCall)
-        {
-            if (sub.GetCurrentServer() is ServerEndPoint oldOwner)
-            {
-                var message = sub.GetMessage(channel, SubscriptionAction.Unsubscribe, flags, internalCall);
-                return multiplexer.ExecuteAsyncImpl(message, sub.Processor, asyncState, oldOwner);
-            }
-            return CompletedTask<bool>.FromResult(true, asyncState);
         }
 
         /// <summary>
@@ -538,7 +359,7 @@ namespace StackExchange.Redis
                 if (subs.TryRemove(pair.Key, out var sub))
                 {
                     sub.MarkCompleted();
-                    UnsubscribeFromServer(sub, pair.Key, flags, false);
+                    sub.UnsubscribeFromServer(this, pair.Key, flags, false);
                 }
             }
         }
@@ -553,7 +374,7 @@ namespace StackExchange.Redis
                 if (subs.TryRemove(pair.Key, out var sub))
                 {
                     sub.MarkCompleted();
-                    last = UnsubscribeFromServerAsync(sub, pair.Key, flags, asyncState, false);
+                    last = sub.UnsubscribeFromServerAsync(this, pair.Key, flags, asyncState, false);
                 }
             }
             return last ?? CompletedTask<bool>.Default(asyncState);

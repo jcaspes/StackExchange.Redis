@@ -11,12 +11,29 @@ using Xunit;
 namespace StackExchange.Redis.Tests;
 
 [RunPerProtocol]
-public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixture) : TestBase(output, fixture)
+public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixture)
+    : PubSubTestBase(output, fixture, null)
+{
+}
+
+[RunPerProtocol]
+public class InProcPubSubTests(ITestOutputHelper output, InProcServerFixture fixture)
+    : PubSubTestBase(output, null, fixture)
+{
+    protected override bool UseDedicatedInProcessServer => true;
+}
+
+[RunPerProtocol]
+public abstract class PubSubTestBase(
+    ITestOutputHelper output,
+    SharedConnectionFixture? connection,
+    InProcServerFixture? server)
+    : TestBase(output, connection, server)
 {
     [Fact]
     public async Task ExplicitPublishMode()
     {
-        await using var conn = Create(channelPrefix: "foo:", log: Writer);
+        await using var conn = ConnectFactory(channelPrefix: "foo:");
 
         var pub = conn.GetSubscriber();
         int a = 0, b = 0, c = 0, d = 0;
@@ -30,19 +47,19 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
 #pragma warning restore CS0618
         await UntilConditionAsync(
             TimeSpan.FromSeconds(10),
-            () => Thread.VolatileRead(ref b) == 1
-               && Thread.VolatileRead(ref c) == 1
-               && Thread.VolatileRead(ref d) == 1);
-        Assert.Equal(0, Thread.VolatileRead(ref a));
-        Assert.Equal(1, Thread.VolatileRead(ref b));
-        Assert.Equal(1, Thread.VolatileRead(ref c));
-        Assert.Equal(1, Thread.VolatileRead(ref d));
+            () => Volatile.Read(ref b) == 1
+               && Volatile.Read(ref c) == 1
+               && Volatile.Read(ref d) == 1);
+        Assert.Equal(0, Volatile.Read(ref a));
+        Assert.Equal(1, Volatile.Read(ref b));
+        Assert.Equal(1, Volatile.Read(ref c));
+        Assert.Equal(1, Volatile.Read(ref d));
 
 #pragma warning disable CS0618
         pub.Publish("*bcd", "efg");
 #pragma warning restore CS0618
-        await UntilConditionAsync(TimeSpan.FromSeconds(10), () => Thread.VolatileRead(ref a) == 1);
-        Assert.Equal(1, Thread.VolatileRead(ref a));
+        await UntilConditionAsync(TimeSpan.FromSeconds(10), () => Volatile.Read(ref a) == 1);
+        Assert.Equal(1, Volatile.Read(ref a));
     }
 
     [Theory]
@@ -54,9 +71,9 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [InlineData("Foo:", true, "f")]
     public async Task TestBasicPubSub(string? channelPrefix, bool wildCard, string breaker)
     {
-        await using var conn = Create(channelPrefix: channelPrefix, shared: false, log: Writer);
+        await using var conn = ConnectFactory(channelPrefix: channelPrefix, shared: false);
 
-        var pub = GetAnyPrimary(conn);
+        var pub = GetAnyPrimary(conn.DefaultClient);
         var sub = conn.GetSubscriber();
         await PingAsync(pub, sub).ForAwait();
         HashSet<string?> received = [];
@@ -86,7 +103,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         {
             Assert.Empty(received);
         }
-        Assert.Equal(0, Thread.VolatileRead(ref secondHandler));
+        Assert.Equal(0, Volatile.Read(ref secondHandler));
 #pragma warning disable CS0618
         var count = sub.Publish(pubChannel, "def");
 #pragma warning restore CS0618
@@ -99,8 +116,8 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
             Assert.Single(received);
         }
         // Give handler firing a moment
-        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Thread.VolatileRead(ref secondHandler) == 1);
-        Assert.Equal(1, Thread.VolatileRead(ref secondHandler));
+        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Volatile.Read(ref secondHandler) == 1);
+        Assert.Equal(1, Volatile.Read(ref secondHandler));
 
         // unsubscribe from first; should still see second
 #pragma warning disable CS0618
@@ -113,9 +130,9 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
             Assert.Single(received);
         }
 
-        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Thread.VolatileRead(ref secondHandler) == 2);
+        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Volatile.Read(ref secondHandler) == 2);
 
-        var secondHandlerCount = Thread.VolatileRead(ref secondHandler);
+        var secondHandlerCount = Volatile.Read(ref secondHandler);
         Log("Expecting 2 from second handler, got: " + secondHandlerCount);
         Assert.Equal(2, secondHandlerCount);
         Assert.Equal(1, count);
@@ -130,19 +147,31 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         {
             Assert.Single(received);
         }
-        secondHandlerCount = Thread.VolatileRead(ref secondHandler);
+        secondHandlerCount = Volatile.Read(ref secondHandler);
         Log("Expecting 2 from second handler, got: " + secondHandlerCount);
         Assert.Equal(2, secondHandlerCount);
         Assert.Equal(0, count);
     }
 
     [Fact]
+    public async Task Ping()
+    {
+        await using var conn = ConnectFactory(shared: false);
+        var pub = GetAnyPrimary(conn.DefaultClient);
+        var sub = conn.GetSubscriber();
+
+        await PingAsync(pub, sub, 5).ForAwait();
+        await sub.SubscribeAsync(RedisChannel.Literal(Me()), (_, __) => { }); // to ensure we're in subscriber mode
+        await PingAsync(pub, sub, 5).ForAwait();
+    }
+
+    [Fact]
     public async Task TestBasicPubSubFireAndForget()
     {
-        await using var conn = Create(shared: false, log: Writer);
+        await using var conn = ConnectFactory(shared: false);
 
-        var profiler = conn.AddProfiler();
-        var pub = GetAnyPrimary(conn);
+        var profiler = conn.DefaultClient.AddProfiler();
+        var pub = GetAnyPrimary(conn.DefaultClient);
         var sub = conn.GetSubscriber();
 
         RedisChannel key = RedisChannel.Literal(Me() + Guid.NewGuid());
@@ -170,7 +199,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         {
             Assert.Empty(received);
         }
-        Assert.Equal(0, Thread.VolatileRead(ref secondHandler));
+        Assert.Equal(0, Volatile.Read(ref secondHandler));
         await PingAsync(pub, sub).ForAwait();
         var count = sub.Publish(key, "def", CommandFlags.FireAndForget);
         await PingAsync(pub, sub).ForAwait();
@@ -182,7 +211,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         {
             Assert.Single(received);
         }
-        Assert.Equal(1, Thread.VolatileRead(ref secondHandler));
+        Assert.Equal(1, Volatile.Read(ref secondHandler));
 
         sub.Unsubscribe(key);
         count = sub.Publish(key, "ghi", CommandFlags.FireAndForget);
@@ -204,19 +233,37 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
             // way to prove that is to use TPL objects
             var subTask = sub.PingAsync();
             var pubTask = pub.PingAsync();
-            await Task.WhenAll(subTask, pubTask).ForAwait();
+            try
+            {
+                await Task.WhenAll(subTask, pubTask).ForAwait();
+            }
+            catch (TimeoutException ex)
+            {
+                throw new TimeoutException($"Timeout; sub: {GetState(subTask)}, pub: {GetState(pubTask)}", ex);
+            }
 
-            Log($"Sub PING time: {subTask.Result.TotalMilliseconds} ms");
-            Log($"Pub PING time: {pubTask.Result.TotalMilliseconds} ms");
+            Log($"sub: {GetState(subTask)}, pub: {GetState(pubTask)}");
+
+            static string GetState(Task<TimeSpan> pending)
+            {
+                var status = pending.Status;
+                return status switch
+                {
+                    TaskStatus.RanToCompletion => $"{status} in {pending.Result.TotalMilliseconds:###,##0.0}ms)",
+                    TaskStatus.Faulted when pending.Exception is { InnerExceptions.Count:1 } ae => $"{status}: {ae.InnerExceptions[0].Message}",
+                    TaskStatus.Faulted => $"{status}: {pending.Exception?.Message}",
+                    _ => status.ToString(),
+                };
+            }
         }
     }
 
     [Fact]
     public async Task TestPatternPubSub()
     {
-        await using var conn = Create(shared: false, log: Writer);
+        await using var conn = ConnectFactory(shared: false);
 
-        var pub = GetAnyPrimary(conn);
+        var pub = GetAnyPrimary(conn.DefaultClient);
         var sub = conn.GetSubscriber();
 
         HashSet<string?> received = [];
@@ -241,7 +288,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         {
             Assert.Empty(received);
         }
-        Assert.Equal(0, Thread.VolatileRead(ref secondHandler));
+        Assert.Equal(0, Volatile.Read(ref secondHandler));
 
         await PingAsync(pub, sub).ForAwait();
         var count = sub.Publish(RedisChannel.Literal("abc"), "def");
@@ -254,8 +301,8 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         }
 
         // Give reception a bit, the handler could be delayed under load
-        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Thread.VolatileRead(ref secondHandler) == 1);
-        Assert.Equal(1, Thread.VolatileRead(ref secondHandler));
+        await UntilConditionAsync(TimeSpan.FromSeconds(2), () => Volatile.Read(ref secondHandler) == 1);
+        Assert.Equal(1, Volatile.Read(ref secondHandler));
 
 #pragma warning disable CS0618
         sub.Unsubscribe("a*c");
@@ -273,7 +320,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task TestPublishWithNoSubscribers()
     {
-        await using var conn = Create();
+        await using var conn = ConnectFactory();
 
         var sub = conn.GetSubscriber();
 #pragma warning disable CS0618
@@ -285,7 +332,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     public async Task TestMassivePublishWithWithoutFlush_Local()
     {
         Skip.UnlessLongRunning();
-        await using var conn = Create();
+        await using var conn = ConnectFactory();
 
         var sub = conn.GetSubscriber();
         TestMassivePublish(sub, Me(), "local");
@@ -295,6 +342,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     public async Task TestMassivePublishWithWithoutFlush_Remote()
     {
         Skip.UnlessLongRunning();
+        SkipIfWouldUseInProcessServer();
         await using var conn = Create(configuration: TestConfig.Current.RemoteServerAndPort);
 
         var sub = conn.GetSubscriber();
@@ -323,7 +371,9 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
             tasks[i] = sub.PublishAsync(channel, "bar");
 #pragma warning restore CS0618
         }
+        #pragma warning disable SER308 // deliberate: test code blocking on a task, and the Wait helpers apply the configured timeout that a bare await would not
         sub.WaitAll(tasks);
+        #pragma warning restore SER308
         withAsync.Stop();
 
         Log($"{caption}: {withFAF.ElapsedMilliseconds}ms (F+F) vs {withAsync.ElapsedMilliseconds}ms (async)");
@@ -335,7 +385,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task SubscribeAsyncEnumerable()
     {
-        await using var conn = Create(syncTimeout: 20000, shared: false, log: Writer);
+        await using var conn = ConnectFactory(shared: false);
 
         var sub = conn.GetSubscriber();
         RedisChannel channel = RedisChannel.Literal(Me());
@@ -370,13 +420,17 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task PubSubGetAllAnyOrder()
     {
-        await using var conn = Create(syncTimeout: 20000, shared: false, log: Writer);
+        await using var conn = ConnectFactory(shared: false);
 
         var sub = conn.GetSubscriber();
         RedisChannel channel = RedisChannel.Literal(Me());
         const int count = 1000;
         var syncLock = new object();
 
+        // The subscription connection is a separate connection from the interactive one, and can still
+        // be coming up when the connect call returns; asserting it immediately is a race that a slow or
+        // contended machine loses (this is the "IsConnected" failure seen on the Windows CI job).
+        await UntilConditionAsync(TimeSpan.FromSeconds(10), () => sub.IsConnected()).ForAwait();
         Assert.True(sub.IsConnected(), nameof(sub.IsConnected));
         var data = new HashSet<int>();
         await sub.SubscribeAsync(channel, (_, val) =>
@@ -418,6 +472,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task PubSubGetAllCorrectOrder()
     {
+        SkipIfWouldUseInProcessServer();
         await using (var conn = Create(configuration: TestConfig.Current.RemoteServerAndPort, syncTimeout: 20000, log: Writer))
         {
             var sub = conn.GetSubscriber();
@@ -488,6 +543,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task PubSubGetAllCorrectOrder_OnMessage_Sync()
     {
+        SkipIfWouldUseInProcessServer();
         await using (var conn = Create(configuration: TestConfig.Current.RemoteServerAndPort, syncTimeout: 20000, log: Writer))
         {
             var sub = conn.GetSubscriber();
@@ -554,6 +610,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task PubSubGetAllCorrectOrder_OnMessage_Async()
     {
+        SkipIfWouldUseInProcessServer();
         await using (var conn = Create(configuration: TestConfig.Current.RemoteServerAndPort, syncTimeout: 20000, log: Writer))
         {
             var sub = conn.GetSubscriber();
@@ -625,9 +682,10 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task TestPublishWithSubscribers()
     {
-        await using var connA = Create(shared: false, log: Writer);
-        await using var connB = Create(shared: false, log: Writer);
-        await using var connPub = Create();
+        await using var pair = ConnectFactory(shared: false);
+        await using var connA = pair.DefaultClient;
+        await using var connB = pair.CreateClient();
+        await using var connPub = pair.CreateClient();
 
         var channel = Me();
         var listenA = connA.GetSubscriber();
@@ -652,9 +710,10 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task TestMultipleSubscribersGetMessage()
     {
-        await using var connA = Create(shared: false, log: Writer);
-        await using var connB = Create(shared: false, log: Writer);
-        await using var connPub = Create();
+        await using var pair = ConnectFactory(shared: false);
+        await using var connA = pair.DefaultClient;
+        await using var connB = pair.CreateClient();
+        await using var connPub = pair.CreateClient();
 
         var channel = RedisChannel.Literal(Me());
         var listenA = connA.GetSubscriber();
@@ -667,22 +726,22 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         await Task.WhenAll(tA, tB).ForAwait();
         Assert.Equal(2, pub.Publish(channel, "message"));
         await AllowReasonableTimeToPublishAndProcess().ForAwait();
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotA, 0, 0));
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotB, 0, 0));
+        Assert.Equal(1, Volatile.Read(ref gotA));
+        Assert.Equal(1, Volatile.Read(ref gotB));
 
         // and unsubscribe...
         tA = listenA.UnsubscribeAsync(channel);
         await tA;
         Assert.Equal(1, pub.Publish(channel, "message"));
         await AllowReasonableTimeToPublishAndProcess().ForAwait();
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotA, 0, 0));
-        Assert.Equal(2, Interlocked.CompareExchange(ref gotB, 0, 0));
+        Assert.Equal(1, Volatile.Read(ref gotA));
+        Assert.Equal(2, Volatile.Read(ref gotB));
     }
 
     [Fact]
     public async Task Issue38()
     {
-        await using var conn = Create(log: Writer);
+        await using var conn = ConnectFactory();
 
         var sub = conn.GetSubscriber();
         int count = 0;
@@ -709,7 +768,7 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         await AllowReasonableTimeToPublishAndProcess().ForAwait();
 
         Assert.Equal(6, total); // sent
-        Assert.Equal(6, Interlocked.CompareExchange(ref count, 0, 0)); // received
+        Assert.Equal(6, Volatile.Read(ref count)); // received
     }
 
     internal static Task AllowReasonableTimeToPublishAndProcess() => Task.Delay(500);
@@ -717,9 +776,10 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
     [Fact]
     public async Task TestPartialSubscriberGetMessage()
     {
-        await using var connA = Create();
-        await using var connB = Create();
-        await using var connPub = Create();
+        await using var pair = ConnectFactory();
+        await using var connA = pair.DefaultClient;
+        await using var connB = pair.CreateClient();
+        await using var connPub = pair.CreateClient();
 
         int gotA = 0, gotB = 0;
         var listenA = connA.GetSubscriber();
@@ -733,8 +793,8 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         Assert.Equal(2, pub.Publish(prefix + "channel", "message"));
 #pragma warning restore CS0618
         await AllowReasonableTimeToPublishAndProcess().ForAwait();
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotA, 0, 0));
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotB, 0, 0));
+        Assert.Equal(1, Volatile.Read(ref gotA));
+        Assert.Equal(1, Volatile.Read(ref gotB));
 
         // and unsubscibe...
 #pragma warning disable CS0618
@@ -743,15 +803,16 @@ public class PubSubTests(ITestOutputHelper output, SharedConnectionFixture fixtu
         Assert.Equal(1, pub.Publish(prefix + "channel", "message"));
 #pragma warning restore CS0618
         await AllowReasonableTimeToPublishAndProcess().ForAwait();
-        Assert.Equal(2, Interlocked.CompareExchange(ref gotA, 0, 0));
-        Assert.Equal(1, Interlocked.CompareExchange(ref gotB, 0, 0));
+        Assert.Equal(2, Volatile.Read(ref gotA));
+        Assert.Equal(1, Volatile.Read(ref gotB));
     }
 
     [Fact]
     public async Task TestSubscribeUnsubscribeAndSubscribeAgain()
     {
-        await using var connPub = Create();
-        await using var connSub = Create();
+        await using var pair = ConnectFactory();
+        await using var connPub = pair.DefaultClient;
+        await using var connSub = pair.CreateClient();
 
         var prefix = Me();
         var pub = connPub.GetSubscriber();

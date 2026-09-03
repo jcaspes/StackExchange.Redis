@@ -5,8 +5,10 @@ using System.IO;
 using System.Linq;
 using System.Runtime;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+using StackExchange.Redis.Configuration;
 using StackExchange.Redis.Profiling;
 using StackExchange.Redis.Tests.Helpers;
 using Xunit;
@@ -15,22 +17,59 @@ namespace StackExchange.Redis.Tests;
 
 public abstract class TestBase : IDisposable
 {
-    private ITestOutputHelper Output { get; }
+    protected ITestOutputHelper Output { get; }
     protected TextWriterOutputHelper Writer { get; }
-    protected virtual string GetConfiguration() => GetDefaultConfiguration();
+    protected virtual string GetConfiguration()
+    {
+        if (_inProcServerFixture != null)
+        {
+            return _inProcServerFixture.Configuration;
+        }
+        return GetDefaultConfiguration();
+    }
     internal static string GetDefaultConfiguration() => TestConfig.Current.PrimaryServerAndPort;
 
-    private readonly SharedConnectionFixture? _fixture;
+    /// <summary>
+    /// Applies <see cref="TestConfig.MinTimeoutMilliseconds"/> as a lower bound, for CI machines that
+    /// cannot honour the library's defaults. Only ever raises, and only called where the test did not
+    /// request a specific timeout - a test asking for a short timeout is testing timeout behaviour,
+    /// and silently lengthening it would defeat the test.
+    /// </summary>
+    private static int RaiseToFloor(int timeout) =>
+        TestConfig.MinTimeoutMilliseconds > timeout ? TestConfig.MinTimeoutMilliseconds : timeout;
 
-    protected bool SharedFixtureAvailable => _fixture != null && _fixture.IsEnabled && !HighIntegrity;
+    /// <summary>
+    /// Cluster endpoints for tests that need the cluster, skipping the test when it is not running.
+    /// </summary>
+    /// <remarks>
+    /// The probe has to happen here rather than when connecting: the cluster configuration carries a
+    /// deliberately long <c>connectTimeout</c>, so a test that discovers the absence by connecting
+    /// pays that timeout in full before it can skip. With ~50 cluster tests that is the difference
+    /// between a one-minute run and a nine-minute one.
+    /// </remarks>
+    protected static string GetClusterConfiguration(string suffix = ",connectTimeout=10000")
+    {
+        Skip.IfNoCluster();
+        return TestConfig.Current.ClusterServersAndPorts + suffix;
+    }
 
-    protected TestBase(ITestOutputHelper output, SharedConnectionFixture? fixture = null)
+    private readonly SharedConnectionFixture? _sharedConnectionFixture;
+    private readonly InProcServerFixture? _inProcServerFixture;
+
+    protected bool SharedFixtureAvailable => _sharedConnectionFixture != null && _sharedConnectionFixture.IsEnabled && !HighIntegrity;
+
+    protected TestBase(ITestOutputHelper output, SharedConnectionFixture? connection = null, InProcServerFixture? server = null)
     {
         Output = output;
         Output.WriteFrameworkVersion();
         Writer = new TextWriterOutputHelper(output);
-        _fixture = fixture;
+        _sharedConnectionFixture = connection;
+        _inProcServerFixture = server;
         ClearAmbientFailures();
+    }
+
+    protected TestBase(ITestOutputHelper output, InProcServerFixture fixture) : this(output, null, fixture)
+    {
     }
 
     /// <summary>
@@ -50,6 +89,16 @@ public abstract class TestBase : IDisposable
         {
             output?.WriteLine(Time() + ": " + message);
         }
+    }
+
+    internal static void NoConcurrentRuntime()
+    {
+        // Some tests are not amenable to running concurrently in different runtimes - for
+        // example they might do a script-flush or a flush-db; ensure it only runs against
+        // our primary build target (or debug, which is local).
+        #if !(DEBUG || BUILD_CURRENT)
+        Assert.Skip("Avoiding concurrent runtime; this is not the primary build");
+        #endif
     }
 
     protected void Log(string? message, params object[] args)
@@ -85,7 +134,7 @@ public abstract class TestBase : IDisposable
     [System.Diagnostics.CodeAnalysis.SuppressMessage("Microsoft.Design", "CA1063:ImplementIDisposableCorrectly", Justification = "Trust me yo")]
     public void Dispose()
     {
-        _fixture?.Teardown(Writer);
+        _sharedConnectionFixture?.Teardown(Writer);
         Teardown();
         Writer.Dispose();
         GC.SuppressFinalize(this);
@@ -197,8 +246,6 @@ public abstract class TestBase : IDisposable
             }
             Assert.Skip($"There were {privateFailCount} private and {sharedFailCount.Value} ambient exceptions; expected {expectedFailCount}.");
         }
-        var pool = SocketManager.Shared?.SchedulerPool;
-        Log($"Service Counts: (Scheduler) Queue: {pool?.TotalServicedByQueue.ToString()}, Pool: {pool?.TotalServicedByPool.ToString()}, Workers: {pool?.WorkerCount.ToString()}, Available: {pool?.AvailableCount.ToString()}");
     }
 
     protected static IServer GetServer(IConnectionMultiplexer muxer)
@@ -226,6 +273,8 @@ public abstract class TestBase : IDisposable
 
     internal virtual bool HighIntegrity => false;
 
+    internal virtual Tunnel? Tunnel => _inProcServerFixture?.Tunnel;
+
     internal virtual IInternalConnectionMultiplexer Create(
         string? clientName = null,
         int? syncTimeout = null,
@@ -250,6 +299,7 @@ public abstract class TestBase : IDisposable
         BacklogPolicy? backlogPolicy = null,
         Version? require = null,
         RedisProtocol? protocol = null,
+        bool allowSimulateConnectionFailure = false,
         [CallerMemberName] string caller = "")
     {
         if (Output == null)
@@ -257,22 +307,24 @@ public abstract class TestBase : IDisposable
             Assert.Fail("Failure: Be sure to call the TestBase constructor like this: BasicOpsTests(ITestOutputHelper output) : base(output) { }");
         }
 
+        if (allowSimulateConnectionFailure) shared = false;
         // Default to protocol context if not explicitly passed in
         protocol ??= TestContext.Current.GetProtocol();
 
         // Share a connection if instructed to and we can - many specifics mean no sharing
         bool highIntegrity = HighIntegrity;
-        if (shared && expectedFailCount == 0
-            && _fixture != null && _fixture.IsEnabled
+        var tunnel = Tunnel;
+        if (tunnel is null && shared && expectedFailCount == 0
+            && _sharedConnectionFixture != null && _sharedConnectionFixture.IsEnabled
             && GetConfiguration() == GetDefaultConfiguration()
             && CanShare(allowAdmin, password, tieBreaker, fail, disabledCommands, enabledCommands, channelPrefix, proxy, configuration, defaultDatabase, backlogPolicy, highIntegrity))
         {
             configuration = GetConfiguration();
-            var fixtureConn = _fixture.GetConnection(this, protocol.Value, caller: caller);
+            var fixtureConn = _sharedConnectionFixture.GetConnection(this, protocol.Value, caller: caller);
             // Only return if we match
             TestBase.ThrowIfIncorrectProtocol(fixtureConn, protocol);
 
-            if (configuration == _fixture.Configuration)
+            if (configuration == _sharedConnectionFixture.Configuration)
             {
                 TestBase.ThrowIfBelowMinVersion(fixtureConn, require);
                 return fixtureConn;
@@ -303,6 +355,8 @@ public abstract class TestBase : IDisposable
             backlogPolicy,
             protocol,
             highIntegrity,
+            tunnel,
+            allowSimulateConnectionFailure,
             caller);
 
         TestBase.ThrowIfIncorrectProtocol(conn, protocol);
@@ -392,6 +446,8 @@ public abstract class TestBase : IDisposable
         BacklogPolicy? backlogPolicy = null,
         RedisProtocol? protocol = null,
         bool highIntegrity = false,
+        Tunnel? tunnel = null,
+        bool allowSimulateConnectionFailure = false,
         [CallerMemberName] string caller = "")
     {
         StringWriter? localLog = null;
@@ -413,21 +469,34 @@ public abstract class TestBase : IDisposable
                 syncTimeout = int.MaxValue;
             }
 
+            config.Tunnel = tunnel;
             if (channelPrefix is not null) config.ChannelPrefix = RedisChannel.Literal(channelPrefix);
             if (tieBreaker is not null) config.TieBreaker = tieBreaker;
             if (password is not null) config.Password = string.IsNullOrEmpty(password) ? null : password;
             if (clientName is not null) config.ClientName = clientName;
             else if (!string.IsNullOrEmpty(caller)) config.ClientName = caller;
             if (syncTimeout is not null) config.SyncTimeout = syncTimeout.Value;
+            else config.SyncTimeout = RaiseToFloor(config.SyncTimeout);
             if (asyncTimeout is not null) config.AsyncTimeout = asyncTimeout.Value;
+            else config.AsyncTimeout = RaiseToFloor(config.AsyncTimeout);
             if (allowAdmin is not null) config.AllowAdmin = allowAdmin.Value;
             if (keepAlive is not null) config.KeepAlive = keepAlive.Value;
+            // No floor on ConnectTimeout, deliberately: tests that simulate a failure and then allow a
+            // fixed window for the heartbeat to reconnect (ConnectFailTimeoutTests.NoticesConnectFail)
+            // break when a stalled connect attempt can no longer be retried inside that window. Verified
+            // by bisection: flooring ConnectTimeout fails that test on its own, as does SyncTimeout.
             if (connectTimeout is not null) config.ConnectTimeout = connectTimeout.Value;
             if (proxy is not null) config.Proxy = proxy.Value;
             if (defaultDatabase is not null) config.DefaultDatabase = defaultDatabase.Value;
             if (backlogPolicy is not null) config.BacklogPolicy = backlogPolicy;
             if (protocol is not null) config.Protocol = protocol;
             if (highIntegrity) config.HighIntegrity = highIntegrity;
+            if (allowSimulateConnectionFailure) config.AllowSimulateConnectionFailure = allowSimulateConnectionFailure;
+            if (checkConnect)
+            {
+                config.AbortOnConnectFail = false;
+                config.ConnectRetry = 0;
+            }
             var watch = Stopwatch.StartNew();
             var task = ConnectionMultiplexer.ConnectAsync(config, log);
             if (!task.Wait(config.ConnectTimeout >= (int.MaxValue / 2) ? int.MaxValue : config.ConnectTimeout * 2))
@@ -450,11 +519,9 @@ public abstract class TestBase : IDisposable
                 Log(output, "Connect took: " + watch.ElapsedMilliseconds + "ms");
             }
             var conn = task.Result;
-            if (checkConnect && !conn.IsConnected)
+            if (checkConnect)
             {
-                // If fail is true, we throw.
-                Assert.False(fail, failMessage + "Server is not available");
-                Assert.Skip(failMessage + "Server is not available");
+                Assert.SkipUnless(conn.IsConnected, (failMessage ?? "") + "Unable to connect to server");
             }
             if (output != null)
             {
@@ -544,7 +611,7 @@ public abstract class TestBase : IDisposable
             for (int i = 0; i < threads; i++)
             {
                 var thd = threadArr[i];
-#if !NET6_0_OR_GREATER
+#if !NET
                 if (thd.IsAlive) thd.Abort();
 #endif
             }
@@ -555,14 +622,121 @@ public abstract class TestBase : IDisposable
     }
 
     private static readonly TimeSpan DefaultWaitPerLoop = TimeSpan.FromMilliseconds(50);
-    protected static async Task UntilConditionAsync(TimeSpan maxWaitTime, Func<bool> predicate, TimeSpan? waitPerLoop = null)
+    protected static async Task<TimeSpan> UntilConditionAsync(TimeSpan maxWaitTime, Func<bool> predicate, TimeSpan? waitPerLoop = null)
     {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        cancellationToken.ThrowIfCancellationRequested();
+        var watch = Stopwatch.StartNew();
         TimeSpan spent = TimeSpan.Zero;
         while (spent < maxWaitTime && !predicate())
         {
             var wait = waitPerLoop ?? DefaultWaitPerLoop;
-            await Task.Delay(wait).ForAwait();
+            await Task.Delay(wait, cancellationToken).ForAwait();
             spent += wait;
         }
+        return watch.Elapsed;
+    }
+
+    // simplified usage to get an interchangeable dedicated vs shared in-process server, useful for debugging
+    protected virtual bool UseDedicatedInProcessServer => false; // use the shared server by default
+
+    internal ClientFactory ConnectFactory(bool allowAdmin = false, string? channelPrefix = null, bool shared = true)
+    {
+        if (UseDedicatedInProcessServer)
+        {
+            var server = new InProcessTestServer(Output);
+            return new ClientFactory(this, allowAdmin, channelPrefix, shared, server);
+        }
+        return new ClientFactory(this, allowAdmin, channelPrefix, shared, null);
+    }
+
+    protected void SkipIfWouldUseInProcessServer(string? reason = null)
+    {
+        Assert.SkipWhen(_inProcServerFixture != null || UseDedicatedInProcessServer, reason ?? "In-process server is in use.");
+    }
+
+    protected void SkipIfWouldUseRealServer(string? reason = null)
+    {
+        Assert.SkipUnless(_inProcServerFixture != null || UseDedicatedInProcessServer, reason ?? "Real server is in use.");
+    }
+
+    protected async Task AssertDebugCommandEnabledAsync(IConnectionMultiplexer muxer)
+    {
+        foreach (var ep in muxer.GetEndPoints())
+        {
+            var server = muxer.GetServer(ep);
+            var config = await server.ConfigGetAsync("enable-debug-command").ForAwait();
+
+            var value = config.Length == 0 ? "" : config[0].Value;
+            Log($"Server {ep} enable-debug-command config: {value}");
+            Assert.SkipUnless(
+                string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase),
+                $"Server {ep} enable-debug-command config is '{value}'; DEBUG OBJECT requires 'yes'.");
+        }
+    }
+
+    internal sealed class ClientFactory : IDisposable, IAsyncDisposable
+    {
+        private readonly TestBase _testBase;
+        private readonly bool _allowAdmin;
+        private readonly string? _channelPrefix;
+        private readonly bool _shared;
+        private readonly InProcessTestServer? _server;
+        private IInternalConnectionMultiplexer? _defaultClient;
+
+        internal ClientFactory(TestBase testBase, bool allowAdmin, string? channelPrefix, bool shared, InProcessTestServer? server)
+        {
+            _testBase = testBase;
+            _allowAdmin = allowAdmin;
+            _channelPrefix = channelPrefix;
+            _shared = shared;
+            _server = server;
+        }
+
+        public IInternalConnectionMultiplexer DefaultClient => _defaultClient ??= CreateClient();
+
+        public InProcessTestServer? Server => _server;
+
+        public IInternalConnectionMultiplexer CreateClient()
+        {
+            if (_server is not null)
+            {
+                var config = _server.GetClientConfig();
+                config.AllowAdmin = _allowAdmin;
+                config.Protocol = TestContext.Current.GetProtocol();
+                if (_channelPrefix is not null)
+                {
+                    config.ChannelPrefix = RedisChannel.Literal(_channelPrefix);
+                }
+                return ConnectionMultiplexer.ConnectAsync(config).Result;
+            }
+            return _testBase.Create(allowAdmin: _allowAdmin, channelPrefix: _channelPrefix, shared: _shared);
+        }
+
+        public IDatabase GetDatabase(int db = -1) => DefaultClient.GetDatabase(db);
+
+        public ISubscriber GetSubscriber() => DefaultClient.GetSubscriber();
+
+        public void Dispose()
+        {
+            _server?.Dispose();
+            _defaultClient?.Dispose();
+        }
+
+        public ValueTask DisposeAsync()
+        {
+            _server?.Dispose();
+            if (_defaultClient is not null)
+            {
+                return _defaultClient.DisposeAsync();
+            }
+            return default;
+        }
+    }
+
+    [Conditional("RELEASE")]
+    protected void SkipOnWindowsRelease(string? message = null) // typically used for tests that are super brittle on the Windows CI
+    {
+        Assert.SkipWhen(RuntimeInformation.IsOSPlatform(OSPlatform.Windows), message ?? "skipping on Windows");
     }
 }

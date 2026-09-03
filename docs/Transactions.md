@@ -116,3 +116,66 @@ var wasSet = (bool) db.ScriptEvaluate(@"if redis.call('hexists', KEYS[1], 'Uniqu
 ```
 
 (note that the response from `ScriptEvaluate` and `ScriptEvaluateAsync` is variable depending on your exact script; the response can be interpreted by casting - in this case as a `bool`)
+
+Don't await inside the transaction
+---
+
+This is the most common mistake with transactions, and it does not fail loudly - it hangs.
+
+Commands queued on an `ITransaction` (or an `IBatch`) are *buffered*, not sent. They go to the server only when
+you call `Execute`/`ExecuteAsync`, so the `Task` handed back at the point of queueing cannot complete until
+after that call. Awaiting it there waits for something that can only happen further down the method:
+
+```csharp
+var tran = db.CreateTransaction();
+var value = await tran.StringGetAsync(key);   // never completes - nothing has been sent yet
+await tran.ExecuteAsync();                    // never reached
+```
+
+Everything else in the async API rewards awaiting promptly, and `ITransaction` offers the same method names, so
+this reads as perfectly ordinary code. Instead, capture the tasks and await them *after* `Execute`:
+
+```csharp
+var tran = db.CreateTransaction();
+var pending = tran.StringGetAsync(key);
+_ = tran.StringSetAsync(other, "value");      // discard the ones you do not need
+if (await tran.ExecuteAsync())
+{
+    var value = await pending;
+}
+```
+
+The analyzer reports this as [SER305](rules/SER305) - an **error**, not a suggestion - and offers both fixes.
+The one case that does not hang is `CommandFlags.FireAndForget`, which completes immediately carrying the
+default value; awaiting that is legal but tells you nothing, which is [SER306](rules/SER306).
+
+Do you need a transaction at all?
+---
+
+A great many transactions in real code exist only to make one command conditional, or to make two commands
+atomic - and in most of those cases a single command already does the job. That is worth preferring: one
+round-trip instead of two, evaluated atomically on the server, with no `WATCH` and so no possibility of
+aborting under contention and needing a retry loop.
+
+```csharp
+// a transaction to set a key only if it is absent...
+var tran = db.CreateTransaction();
+tran.AddCondition(Condition.KeyNotExists(key));
+_ = tran.StringSetAsync(key, value);
+if (await tran.ExecuteAsync()) { /* ... */ }
+
+// ...is just this
+if (await db.StringSetAsync(key, value, when: When.NotExists)) { /* ... */ }
+```
+
+Since 3.1 the package ships a Roslyn analyzer that points these out in your own build, as warnings. It covers conditions that duplicate a `when:` argument,
+compare-and-set that a newer server does in one command, conditions that ask what the command already reports,
+and pairs or repetitions of commands that collapse into one call.
+
+See [Analyzer rules](rules/) for the full list, what changes when you apply each suggestion - the result can
+change meaning, so they are worth reading before rewriting - and how to declare your server version so you only
+see suggestions you can act on.
+
+None of this makes transactions redundant. Cross-key compare-and-set, several genuinely independent conditions,
+and multi-command units with no single-command equivalent are exactly what `MULTI`/`EXEC` and `WATCH` are for,
+and the analyzer deliberately stays quiet about them.

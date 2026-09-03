@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.IO;
 using System.Net;
 using System.Threading.Tasks;
+using StackExchange.Redis.Availability;
 using StackExchange.Redis.Maintenance;
 using StackExchange.Redis.Profiling;
 using static StackExchange.Redis.ConnectionMultiplexer;
@@ -22,6 +23,15 @@ internal interface IInternalConnectionMultiplexer : IConnectionMultiplexer
     ConfigurationOptions RawConfig { get; }
 
     long? GetConnectionId(EndPoint endPoint, ConnectionType type);
+
+    /// <summary>
+    /// Whether this connection is read/written by a thread we own rather than by the thread-pool; <c>null</c>
+    /// if there is no such connection. See the <c>DedicatedThreads</c> feature flag.
+    /// </summary>
+    bool? IsSyncReader(EndPoint endPoint, ConnectionType type);
+
+    /// <inheritdoc cref="IsSyncReader"/>
+    bool? IsSyncWriter(EndPoint endPoint, ConnectionType type);
 
     ServerSelectionStrategy ServerSelectionStrategy { get; }
 
@@ -76,7 +86,7 @@ public interface IConnectionMultiplexer : IDisposable, IAsyncDisposable
     /// <summary>
     /// Should exceptions include identifiable details? (key names, additional <see cref="Exception.Data"/> annotations).
     /// </summary>
-    [Obsolete($"Please use {nameof(ConfigurationOptions)}.{nameof(ConfigurationOptions.IncludeDetailInExceptions)} instead - this will be removed in 3.0.")]
+    [Obsolete($"Please use {nameof(ConfigurationOptions)}.{nameof(ConfigurationOptions.IncludeDetailInExceptions)} instead - this will be removed in 3.2.", error: true)]
     [Browsable(false), EditorBrowsable(EditorBrowsableState.Never)]
     bool IncludeDetailInExceptions { get; set; }
 

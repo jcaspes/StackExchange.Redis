@@ -1,19 +1,52 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using RESPite.Messages;
+using StackExchange.Redis.Interfaces;
 
 namespace StackExchange.Redis
 {
-    internal sealed class RedisTransaction : RedisDatabase, ITransaction
+    internal sealed class RedisTransaction : RedisDatabase, ITransaction, IInternalTransaction
     {
         private List<ConditionResult>? _conditions;
         private List<QueuedMessage>? _pending;
+        private TransactionMessage? _lastMessage;
         private object SyncLock => this;
+
+        /// <inheritdoc/>
+        // set by TransactionProcessor when the server answers EXEC with a null array
+        public bool WasWatchConflict => _lastMessage?.WasWatchConflict == true;
+
+        // combine the retry categories of all queued operations, taking the most side-effecting (numerically
+        // highest) - this is what a replay of the whole transaction would do. WATCH constraints are *not*
+        // included: they live in _conditions, not _pending, and re-issuing them is what makes replay safe.
+        CommandFlags IInternalTransaction.GetAggregateRetryCategory()
+        {
+            var result = CommandFlags.None;
+            lock (SyncLock)
+            {
+                var list = _pending;
+                if (list != null)
+                {
+                    foreach (var q in list)
+                    {
+                        var cat = q.Wrapped.Flags & Message.MaskRetryCategory;
+                        if (cat > result) result = cat;
+                    }
+                }
+            }
+            return result;
+        }
+
+        private protected override DatabaseFeatureFlags GetDatabaseFeatures()
+            => base.GetDatabaseFeatures() | DatabaseFeatureFlags.Transaction;
 
         public RedisTransaction(RedisDatabase wrapped, object? asyncState) : base(wrapped.multiplexer, wrapped.Database, asyncState ?? wrapped.AsyncState)
         {
+            wrapped.RejectFlags(DatabaseFeatureFlags.Batch | DatabaseFeatureFlags.Transaction);
             // need to check we can reliably do this...
             var commandMap = multiplexer.CommandMap;
             commandMap.AssertAvailable(RedisCommand.MULTI);
@@ -166,7 +199,8 @@ namespace StackExchange.Redis
                 return Message.Create(-1, flags, RedisCommand.PING);
             }
             processor = TransactionProcessor.Default;
-            return new TransactionMessage(Database, flags, cond, work);
+
+            return _lastMessage = new TransactionMessage(Database, flags, cond, work);
         }
 
         private sealed class QueuedMessage : Message
@@ -186,9 +220,9 @@ namespace StackExchange.Redis
                 set => wasQueued = value;
             }
 
-            protected override void WriteImpl(PhysicalConnection physical)
+            protected override void WriteImpl(in MessageWriter writer)
             {
-                Wrapped.WriteTo(physical);
+                Wrapped.WriteTo(writer);
                 Wrapped.SetRequestSent();
             }
             public override int ArgCount => Wrapped.ArgCount;
@@ -201,16 +235,21 @@ namespace StackExchange.Redis
         {
             public static readonly ResultProcessor<bool> Default = new QueuedProcessor();
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
-                if (result.Resp2TypeBulkString == ResultType.SimpleString && result.IsEqual(CommonReplies.QUEUED))
+                if (reader.Prefix == RespPrefix.SimpleString && reader.IsScalar)
                 {
-                    if (message is QueuedMessage q)
+                    Span<byte> buffer = stackalloc byte[8];
+                    var span = reader.TryGetSpan(out var tmp) ? tmp : reader.Buffer(buffer);
+                    if (span.SequenceEqual("QUEUED"u8))
                     {
-                        connection?.BridgeCouldBeNull?.Multiplexer?.OnTransactionLog("Observed QUEUED for " + q.Wrapped?.CommandAndKey);
-                        q.WasQueued = true;
+                        if (message is QueuedMessage q)
+                        {
+                            connection?.BridgeCouldBeNull?.Multiplexer?.OnTransactionLog("Observed QUEUED for " + q.Wrapped?.CommandAndKey);
+                            q.WasQueued = true;
+                        }
+                        return true;
                     }
-                    return true;
                 }
                 return false;
             }
@@ -229,20 +268,31 @@ namespace StackExchange.Redis
                 this.conditions = (conditions?.Count > 0) ? conditions.ToArray() : Array.Empty<ConditionResult>();
             }
 
-            internal override void SetExceptionAndComplete(Exception exception, PhysicalBridge? bridge)
+            internal override void SetExceptionAndComplete(Exception exception, PhysicalConnection? connection)
             {
                 var inner = InnerOperations;
-                if (inner != null)
+                // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+                if (inner is not null)
                 {
                     for (int i = 0; i < inner.Length; i++)
                     {
-                        inner[i]?.Wrapped?.SetExceptionAndComplete(exception, bridge);
+                        inner[i]?.Wrapped?.SetExceptionAndComplete(exception, connection);
                     }
                 }
-                base.SetExceptionAndComplete(exception, bridge);
+                base.SetExceptionAndComplete(exception, connection);
             }
 
             public bool IsAborted => command != RedisCommand.EXEC;
+
+            // the server rejected an EXEC we really did issue, because a watched key moved; volatile
+            // because it is written on the read loop and observed by whoever awaited the transaction
+            public bool WasWatchConflict
+            {
+                get => Volatile.Read(ref _watchConflict);
+                set => Volatile.Write(ref _watchConflict, value);
+            }
+
+            private bool _watchConflict;
 
             public override void AppendStormLog(StringBuilder sb)
             {
@@ -320,9 +370,7 @@ namespace StackExchange.Redis
                                 sb.AppendLine("checking conditions in the *early* path");
                                 // need to get those sent ASAP; if they are stuck in the buffers, we die
                                 multiplexer.Trace("Flushing and waiting for precondition responses");
-#pragma warning disable CS0618 // Type or member is obsolete
-                                connection.FlushSync(true, multiplexer.TimeoutMilliseconds); // make sure they get sent, so we can check for QUEUED (and the preconditions if necessary)
-#pragma warning restore CS0618
+                                connection.Flush(); // make sure they get sent, so we can check for QUEUED (and the preconditions if necessary)
 
                                 if (Monitor.Wait(lastBox, multiplexer.TimeoutMilliseconds))
                                 {
@@ -380,9 +428,7 @@ namespace StackExchange.Redis
                                 sb.AppendLine("checking conditions in the *late* path");
 
                                 multiplexer.Trace("Flushing and waiting for precondition+queued responses");
-#pragma warning disable CS0618 // Type or member is obsolete
-                                connection.FlushSync(true, multiplexer.TimeoutMilliseconds); // make sure they get sent, so we can check for QUEUED (and the preconditions if necessary)
-#pragma warning restore CS0618
+                                connection.Flush(); // make sure they get sent, so we can check for QUEUED (and the preconditions if necessary)
                                 if (Monitor.Wait(lastBox, multiplexer.TimeoutMilliseconds))
                                 {
                                     if (!AreAllConditionsSatisfied(multiplexer))
@@ -428,7 +474,7 @@ namespace StackExchange.Redis
                         {
                             var inner = op.Wrapped;
                             inner.Cancel();
-                            inner.Complete();
+                            inner.Complete(connection);
                         }
                     }
                     connection.Trace("End of transaction: " + Command);
@@ -441,7 +487,7 @@ namespace StackExchange.Redis
                 }
             }
 
-            protected override void WriteImpl(PhysicalConnection physical) => physical.WriteHeader(Command, 0);
+            protected override void WriteImpl(in MessageWriter writer) => writer.WriteHeader(Command, 0);
 
             public override int ArgCount => 0;
 
@@ -469,98 +515,98 @@ namespace StackExchange.Redis
         {
             public static readonly TransactionProcessor Default = new();
 
-            public override bool SetResult(PhysicalConnection connection, Message message, in RawResult result)
+            public override bool SetResult(PhysicalConnection connection, Message message, ref RespReader reader)
             {
-                if (result.IsError && message is TransactionMessage tran)
+                var copy = reader;
+                reader.MovePastBof();
+                if (reader.IsError && message is TransactionMessage tran)
                 {
-                    string error = result.GetString()!;
+                    var errorKind = RedisErrorKindMetadata.Classify(reader);
+                    string error = reader.ReadString()!;
                     foreach (var op in tran.InnerOperations)
                     {
                         var inner = op.Wrapped;
-                        ServerFail(inner, error);
-                        inner.Complete();
+                        ServerFail(inner, errorKind, error);
+                        inner.Complete(connection);
                     }
                 }
-                return base.SetResult(connection, message, result);
+                return base.SetResult(connection, message, ref copy);
             }
 
-            protected override bool SetResultCore(PhysicalConnection connection, Message message, in RawResult result)
+            protected override bool SetResultCore(PhysicalConnection connection, Message message, ref RespReader reader)
             {
                 var muxer = connection.BridgeCouldBeNull?.Multiplexer;
-                muxer?.OnTransactionLog($"got {result} for {message.CommandAndKey}");
+                muxer?.OnTransactionLog($"got {reader.GetOverview()} for {message.CommandAndKey}");
                 if (message is TransactionMessage tran)
                 {
                     var wrapped = tran.InnerOperations;
-                    switch (result.Resp2TypeArray)
-                    {
-                        case ResultType.SimpleString:
-                            if (tran.IsAborted && result.IsEqual(CommonReplies.OK))
-                            {
-                                connection.Trace("Acknowledging UNWATCH (aborted electively)");
-                                SetResult(message, false);
-                                return true;
-                            }
-                            // EXEC returned with a NULL
-                            if (!tran.IsAborted && result.IsNull)
-                            {
-                                connection.Trace("Server aborted due to failed EXEC");
-                                // cancel the commands in the transaction and mark them as complete with the completion manager
-                                foreach (var op in wrapped)
-                                {
-                                    var inner = op.Wrapped;
-                                    inner.Cancel();
-                                    inner.Complete();
-                                }
-                                SetResult(message, false);
-                                return true;
-                            }
-                            break;
-                        case ResultType.Array:
-                            if (!tran.IsAborted)
-                            {
-                                var arr = result.GetItems();
-                                if (result.IsNull)
-                                {
-                                    muxer?.OnTransactionLog("Aborting wrapped messages (failed watch)");
-                                    connection.Trace("Server aborted due to failed WATCH");
-                                    foreach (var op in wrapped)
-                                    {
-                                        var inner = op.Wrapped;
-                                        inner.Cancel();
-                                        inner.Complete();
-                                    }
-                                    SetResult(message, false);
-                                    return true;
-                                }
-                                else if (wrapped.Length == arr.Length)
-                                {
-                                    connection.Trace("Server committed; processing nested replies");
-                                    muxer?.OnTransactionLog($"Processing {arr.Length} wrapped messages");
 
-                                    int i = 0;
-                                    foreach (ref RawResult item in arr)
-                                    {
-                                        var inner = wrapped[i++].Wrapped;
-                                        muxer?.OnTransactionLog($"> got {item} for {inner.CommandAndKey}");
-                                        if (inner.ComputeResult(connection, in item))
-                                        {
-                                            inner.Complete();
-                                        }
-                                    }
-                                    SetResult(message, true);
-                                    return true;
+                    if (reader.IsNull) // EXEC returned with a NULL
+                    {
+                        // the server refused to apply the transaction because a watched key changed
+                        // ("WATCH drift"); nothing was applied, so every queued operation must be
+                        // brought to a terminal state - otherwise the caller's tasks hang forever.
+                        // (in the electively-aborted case they were already cancelled in GetMessages;
+                        // Cancel/Complete are idempotent, so doing it again is harmless)
+                        muxer?.OnTransactionLog("Aborting wrapped messages (failed watch)");
+                        connection.Trace("Server aborted due to failed WATCH");
+
+                        // distinguish "the server refused an EXEC we issued" from "we chose not to issue
+                        // one"; only the former is worth re-attempting (see IInternalTransaction)
+                        tran.WasWatchConflict = !tran.IsAborted;
+
+                        foreach (var op in wrapped)
+                        {
+                            var inner = op.Wrapped;
+                            inner.Cancel();
+                            inner.Complete(connection);
+                        }
+                        SetResult(message, false);
+                        return true;
+                    }
+                    if (reader.IsScalar && (tran.IsAborted & reader.IsOK()))
+                    {
+                        connection.Trace("Acknowledging UNWATCH (aborted electively)");
+                        SetResult(message, false);
+                        return true;
+                    }
+
+                    if (reader.IsAggregate && !tran.IsAborted)
+                    {
+                        var len = reader.AggregateLength();
+                        if (len == wrapped.Length)
+                        {
+                            connection.Trace("Server committed; processing nested replies");
+                            muxer?.OnTransactionLog($"Processing {len} wrapped messages");
+
+                            var iter = reader.AggregateChildren();
+                            int i = 0;
+                            // using "raw" to leave reader ahead of content
+                            // (so errors and attributes can be consumed appropriately)
+                            while (iter.MoveNextRaw())
+                            {
+                                var inner = wrapped[i++].Wrapped;
+                                muxer?.OnTransactionLog($"> got {iter.Value.GetOverview()} for {inner.CommandAndKey}");
+                                if (inner.ComputeResult(connection, ref iter.Value))
+                                {
+                                    inner.Complete(connection);
                                 }
                             }
-                            break;
+
+                            Debug.Assert(i == len, "we pre-checked the lengths");
+                            SetResult(message, true);
+                            return true;
+                        }
                     }
+
                     // even if we didn't fully understand the result, we still need to do something with
                     // the pending tasks
                     foreach (var op in wrapped)
                     {
-                        if (op?.Wrapped is Message inner)
+                        if (op?.Wrapped is { } inner)
                         {
                             inner.Fail(ConnectionFailureType.ProtocolFailure, null, "Transaction failure", muxer);
-                            inner.Complete();
+                            inner.Complete(connection);
                         }
                     }
                 }

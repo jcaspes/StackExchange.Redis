@@ -5,6 +5,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 
 #if UNIX_SOCKET
@@ -15,7 +16,7 @@ namespace StackExchange.Redis
 {
     internal static class Format
     {
-#if NETSTANDARD2_1_OR_GREATER || NETCOREAPP3_0_OR_GREATER
+#if NET
         public static int ParseInt32(ReadOnlySpan<char> s) => int.Parse(s, NumberStyles.Integer, NumberFormatInfo.InvariantInfo);
         public static bool TryParseInt32(ReadOnlySpan<char> s, out int value) => int.TryParse(s, NumberStyles.Integer, NumberFormatInfo.InvariantInfo, out value);
 #endif
@@ -197,7 +198,7 @@ namespace StackExchange.Redis
                         }
                         break;
                 }
-#if NET6_0_OR_GREATER
+#if NET
                 Unsafe.SkipInit(out value);
 #else
                 value = 0;
@@ -281,7 +282,7 @@ namespace StackExchange.Redis
                         }
                         break;
                 }
-#if NET6_0_OR_GREATER
+#if NET
                 Unsafe.SkipInit(out value);
 #else
                 value = 0;
@@ -320,7 +321,18 @@ namespace StackExchange.Redis
                 }
 
 #if UNIX_SOCKET
-                endpoint = new UnixDomainSocketEndPoint(addressWithPort.Substring(1));
+                var path = addressWithPort.Substring(1);
+                if (path[0] == '@' && OperatingSystem.IsLinux())
+                {
+                    // "!@name" is the Linux ABSTRACT namespace, using the same '@' convention as
+                    // socat/systemd (and redis-cli/redis-benchmark where supported): the kernel
+                    // spelling is a leading NUL, which cannot appear in a config string. Linux-gated
+                    // because no other platform has the namespace — elsewhere '@' stays a literal
+                    // (strange) filename, matching what the other tools do. Note ToString() round-trips
+                    // for free: UnixDomainSocketEndPoint renders abstract names back as "@name".
+                    path = "\0" + path.Substring(1);
+                }
+                endpoint = new UnixDomainSocketEndPoint(path);
                 return true;
 #else
                 throw new PlatformNotSupportedException("Unix domain sockets require .NET Core 3 or above");
@@ -393,10 +405,11 @@ namespace StackExchange.Redis
 
         internal static string GetString(ReadOnlySequence<byte> buffer)
         {
-            if (buffer.IsSingleSegment) return GetString(buffer.First.Span);
+            if (buffer.IsSingleSegment) return GetString(buffer.FirstSpan);
 
-            var arr = ArrayPool<byte>.Shared.Rent(checked((int)buffer.Length));
-            var span = new Span<byte>(arr, 0, (int)buffer.Length);
+            var length = checked((int)buffer.Length);
+            var arr = ArrayPool<byte>.Shared.Rent(length);
+            var span = new Span<byte>(arr, 0, length);
             buffer.CopyTo(span);
             string s = GetString(span);
             ArrayPool<byte>.Shared.Return(arr);
@@ -406,10 +419,10 @@ namespace StackExchange.Redis
         internal static unsafe string GetString(ReadOnlySpan<byte> span)
         {
             if (span.IsEmpty) return "";
-#if NETCOREAPP3_1_OR_GREATER
+#if NET
             return Encoding.UTF8.GetString(span);
 #else
-            fixed (byte* ptr = span)
+            fixed (byte* ptr = &MemoryMarshal.GetReference(span))
             {
                 return Encoding.UTF8.GetString(ptr, span.Length);
             }
@@ -468,6 +481,31 @@ namespace StackExchange.Redis
 #endif
         }
 
+        internal static int FormatDouble(double value, Span<char> destination)
+        {
+            string s;
+            if (double.IsInfinity(value))
+            {
+                s = double.IsPositiveInfinity(value) ? "+inf" : "-inf";
+                if (!s.AsSpan().TryCopyTo(destination)) ThrowFormatFailed();
+                return 4;
+            }
+
+#if NET
+            if (!value.TryFormat(destination, out int len, "G17", NumberFormatInfo.InvariantInfo))
+            {
+                ThrowFormatFailed();
+            }
+
+            return len;
+#else
+            s = value.ToString("G17", NumberFormatInfo.InvariantInfo); // this looks inefficient, but is how Utf8Formatter works too, just: more direct
+            if (s.Length > destination.Length) ThrowFormatFailed();
+            s.AsSpan().CopyTo(destination);
+            return s.Length;
+#endif
+        }
+
         internal static int MeasureInt64(long value)
         {
             Span<byte> valueSpan = stackalloc byte[MaxInt64TextLen];
@@ -481,10 +519,36 @@ namespace StackExchange.Redis
             return len;
         }
 
+        internal static int FormatInt64(long value, Span<char> destination)
+        {
+#if NET
+            if (!value.TryFormat(destination, out var len))
+                ThrowFormatFailed();
+            return len;
+#else
+            Span<byte> buffer = stackalloc byte[MaxInt64TextLen];
+            var bytes = FormatInt64(value, buffer);
+            return Encoding.UTF8.GetChars(buffer.Slice(0, bytes), destination);
+#endif
+        }
+
         internal static int MeasureUInt64(ulong value)
         {
             Span<byte> valueSpan = stackalloc byte[MaxInt64TextLen];
             return FormatUInt64(value, valueSpan);
+        }
+
+        internal static int FormatUInt64(ulong value, Span<char> destination)
+        {
+#if NET
+            if (!value.TryFormat(destination, out var len))
+                ThrowFormatFailed();
+            return len;
+#else
+            Span<byte> buffer = stackalloc byte[MaxInt64TextLen];
+            var bytes = FormatUInt64(value, buffer);
+            return Encoding.UTF8.GetChars(buffer.Slice(0, bytes), destination);
+#endif
         }
 
         internal static int FormatUInt64(ulong value, Span<byte> destination)
@@ -501,9 +565,22 @@ namespace StackExchange.Redis
             return len;
         }
 
+        internal static int FormatInt32(int value, Span<char> destination)
+        {
+#if NET
+            if (!value.TryFormat(destination, out var len))
+                ThrowFormatFailed();
+            return len;
+#else
+            Span<byte> buffer = stackalloc byte[MaxInt32TextLen];
+            var bytes = FormatInt32(value, buffer);
+            return Encoding.UTF8.GetChars(buffer.Slice(0, bytes), destination);
+#endif
+        }
+
         internal static bool TryParseVersion(ReadOnlySpan<char> input, [NotNullWhen(true)] out Version? version)
         {
-#if NETCOREAPP3_1_OR_GREATER
+#if NET
             if (Version.TryParse(input, out version)) return true;
             // allow major-only (Version doesn't do this, because... reasons?)
             if (TryParseInt32(input, out int i32))
@@ -519,14 +596,8 @@ namespace StackExchange.Redis
                 version = null;
                 return false;
             }
-            unsafe
-            {
-                fixed (char* ptr = input)
-                {
-                    string s = new(ptr, 0, input.Length);
-                    return TryParseVersion(s, out version);
-                }
-            }
+            string s = input.ToString();
+            return TryParseVersion(s, out version);
 #endif
         }
 

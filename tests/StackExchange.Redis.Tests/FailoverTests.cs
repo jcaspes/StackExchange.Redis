@@ -1,4 +1,4 @@
-﻿#if NET6_0_OR_GREATER
+﻿#if NET
 using System;
 using System.IO;
 using System.Threading;
@@ -16,7 +16,7 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
 
     public async ValueTask InitializeAsync()
     {
-        await using var conn = Create();
+        await using var conn = Create(connectTimeout: 10000);
 
         var shouldBePrimary = conn.GetServer(TestConfig.Current.FailoverPrimaryServerAndPort);
         if (shouldBePrimary.IsReplica)
@@ -89,7 +89,7 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         await GetServer(receiverConn).PingAsync();
         await Task.Delay(1000).ConfigureAwait(false);
         Assert.True(count == -1 || count >= 2, "subscribers");
-        Assert.True(Interlocked.CompareExchange(ref total, 0, 0) >= 1, "total (1st)");
+        Assert.True(Volatile.Read(ref total) >= 1, "total (1st)");
 
         Interlocked.Exchange(ref total, 0);
 
@@ -100,7 +100,7 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         await Task.Delay(1000).ConfigureAwait(false);
         await GetServer(receiverConn).PingAsync();
         await GetServer(receiverConn).PingAsync();
-        Assert.True(Interlocked.CompareExchange(ref total, 0, 0) >= 1, "total (2nd)");
+        Assert.True(Volatile.Read(ref total) >= 1, "total (2nd)");
     }
 
     [Fact]
@@ -196,14 +196,16 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
 
 #if DEBUG
     [Fact]
+    [Trait(TestCategories.Category, TestCategories.SimulatedConnectionFailure)]
     public async Task SubscriptionsSurviveConnectionFailureAsync()
     {
-        await using var conn = Create(allowAdmin: true, shared: false, log: Writer, syncTimeout: 1000);
+        await using var conn = Create(allowAdmin: true, log: Writer, syncTimeout: 1000, allowSimulateConnectionFailure: true);
 
         var profiler = conn.AddProfiler();
         RedisChannel channel = RedisChannel.Literal(Me());
         var sub = conn.GetSubscriber();
         int counter = 0;
+        await UntilConditionAsync(TimeSpan.FromSeconds(10), () => sub.IsConnected()).ForAwait();
         Assert.True(sub.IsConnected());
         await sub.SubscribeAsync(channel, (arg1, arg2) => Interlocked.Increment(ref counter)).ConfigureAwait(false);
 
@@ -217,11 +219,12 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         await sub.PingAsync();
         await Task.Delay(200).ConfigureAwait(false);
 
-        var counter1 = Thread.VolatileRead(ref counter);
+        var counter1 = Volatile.Read(ref counter);
         Log($"Expecting 1 message, got {counter1}");
         Assert.Equal(1, counter1);
 
         var server = GetServer(conn);
+        Assert.SkipUnless(server.CanSimulateConnectionFailure(), "Skipping because server cannot simulate connection failure");
         var socketCount = server.GetCounters().Subscription.SocketCount;
         Log($"Expecting 1 socket, got {socketCount}");
         Assert.Equal(1, socketCount);
@@ -236,9 +239,11 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         server.SimulateConnectionFailure(SimulatedFailureType.All);
         // Trigger failure (RedisTimeoutException or RedisConnectionException because
         // of backlog behavior)
-        var ex = Assert.ThrowsAny<Exception>(() => sub.Ping());
-        Assert.True(ex is RedisTimeoutException or RedisConnectionException);
         Assert.False(sub.IsConnected(channel));
+
+        var ex = Assert.ThrowsAny<Exception>(() => Log($"Ping: {sub.Ping(CommandFlags.DemandMaster)}ms"));
+        Assert.True(ex is RedisTimeoutException or RedisConnectionException);
+        Log($"Failed as expected: {ex.Message}");
 
         // Now reconnect...
         conn.AllowConnect = true;
@@ -263,7 +268,7 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         foreach (var pair in muxerSubs)
         {
             var muxerSub = pair.Value;
-            Log($"  Muxer Sub: {pair.Key}: (EndPoint: {muxerSub.GetCurrentServer()}, Connected: {muxerSub.IsConnected})");
+            Log($"  Muxer Sub: {pair.Key}: (EndPoint: {muxerSub.GetAnyCurrentServer()}, Connected: {muxerSub.IsConnectedAny()})");
         }
 
         Log("Publishing");
@@ -274,9 +279,9 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
 
         // Give it a few seconds to get our messages
         Log("Waiting for 2 messages");
-        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => Thread.VolatileRead(ref counter) == 2);
+        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => Volatile.Read(ref counter) == 2);
 
-        var counter2 = Thread.VolatileRead(ref counter);
+        var counter2 = Volatile.Read(ref counter);
         Log($"Expecting 2 messages, got {counter2}");
         Assert.Equal(2, counter2);
 
@@ -335,17 +340,17 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
         Log("  SubA ping: " + subA.Ping());
         Log("  SubB ping: " + subB.Ping());
         // If redis is under load due to this suite, it may take a moment to send across.
-        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => Interlocked.Read(ref aCount) == 2 && Interlocked.Read(ref bCount) == 2).ForAwait();
+        await UntilConditionAsync(TimeSpan.FromSeconds(5), () => Volatile.Read(ref aCount) == 2 && Volatile.Read(ref bCount) == 2).ForAwait();
 
-        Assert.Equal(2, Interlocked.Read(ref aCount));
-        Assert.Equal(2, Interlocked.Read(ref bCount));
-        Assert.Equal(0, Interlocked.Read(ref primaryChanged));
+        Assert.Equal(2, Volatile.Read(ref aCount));
+        Assert.Equal(2, Volatile.Read(ref bCount));
+        Assert.Equal(0, Volatile.Read(ref primaryChanged));
 
         try
         {
-            Interlocked.Exchange(ref primaryChanged, 0);
-            Interlocked.Exchange(ref aCount, 0);
-            Interlocked.Exchange(ref bCount, 0);
+            Volatile.Write(ref primaryChanged, 0);
+            Volatile.Write(ref aCount, 0);
+            Volatile.Write(ref bCount, 0);
             Log("Changing primary...");
             using (var sw = new StringWriter())
             {
@@ -406,17 +411,17 @@ public class FailoverTests(ITestOutputHelper output) : TestBase(output), IAsyncL
             await subA.PingAsync();
             await subB.PingAsync();
             Log("Ping Complete. Checking...");
-            await UntilConditionAsync(TimeSpan.FromSeconds(10), () => Interlocked.Read(ref aCount) == 2 && Interlocked.Read(ref bCount) == 2).ForAwait();
+            await UntilConditionAsync(TimeSpan.FromSeconds(10), () => Volatile.Read(ref aCount) == 2 && Volatile.Read(ref bCount) == 2).ForAwait();
 
             Log("Counts so far:");
-            Log("  aCount: " + Interlocked.Read(ref aCount));
-            Log("  bCount: " + Interlocked.Read(ref bCount));
-            Log("  primaryChanged: " + Interlocked.Read(ref primaryChanged));
+            Log("  aCount: " + Volatile.Read(ref aCount));
+            Log("  bCount: " + Volatile.Read(ref bCount));
+            Log("  primaryChanged: " + Volatile.Read(ref primaryChanged));
 
-            Assert.Equal(2, Interlocked.Read(ref aCount));
-            Assert.Equal(2, Interlocked.Read(ref bCount));
+            Assert.Equal(2, Volatile.Read(ref aCount));
+            Assert.Equal(2, Volatile.Read(ref bCount));
             // Expect 12, because a sees a, but b sees a and b due to replication, but contenders may add their own
-            Assert.True(Interlocked.CompareExchange(ref primaryChanged, 0, 0) >= 12);
+            Assert.True(Volatile.Read(ref primaryChanged) >= 12);
         }
         catch
         {

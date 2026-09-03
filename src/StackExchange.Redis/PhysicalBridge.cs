@@ -8,10 +8,6 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
-#if !NETCOREAPP
-using Pipelines.Sockets.Unofficial.Threading;
-using static Pipelines.Sockets.Unofficial.Threading.MutexSlim;
-#endif
 
 namespace StackExchange.Redis
 {
@@ -48,11 +44,15 @@ namespace StackExchange.Redis
         private int failConnectCount = 0;
         private volatile bool isDisposed;
         private volatile bool shouldResetConnectionRetryCount;
+        private bool _needsReconnect;
         private long nonPreferredEndpointCount;
 
         // private volatile int missedHeartbeats;
         private long operationCount, socketCount;
         private volatile PhysicalConnection? physical;
+
+        /// <summary>The current connection, if any; for diagnostics and tests.</summary>
+        internal PhysicalConnection? Physical => physical;
 
         private long profileLastLog;
         private int profileLogIndex;
@@ -63,11 +63,7 @@ namespace StackExchange.Redis
 
         internal long? ConnectionId => physical?.ConnectionId;
 
-#if NETCOREAPP
-        private readonly SemaphoreSlim _singleWriterMutex = new(1, 1);
-#else
-        private readonly MutexSlim _singleWriterMutex;
-#endif
+        private readonly AwaitableMutex _singleWriter;
 
         internal string? PhysicalName => physical?.ToString();
 
@@ -81,18 +77,13 @@ namespace StackExchange.Redis
             ConnectionType = type;
             Multiplexer = serverEndPoint.Multiplexer;
             Name = Format.ToString(serverEndPoint.EndPoint) + "/" + ConnectionType.ToString();
-            TimeoutMilliseconds = timeoutMilliseconds;
-#if !NETCOREAPP
-            _singleWriterMutex = new MutexSlim(timeoutMilliseconds: timeoutMilliseconds);
-#endif
+            _singleWriter = AwaitableMutex.Create(timeoutMilliseconds: timeoutMilliseconds);
             if (type == ConnectionType.Interactive && Multiplexer.RawConfig.HighIntegrity)
             {
                 // we just need this to be non-zero to enable tracking
                 _nextHighIntegrityToken = 1;
             }
         }
-
-        private readonly int TimeoutMilliseconds;
 
         public enum State : byte
         {
@@ -117,9 +108,9 @@ namespace StackExchange.Redis
         public long SubscriptionCount => physical?.SubscriptionCount ?? 0;
 
         internal State ConnectionState => (State)state;
-        internal bool IsBeating => Interlocked.CompareExchange(ref beating, 0, 0) == 1;
+        internal bool IsBeating => Volatile.Read(ref beating) == 1;
 
-        internal long OperationCount => Interlocked.Read(ref operationCount);
+        internal long OperationCount => Volatile.Read(ref operationCount);
 
         public RedisCommand LastCommand { get; private set; }
 
@@ -131,11 +122,21 @@ namespace StackExchange.Redis
         private RedisProtocol _protocol; // note starts at zero, not RESP2
         internal void SetProtocol(RedisProtocol protocol) => _protocol = protocol;
 
+        /// <summary>
+        /// Indicates whether the bridge needs to reconnect.
+        /// </summary>
+        internal bool NeedsReconnect => Volatile.Read(ref _needsReconnect);
+
+        /// <summary>
+        /// Marks that the bridge needs to reconnect.
+        /// </summary>
+        internal void MarkNeedsReconnect() => Volatile.Write(ref _needsReconnect, true);
+
         public void Dispose()
         {
             isDisposed = true;
             // If there's anything in the backlog and we're being torn down - exfil it immediately (e.g. so all awaitables complete)
-            AbandonPendingBacklog(new ObjectDisposedException("Connection is being disposed"));
+            AbandonPendingBacklog(new ObjectDisposedException("Connection is being disposed"), null);
             try
             {
                 _backlogAutoReset?.Set();
@@ -154,7 +155,7 @@ namespace StackExchange.Redis
             isDisposed = true; // make damn sure we don't true to resurrect
 
             // If there's anything in the backlog and we're being torn down - exfil it immediately (e.g. so all awaitables complete)
-            AbandonPendingBacklog(new ObjectDisposedException("Connection is being finalized"));
+            AbandonPendingBacklog(new ObjectDisposedException("Connection is being finalized"), null);
 
             // shouldn't *really* touch managed objects
             // in a finalizer, but we need to kill that socket,
@@ -194,7 +195,7 @@ namespace StackExchange.Redis
             // Anything else goes in the bin - we're just not ready for you yet
             message.Cancel();
             Multiplexer.OnMessageFaulted(message, null);
-            message.Complete();
+            message.Complete(null);
             return WriteResult.NoConnectionAvailable;
         }
 
@@ -202,7 +203,7 @@ namespace StackExchange.Redis
         {
             message.Cancel();
             Multiplexer.OnMessageFaulted(message, null);
-            message.Complete();
+            message.Complete(null);
             return WriteResult.NoConnectionAvailable;
         }
 
@@ -210,7 +211,7 @@ namespace StackExchange.Redis
         public WriteResult TryWriteSync(Message message, bool isReplica)
         {
             if (isDisposed) throw new ObjectDisposedException(Name);
-            if (!IsConnected) return QueueOrFailMessage(message);
+            if (!IsConnected || NeedsReconnect) return QueueOrFailMessage(message);
 
             var physical = this.physical;
             if (physical == null)
@@ -234,7 +235,7 @@ namespace StackExchange.Redis
         public ValueTask<WriteResult> TryWriteAsync(Message message, bool isReplica, bool bypassBacklog = false)
         {
             if (isDisposed) throw new ObjectDisposedException(Name);
-            if (!IsConnected && !bypassBacklog) return new ValueTask<WriteResult>(QueueOrFailMessage(message));
+            if ((!IsConnected || NeedsReconnect) && !bypassBacklog) return new ValueTask<WriteResult>(QueueOrFailMessage(message));
 
             var physical = this.physical;
             if (physical == null)
@@ -261,9 +262,9 @@ namespace StackExchange.Redis
             var clone = new long[ProfileLogSamples + 1];
             for (int i = 0; i < ProfileLogSamples; i++)
             {
-                clone[i] = Interlocked.Read(ref profileLog[i]);
+                clone[i] = Volatile.Read(ref profileLog[i]);
             }
-            clone[ProfileLogSamples] = Interlocked.Read(ref operationCount);
+            clone[ProfileLogSamples] = Volatile.Read(ref operationCount);
             Array.Sort(clone);
             sb.Append(' ').Append(clone[0]);
             for (int i = 1; i < clone.Length; i++)
@@ -284,9 +285,10 @@ namespace StackExchange.Redis
         internal void GetCounters(ConnectionCounters counters)
         {
             counters.OperationCount = OperationCount;
-            counters.SocketCount = Interlocked.Read(ref socketCount);
-            counters.WriterCount = Interlocked.CompareExchange(ref activeWriters, 0, 0);
-            counters.NonPreferredEndpointCount = Interlocked.Read(ref nonPreferredEndpointCount);
+            counters.SocketCount = Volatile.Read(ref socketCount);
+            counters.WriterCount = Volatile.Read(ref activeWriters);
+            counters.NonPreferredEndpointCount = Volatile.Read(ref nonPreferredEndpointCount);
+            counters.PendingUnsentItems = Volatile.Read(ref _backlogCurrentEnqueued);
             physical?.GetCounters(counters);
         }
 
@@ -343,13 +345,9 @@ namespace StackExchange.Redis
 
         internal BridgeStatus GetStatus() => new()
         {
-            MessagesSinceLastHeartbeat = (int)(Interlocked.Read(ref operationCount) - Interlocked.Read(ref profileLastLog)),
+            MessagesSinceLastHeartbeat = (int)(Volatile.Read(ref operationCount) - Volatile.Read(ref profileLastLog)),
             ConnectedAt = ConnectedAt,
-#if NETCOREAPP
-            IsWriterActive = _singleWriterMutex.CurrentCount == 0,
-#else
-            IsWriterActive = !_singleWriterMutex.IsAvailable,
-#endif
+            IsWriterActive = !_singleWriter.IsAvailable,
             BacklogMessagesPending = _backlog.Count,
             BacklogMessagesPendingCounter = Volatile.Read(ref _backlogCurrentEnqueued),
             BacklogStatus = _backlogStatus,
@@ -467,7 +465,7 @@ namespace StackExchange.Redis
             // If we're configured to, fail all pending backlogged messages
             if (Multiplexer.RawConfig.BacklogPolicy?.AbortPendingOnConnectionFailure == true)
             {
-                AbandonPendingBacklog(innerException);
+                AbandonPendingBacklog(innerException, connection);
             }
 
             if (reportNextFailure)
@@ -516,12 +514,16 @@ namespace StackExchange.Redis
             }
         }
 
-        private void AbandonPendingBacklog(Exception ex)
+        private void AbandonPendingBacklog(Exception ex, PhysicalConnection? connection)
         {
             while (BacklogTryDequeue(out Message? next))
             {
-                Multiplexer.OnMessageFaulted(next, ex);
-                next.SetExceptionAndComplete(ex, this);
+                // as in PhysicalConnection.RecordMessageFailed: don't hand the same exception to every
+                // message. A backlogged message has provably never been written, which is exactly what the
+                // retry machinery needs to know, and it is lost if we share the connection-level instance.
+                var perMessage = ExceptionFactory.PerMessage(ex, next);
+                Multiplexer.OnMessageFaulted(next, perMessage);
+                next.SetExceptionAndComplete(perMessage, connection);
             }
         }
 
@@ -555,8 +557,8 @@ namespace StackExchange.Redis
 
         private bool DueForConnectRetry()
         {
-            int connectTimeMilliseconds = unchecked(Environment.TickCount - Thread.VolatileRead(ref connectStartTicks));
-            return Multiplexer.RawConfig.ReconnectRetryPolicy.ShouldRetry(Interlocked.Read(ref connectTimeoutRetryCount), connectTimeMilliseconds);
+            int connectTimeMilliseconds = unchecked(Environment.TickCount - Volatile.Read(ref connectStartTicks));
+            return Multiplexer.RawConfig.ReconnectRetryPolicy.ShouldRetry(Volatile.Read(ref connectTimeoutRetryCount), connectTimeMilliseconds);
         }
 
         internal void OnHeartbeat(bool ifConnectedOnly)
@@ -577,13 +579,18 @@ namespace StackExchange.Redis
                 if (!runThisTime) return;
 
                 uint index = (uint)Interlocked.Increment(ref profileLogIndex);
-                long newSampleCount = Interlocked.Read(ref operationCount);
-                Interlocked.Exchange(ref profileLog[index % ProfileLogSamples], newSampleCount);
-                Interlocked.Exchange(ref profileLastLog, newSampleCount);
-                Trace("OnHeartbeat: " + (State)state);
+                long newSampleCount = Volatile.Read(ref operationCount);
+                Volatile.Write(ref profileLog[index % ProfileLogSamples], newSampleCount);
+                Volatile.Write(ref profileLastLog, newSampleCount);
+
+#pragma warning disable CS0420 // A reference to a volatile field will not be treated as volatile
+                // ReSharper disable once LocalVariableHidesMember
+                ref State state = ref Unsafe.As<int, State>(ref this.state);
+#pragma warning restore CS0420 // A reference to a volatile field will not be treated as volatile
+                Trace("OnHeartbeat: " + state);
                 switch (state)
                 {
-                    case (int)State.Connecting:
+                    case State.Connecting:
                         if (DueForConnectRetry())
                         {
                             Interlocked.Increment(ref connectTimeoutRetryCount);
@@ -598,28 +605,29 @@ namespace StackExchange.Redis
                             TryConnect(null);
                         }
                         break;
-                    case (int)State.ConnectedEstablishing:
+                    case State.ConnectedEstablishing:
                         // (Fall through) Happens when we successfully connected via TCP, but no Redis handshake completion yet.
                         // This can happen brief (usual) or when the server never answers (rare). When we're in this state,
                         // a socket is open and reader likely listening indefinitely for incoming data on an async background task.
                         // We need to time that out and cleanup the PhysicalConnection if needed, otherwise that reader and socket will remain open
                         // for the lifetime of the application due to being orphaned, yet still referenced by the active task doing the pipe read.
-                    case (int)State.ConnectedEstablished:
-                        // Track that we should reset the count on the next disconnect, but not do so in a loop
-                        shouldResetConnectionRetryCount = true;
+                    case State.ConnectedEstablished:
                         var tmp = physical;
                         if (tmp != null)
                         {
-                            if (state == (int)State.ConnectedEstablished)
+                            if (state is State.ConnectedEstablished)
                             {
-                                Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
+                                // Track that we should reset the count on the next disconnect, but not do so in a loop, reset
+                                // the connect-retry-count (used for backoff decay etc), and remove any non-responsive flag.
+                                shouldResetConnectionRetryCount = true;
+                                Volatile.Write(ref connectTimeoutRetryCount, 0);
                                 tmp.BridgeCouldBeNull?.ServerEndPoint?.ClearUnselectable(UnselectableFlags.DidNotRespond);
                             }
                             tmp.OnBridgeHeartbeat(out int asyncTimeoutThisHeartbeat, out int syncTimeoutThisHeartbeat);
                             int writeEverySeconds = ServerEndPoint.WriteEverySeconds;
                             bool configCheckDue = ServerEndPoint.ConfigCheckSeconds > 0 && ServerEndPoint.LastInfoReplicationCheckSecondsAgo >= ServerEndPoint.ConfigCheckSeconds;
 
-                            if (state == (int)State.ConnectedEstablished && ConnectionType == ConnectionType.Interactive
+                            if (state is State.ConnectedEstablished && ConnectionType == ConnectionType.Interactive
                                 && tmp.BridgeCouldBeNull?.Multiplexer.RawConfig.HeartbeatConsistencyChecks == true)
                             {
                                 // If HeartbeatConsistencyChecks are enabled, we're sending a PING (expecting PONG) or ECHO (expecting UniqueID back) every single
@@ -634,7 +642,7 @@ namespace StackExchange.Redis
                                     ServerEndPoint.CheckInfoReplication();
                                 }
                             }
-                            else if (state == (int)State.ConnectedEstablished && ConnectionType == ConnectionType.Interactive
+                            else if (state is State.ConnectedEstablished && ConnectionType == ConnectionType.Interactive
                                 && configCheckDue
                                 && ServerEndPoint.CheckInfoReplication())
                             {
@@ -643,7 +651,7 @@ namespace StackExchange.Redis
                             else if (writeEverySeconds > 0 && tmp.LastWriteSecondsAgo >= writeEverySeconds)
                             {
                                 Trace("OnHeartbeat - overdue");
-                                if (state == (int)State.ConnectedEstablished)
+                                if (state is State.ConnectedEstablished)
                                 {
                                     KeepAlive();
                                 }
@@ -665,8 +673,9 @@ namespace StackExchange.Redis
 
                             // This is an "always" check - we always want to evaluate a dead connection from a non-responsive sever regardless of the need to heartbeat above
                             var totalTimeoutThisHeartbeat = asyncTimeoutThisHeartbeat + syncTimeoutThisHeartbeat;
-                            if ((totalTimeoutThisHeartbeat > 0)
-                                && tmp.LastReadSecondsAgo * 1_000 > (tmp.BridgeCouldBeNull?.Multiplexer.AsyncTimeoutMilliseconds * 4))
+                            bool deadConnectionOnAsync = asyncTimeoutThisHeartbeat > 0 && tmp.LastReadSecondsAgo * 1_000 > (tmp.BridgeCouldBeNull?.Multiplexer.AsyncTimeoutMilliseconds * 4);
+                            bool deadConnectionOnSync = syncTimeoutThisHeartbeat > 0 && tmp.LastReadSecondsAgo * 1_000 > (tmp.BridgeCouldBeNull?.Multiplexer.TimeoutMilliseconds * 4);
+                            if (deadConnectionOnAsync || deadConnectionOnSync)
                             {
                                 // If we've received *NOTHING* on the pipe in 4 timeouts worth of time and we're timing out commands, issue a connection failure so that we reconnect
                                 // This is meant to address the scenario we see often in Linux configs where TCP retries will happen for 15 minutes.
@@ -678,14 +687,14 @@ namespace StackExchange.Redis
                             }
                         }
                         break;
-                    case (int)State.Disconnected:
+                    case State.Disconnected:
                         // Only if we should reset the connection count
                         // This should only happen after a successful reconnection, and not every time we bounce from BeginConnectAsync -> Disconnected
                         // in a failure loop case that happens when a node goes missing forever.
                         if (shouldResetConnectionRetryCount)
                         {
                             shouldResetConnectionRetryCount = false;
-                            Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
+                            Volatile.Write(ref connectTimeoutRetryCount, 0);
                         }
                         if (!ifConnectedOnly && DueForConnectRetry())
                         {
@@ -698,7 +707,7 @@ namespace StackExchange.Redis
                         }
                         break;
                     default:
-                        Interlocked.Exchange(ref connectTimeoutRetryCount, 0);
+                        Volatile.Write(ref connectTimeoutRetryCount, 0);
                         break;
                 }
             }
@@ -728,13 +737,39 @@ namespace StackExchange.Redis
 
             if (isDisposed) throw new ObjectDisposedException(Name);
 
-            if (!IsConnected)
+            if (!IsConnected || NeedsReconnect)
             {
+                // During reconnection (e.g. MOVED-to-same-endpoint), queue messages to the backlog
+                // so they can be sent once the connection is re-established.
+                // This matches the behavior of TryWriteAsync/TryWriteSync for individual commands.
+                if (Multiplexer.RawConfig.BacklogPolicy.QueueWhileDisconnected)
+                {
+                    foreach (var message in messages)
+                    {
+                        message.SetEnqueued(null);
+                        BacklogEnqueue(message);
+                    }
+                    StartBacklogProcessor();
+                    return true;
+                }
                 return false;
             }
 
             var physical = this.physical;
-            if (physical == null) return false;
+            if (physical == null)
+            {
+                if (Multiplexer.RawConfig.BacklogPolicy.QueueWhileDisconnected)
+                {
+                    foreach (var message in messages)
+                    {
+                        message.SetEnqueued(null);
+                        BacklogEnqueue(message);
+                    }
+                    StartBacklogProcessor();
+                    return true;
+                }
+                return false;
+            }
             foreach (var message in messages)
             {
                 // deliberately not taking a single lock here; we don't care if
@@ -752,6 +787,19 @@ namespace StackExchange.Redis
 
         private WriteResult WriteMessageInsideLock(PhysicalConnection physical, Message message)
         {
+            if (ConnectionType == ConnectionType.Interactive
+                && message.IsForSubscriptionBridge
+                && Protocol is RedisProtocol.Resp2
+                && ServerEndPoint.TryRerouteToSubscriptionBridge(message, this))
+            {
+                // this was queued while we expected RESP3 - where subscriptions share the interactive
+                // connection - but the handshake resolved to RESP2, which needs them on their own connection.
+                // Writing it here would put *this* connection into subscriber mode, which rejects every
+                // ordinary command on it from then on; see #3154
+                Trace($"Rerouting {message.CommandAndKey} to the subscription connection (RESP2)");
+                return WriteResult.Success;
+            }
+
             WriteResult result;
             var existingMessage = Interlocked.CompareExchange(ref _activeMessage, message, null);
             if (existingMessage != null)
@@ -774,7 +822,7 @@ namespace StackExchange.Redis
                         // killed the underlying connection
                         Trace("Unable to write to server");
                         message.Fail(ConnectionFailureType.ProtocolFailure, null, "failure before write: " + result.ToString(), Multiplexer);
-                        message.Complete();
+                        message.Complete(physical);
                         return result;
                     }
                     // The parent message (next) may be returned from GetMessages
@@ -808,20 +856,11 @@ namespace StackExchange.Redis
                 return WriteResult.Success; // queued counts as success
             }
 
-#if NETCOREAPP
             bool gotLock = false;
-#else
-            LockToken token = default;
-#endif
             try
             {
-#if NETCOREAPP
-                gotLock = _singleWriterMutex.Wait(0);
+                gotLock = _singleWriter.TryTakeInstant();
                 if (!gotLock)
-#else
-                token = _singleWriterMutex.TryWait(WaitOptions.NoDelay);
-                if (!token.Success)
-#endif
                 {
                     // If we can't get it *instantaneously*, pass it to the backlog for throughput
                     if (TryPushToBacklog(message, onlyIfExists: false))
@@ -832,37 +871,28 @@ namespace StackExchange.Redis
                     // no backlog... try to wait with the timeout;
                     // if we *still* can't get it: that counts as
                     // an actual timeout
-#if NETCOREAPP
-                    gotLock = _singleWriterMutex.Wait(TimeoutMilliseconds);
+                    gotLock = _singleWriter.TryTakeSync();
                     if (!gotLock) return TimedOutBeforeWrite(message);
-#else
-                    token = _singleWriterMutex.TryWait();
-                    if (!token.Success) return TimedOutBeforeWrite(message);
-#endif
                 }
 
                 var result = WriteMessageInsideLock(physical, message);
 
-                if (result == WriteResult.Success)
+                if (result == WriteResult.Success & message.IsFlushRequiredSync)
                 {
-                    result = physical.FlushSync(false, TimeoutMilliseconds);
+                    physical.Flush();
                 }
 
                 physical.SetIdle();
                 return result;
             }
-            catch (Exception ex) { return HandleWriteException(message, ex); }
+            catch (Exception ex) { return HandleWriteException(physical, message, ex); }
             finally
             {
                 UnmarkActiveMessage(message);
-#if NETCOREAPP
                 if (gotLock)
                 {
-                    _singleWriterMutex.Release();
+                    _singleWriter.Release();
                 }
-#else
-                token.Dispose();
-#endif
             }
         }
 
@@ -895,6 +925,16 @@ namespace StackExchange.Redis
             // Which StartBacklogProcessor will check.
             StartBacklogProcessor();
             return true;
+        }
+
+        /// <summary>
+        /// Takes over a message that was queued against a different bridge of the same endpoint, because the
+        /// protocol resolved differently to what we expected when it was queued (see #3154).
+        /// </summary>
+        internal void AcceptRerouted(Message message)
+        {
+            BacklogEnqueue(message);
+            StartBacklogProcessor();
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -934,20 +974,40 @@ namespace StackExchange.Redis
         {
             if (Interlocked.CompareExchange(ref _backlogProcessorIsRunning, 1, 0) == 0)
             {
-                _backlogStatus = BacklogStatus.Activating;
-
-                // Start the backlog processor; this is a bit unorthodox, as you would *expect* this to just
-                // be Task.Run; that would work fine when healthy, but when we're falling on our face, it is
-                // easy to get into a thread-pool-starvation "spiral of death" if we rely on the thread-pool
-                // to unblock the thread-pool when there could be sync-over-async callers. Note that in reality,
-                // the initial "enough" of the back-log processor is typically sync, which means that the thread
-                // we start is actually useful, despite thinking "but that will just go async and back to the pool"
-                var thread = new Thread(s => ((PhysicalBridge)s!).ProcessBacklog())
+                var successfullyStarted = false;
+                try
                 {
-                    IsBackground = true,                  // don't keep process alive (also: act like the thread-pool used to)
-                    Name = "StackExchange.Redis Backlog", // help anyone looking at thread-dumps
-                };
-                thread.Start(this);
+                    _backlogStatus = BacklogStatus.Activating;
+
+                    // Start the backlog processor; this is a bit unorthodox, as you would *expect* this to just
+                    // be Task.Run; that would work fine when healthy, but when we're falling on our face, it is
+                    // easy to get into a thread-pool-starvation "spiral of death" if we rely on the thread-pool
+                    // to unblock the thread-pool when there could be sync-over-async callers. Note that in reality,
+                    // the initial "enough" of the back-log processor is typically sync, which means that the thread
+                    // we start is actually useful, despite thinking "but that will just go async and back to the pool"
+                    var thread = new Thread(s => ((PhysicalBridge)s!).ProcessBacklog())
+                    {
+                        IsBackground = true,                  // don't keep process alive (also: act like the thread-pool used to)
+                        Name = "StackExchange.Redis Backlog", // help anyone looking at thread-dumps
+                    };
+
+                    thread.Start(this);
+                    successfullyStarted = true;
+                }
+                catch (Exception ex)
+                {
+                    OnInternalError(ex);
+                    Trace("StartBacklogProcessor failed to start backlog processor thread: " + ex.Message);
+                }
+                finally
+                {
+                    // If thread failed to start - reset flag to ensure next call doesn't erroneously think backlog process is running
+                    if (!successfullyStarted)
+                    {
+                        _backlogStatus = BacklogStatus.Inactive;
+                        Interlocked.Exchange(ref _backlogProcessorIsRunning, 0);
+                    }
+                }
             }
             else
             {
@@ -962,7 +1022,7 @@ namespace StackExchange.Redis
         private void CheckBacklogForTimeouts()
         {
             var now = Environment.TickCount;
-            var timeout = TimeoutMilliseconds;
+            var timeout = _singleWriter.TimeoutMilliseconds;
 
             // Because peeking at the backlog, checking message and then dequeuing, is not thread-safe, we do have to use
             // a lock here, for mutual exclusion of backlog DEQUEUERS. Unfortunately.
@@ -992,7 +1052,7 @@ namespace StackExchange.Redis
                     // Tell the message it has failed
                     // Note: Attempting to *avoid* reentrancy/deadlock issues by not holding the lock while completing messages.
                     var ex = Multiplexer.GetException(WriteResult.TimeoutBeforeWrite, message, ServerEndPoint, this);
-                    message.SetExceptionAndComplete(ex, this);
+                    message.SetExceptionAndComplete(ex, null);
                 }
             }
         }
@@ -1068,7 +1128,7 @@ namespace StackExchange.Redis
                         }
 
                         var ex = ExceptionFactory.Timeout(Multiplexer, "The message was in the backlog when connection was disposed", message, ServerEndPoint, WriteResult.TimeoutBeforeWrite, this);
-                        message.SetExceptionAndComplete(ex, this);
+                        message.SetExceptionAndComplete(ex, null);
                     }
                 }
             }
@@ -1113,11 +1173,7 @@ namespace StackExchange.Redis
         {
             // Importantly: don't assume we have a physical connection here
             // We are very likely to hit a state where it's not re-established or even referenced here
-#if NETCOREAPP
             bool gotLock = false;
-#else
-            LockToken token = default;
-#endif
             _backlogAutoReset.Reset();
             try
             {
@@ -1135,21 +1191,22 @@ namespace StackExchange.Redis
                     if (_backlog.IsEmpty) return; // nothing to do
 
                     // try and get the lock; if unsuccessful, retry
-#if NETCOREAPP
-                    gotLock = _singleWriterMutex.Wait(TimeoutMilliseconds);
+                    gotLock = _singleWriter.TryTakeSync();
                     if (gotLock) break; // got the lock; now go do something with it
-#else
-                    token = _singleWriterMutex.TryWait();
-                    if (token.Success) break; // got the lock; now go do something with it
-#endif
                 }
                 _backlogStatus = BacklogStatus.Started;
 
                 // Only execute if we're connected.
                 // Timeouts are handled above, so we're exclusively into backlog items eligible to write at this point.
                 // If we can't write them, abort and wait for the next heartbeat or activation to try this again.
-                while (IsConnected && physical?.HasOutputPipe == true)
+                bool flush = false;
+                while (IsConnected)
                 {
+                    // Snapshot the connection for the whole of this message: OnDisconnected nulls the field
+                    // without waiting for the write lock, so re-reading it (as the loop guard used to) can hand
+                    // null to a write path that requires a connection. See #3167.
+                    if (this.physical is not { HasOutputPipe: true } physical) break;
+
                     Message? message;
                     _backlogStatus = BacklogStatus.CheckingForWork;
 
@@ -1168,46 +1225,75 @@ namespace StackExchange.Redis
                         _backlogStatus = BacklogStatus.WritingMessage;
                         var result = WriteMessageInsideLock(physical, message);
 
-                        if (result == WriteResult.Success)
-                        {
-                            _backlogStatus = BacklogStatus.Flushing;
-#pragma warning disable CS0618 // Type or member is obsolete
-                            result = physical.FlushSync(false, TimeoutMilliseconds);
-#pragma warning restore CS0618 // Type or member is obsolete
-                        }
+                        // use flush logic that assumes a sync caller
+                        if (!flush) flush = message.IsFlushRequiredSync;
 
                         _backlogStatus = BacklogStatus.MarkingInactive;
                         if (result != WriteResult.Success)
                         {
                             _backlogStatus = BacklogStatus.RecordingWriteFailure;
                             var ex = Multiplexer.GetException(result, message, ServerEndPoint);
-                            HandleWriteException(message, ex);
+                            HandleWriteException(physical, message, ex);
                         }
                     }
                     catch (Exception ex)
                     {
                         _backlogStatus = BacklogStatus.RecordingFault;
-                        HandleWriteException(message, ex);
+                        HandleWriteException(physical, message, ex);
                     }
                     finally
                     {
                         UnmarkActiveMessage(message);
                     }
                 }
+
+                if (flush && IsConnected && physical is { HasOutputPipe: true })
+                {
+                    // at least one message wants flushing
+                    _backlogStatus = BacklogStatus.Flushing;
+                    physical?.Flush();
+                }
+
                 _backlogStatus = BacklogStatus.SettingIdle;
                 physical?.SetIdle();
                 _backlogStatus = BacklogStatus.Inactive;
             }
             finally
             {
-#if NETCOREAPP
                 if (gotLock)
                 {
-                    _singleWriterMutex.Release();
+                    _singleWriter.Release();
                 }
-#else
-                token.Dispose();
-#endif
+            }
+        }
+
+        /// <summary>
+        /// Flush anything earlier writes left staged, but only if that can be done without waiting.
+        /// </summary>
+        /// <remarks>
+        /// Called from a push transport's batch-end callback, which runs on a transport thread that must
+        /// not block. The write lock is what makes staging exclusive - a flush that raced a stage could
+        /// hand a half-written frame to a transport mid-<c>Advance</c> - so this either gets the lock
+        /// instantly or does nothing, leaving the flush to whoever does hold it.
+        /// </remarks>
+        internal void TryFlushStagedWrites(PhysicalConnection physical)
+        {
+            if (!_singleWriter.TryTakeInstant()) return;
+            try
+            {
+                if (physical is { HasOutputPipe: true })
+                {
+                    physical.Flush();
+                }
+            }
+            catch
+            {
+                // opportunistic: a flush failure here means the transport is going away, and that is
+                // reported through the receiver's OnClosed
+            }
+            finally
+            {
+                _singleWriter.Release();
             }
         }
 
@@ -1227,7 +1313,7 @@ namespace StackExchange.Redis
         {
             message.Cancel();
             Multiplexer.OnMessageFaulted(message, null);
-            message.Complete();
+            message.Complete(null);
             return WriteResult.TimeoutBeforeWrite;
         }
 
@@ -1251,22 +1337,12 @@ namespace StackExchange.Redis
             }
 
             bool releaseLock = true; // fine to default to true, as it doesn't matter until token is a "success"
-#if NETCOREAPP
             bool gotLock = false;
-#else
-            LockToken token = default;
-#endif
             try
             {
                 // try to acquire it synchronously
-#if NETCOREAPP
-                gotLock = _singleWriterMutex.Wait(0);
+                gotLock = _singleWriter.TryTakeInstant();
                 if (!gotLock)
-#else
-                // note: timeout is specified in mutex-constructor
-                token = _singleWriterMutex.TryWait(options: WaitOptions.NoDelay);
-                if (!token.Success)
-#endif
                 {
                     // If we can't get it *instantaneously*, pass it to the backlog for throughput
                     if (TryPushToBacklog(message, onlyIfExists: false, bypassBacklog: bypassBacklog))
@@ -1277,35 +1353,16 @@ namespace StackExchange.Redis
                     // no backlog... try to wait with the timeout;
                     // if we *still* can't get it: that counts as
                     // an actual timeout
-#if NETCOREAPP
-                    var pending = _singleWriterMutex.WaitAsync(TimeoutMilliseconds);
-                    if (pending.Status != TaskStatus.RanToCompletion) return WriteMessageTakingWriteLockAsync_Awaited(pending, physical, message);
-
-                    gotLock = pending.Result; // fine since we know we got a result
-                    if (!gotLock) return new ValueTask<WriteResult>(TimedOutBeforeWrite(message));
-#else
-                    var pending = _singleWriterMutex.TryWaitAsync(options: WaitOptions.DisableAsyncContext);
+                    var pending = _singleWriter.TryTakeAsync();
                     if (!pending.IsCompletedSuccessfully) return WriteMessageTakingWriteLockAsync_Awaited(pending, physical, message);
 
-                    token = pending.Result; // fine since we know we got a result
-                    if (!token.Success) return new ValueTask<WriteResult>(TimedOutBeforeWrite(message));
-#endif
+                    gotLock = pending.GetAwaiter().GetResult(); // fine since we know we got a result
+                    if (!gotLock) return new ValueTask<WriteResult>(TimedOutBeforeWrite(message));
                 }
                 var result = WriteMessageInsideLock(physical, message);
-                if (result == WriteResult.Success)
+                if (result == WriteResult.Success & message.IsFlushRequiredAsync)
                 {
-                    var flush = physical.FlushAsync(false);
-                    if (!flush.IsCompletedSuccessfully)
-                    {
-                        releaseLock = false; // so we don't release prematurely
-#if NETCOREAPP
-                        return CompleteWriteAndReleaseLockAsync(flush, message);
-#else
-                        return CompleteWriteAndReleaseLockAsync(token, flush, message);
-#endif
-                    }
-
-                    result = flush.Result; // .Result: we know it was completed, so this is fine
+                    physical.Flush();
                 }
 
                 physical.SetIdle();
@@ -1314,56 +1371,37 @@ namespace StackExchange.Redis
             }
             catch (Exception ex)
             {
-                return new ValueTask<WriteResult>(HandleWriteException(message, ex));
+                return new ValueTask<WriteResult>(HandleWriteException(physical, message, ex));
             }
             finally
             {
-#if NETCOREAPP
                 if (gotLock)
-#else
-                if (token.Success)
-#endif
                 {
                     UnmarkActiveMessage(message);
 
                     if (releaseLock)
                     {
-#if NETCOREAPP
-                        _singleWriterMutex.Release();
-#else
-                        token.Dispose();
-#endif
+                        _singleWriter.Release();
                     }
                 }
             }
         }
 
         private async ValueTask<WriteResult> WriteMessageTakingWriteLockAsync_Awaited(
-#if NETCOREAPP
-            Task<bool> pending,
-#else
-            ValueTask<LockToken> pending,
-#endif
+            ValueTask<bool> pending,
             PhysicalConnection physical,
             Message message)
         {
-#if NETCOREAPP
             bool gotLock = false;
-#endif
-
             try
             {
-#if NETCOREAPP
                 gotLock = await pending.ForAwait();
                 if (!gotLock) return TimedOutBeforeWrite(message);
-#else
-                using var token = await pending.ForAwait();
-#endif
                 var result = WriteMessageInsideLock(physical, message);
 
                 if (result == WriteResult.Success)
                 {
-                    result = await physical.FlushAsync(false).ForAwait();
+                    physical.Flush();
                 }
 
                 physical.SetIdle();
@@ -1372,31 +1410,23 @@ namespace StackExchange.Redis
             }
             catch (Exception ex)
             {
-                return HandleWriteException(message, ex);
+                return HandleWriteException(physical, message, ex);
             }
             finally
             {
                 UnmarkActiveMessage(message);
-#if NETCOREAPP
                 if (gotLock)
                 {
-                    _singleWriterMutex.Release();
+                    _singleWriter.Release();
                 }
-#endif
             }
         }
 
         [SuppressMessage("StyleCop.CSharp.LayoutRules", "SA1519:Braces should not be omitted from multi-line child statement", Justification = "Detector is confused with the #ifdefs here")]
         private async ValueTask<WriteResult> CompleteWriteAndReleaseLockAsync(
-#if !NETCOREAPP
-            LockToken lockToken,
-#endif
             ValueTask<WriteResult> flush,
             Message message)
         {
-#if !NETCOREAPP
-            using (lockToken)
-#endif
             try
             {
                 var result = await flush.ForAwait();
@@ -1405,20 +1435,24 @@ namespace StackExchange.Redis
             }
             catch (Exception ex)
             {
-                return HandleWriteException(message, ex);
+                return HandleWriteException(physical, message, ex);
             }
             finally
             {
-#if NETCOREAPP
-                _singleWriterMutex.Release();
-#endif
+                _singleWriter.Release();
             }
         }
 
-        private WriteResult HandleWriteException(Message message, Exception ex)
+        private WriteResult HandleWriteException(PhysicalConnection? physical, Message message, Exception ex)
         {
-            var inner = new RedisConnectionException(ConnectionFailureType.InternalFailure, "Failed to write", ex);
-            message.SetExceptionAndComplete(inner, this);
+            var failureType = PhysicalConnection.ClassifyWriteFailure(ex, physical);
+            var inner = new RedisConnectionException(failureType, message.Flags, "Failed to write", ex);
+            message.SetExceptionAndComplete(inner, physical);
+            // Tear down the physical connection. A write that throws may have left a partial frame on the
+            // wire, and continuing to use the same socket would let the next reply match the wrong message
+            // in the response queue. Forcing a reconnect drains the in-flight queue with failures and
+            // restores wire-level synchronization.
+            physical?.RecordConnectionFailed(failureType, inner);
             return WriteResult.WriteFailure;
         }
 
@@ -1458,11 +1492,13 @@ namespace StackExchange.Redis
                         Multiplexer.Trace("Connecting...", Name);
                         if (ChangeState(State.Disconnected, State.Connecting))
                         {
+                            // Clear the reconnect flag as we're starting a new connection
+                            Volatile.Write(ref _needsReconnect, false);
                             Interlocked.Increment(ref socketCount);
                             Interlocked.Exchange(ref connectStartTicks, Environment.TickCount);
                             // separate creation and connection for case when connection completes synchronously
                             // in that case PhysicalConnection will call back to PhysicalBridge, and most PhysicalBridge methods assume that physical is not null;
-                            physical = new PhysicalConnection(this);
+                            physical = new PhysicalConnection(this, Multiplexer.RawConfig.WriteMode);
 
                             physical.BeginConnectAsync(log).RedisFireAndForget();
                         }
@@ -1516,6 +1552,33 @@ namespace StackExchange.Redis
                     sel.SetRequestSent();
                     IncrementOpCount();
                 }
+            }
+        }
+
+        // HIMPORT is connection-local: a field-set must be PREPAREd on the same physical connection before a SET can
+        // reference it. We inject that PREPARE lazily here (mirroring SELECT injection): the first SET for a given
+        // field-set on a given connection triggers a fire-and-forget PREPARE ahead of it; a reconnect starts with a
+        // fresh (empty) connection set and re-prepares transparently. A DISCARD drops the id so the connection's set
+        // stays bounded to live field-sets. All of this runs inside the write lock, so ordering PREPARE-before-SET on
+        // the wire is guaranteed and the connection's set needs no further synchronization.
+        private void PrepareFieldSetInsideWriteLock(PhysicalConnection connection, Message message)
+        {
+            if (message is HashImportSetMessage set)
+            {
+                var fieldSet = set.FieldSet;
+                if (connection.TryAddPreparedFieldSet(fieldSet.Id))
+                {
+                    var prepare = fieldSet.CreatePrepareMessage(message.Db);
+                    connection.EnqueueInsideWriteLock(prepare);
+                    prepare.WriteTo(connection);
+                    prepare.SetRequestSent();
+                    IncrementOpCount();
+                    fieldSet.RegisterServer(ServerEndPoint, message.Db);
+                }
+            }
+            else if (message is HashImportDiscardMessage discard)
+            {
+                connection.RemovePreparedFieldSet(discard.FieldSetId);
             }
         }
 
@@ -1589,8 +1652,13 @@ namespace StackExchange.Redis
 
                 if (_nextHighIntegrityToken is not 0
                     && !connection.TransactionActive // validated in the UNWATCH/EXEC/DISCARD
-                    && message.Command is not RedisCommand.AUTH or RedisCommand.HELLO) // if auth fails, ECHO may also fail; avoid confusion
+                    && message.Command is not RedisCommand.AUTH // if auth fails, later commands may also fail; avoid confusion
+                    && message.Command is not RedisCommand.HELLO)
                 {
+                    // note on the Command match above: curiously, .NET 10 and .NET 11 SDKs emit *opposite* errors here
+                    // re "CS9336: The pattern is redundant." ("fixing" one "breaks" the other); possibly a fixed bool inversion
+                    // in the analyzer? to avoid pain, we'll just use the most obviously correct form
+
                     // make sure this value exists early to avoid a race condition
                     // if the response comes back super quickly
                     message.WithHighIntegrity(NextHighIntegrityTokenInsideLock());
@@ -1600,6 +1668,7 @@ namespace StackExchange.Redis
                 {
                     Debug.Assert(!message.IsHighIntegrity, "prior high integrity message found during transaction?");
                 }
+                if (cmd is RedisCommand.HIMPORT) PrepareFieldSetInsideWriteLock(connection, message);
                 connection.EnqueueInsideWriteLock(message);
                 isQueued = true;
                 message.WriteTo(connection);
@@ -1639,7 +1708,7 @@ namespace StackExchange.Redis
             {
                 Trace("Write failed: " + ex.Message);
                 message.Fail(ConnectionFailureType.InternalFailure, ex, null, Multiplexer);
-                message.Complete();
+                message.Complete(connection);
 
                 // This failed without actually writing; we're OK with that... unless there's a transaction
                 if (connection?.TransactionActive == true)
@@ -1653,11 +1722,14 @@ namespace StackExchange.Redis
             catch (Exception ex)
             {
                 Trace("Write failed: " + ex.Message);
-                message.Fail(ConnectionFailureType.InternalFailure, ex, null, Multiplexer);
-                message.Complete();
 
-                // We're not sure *what* happened here - probably an IOException; kill the connection
-                connection?.RecordConnectionFailed(ConnectionFailureType.InternalFailure, ex);
+                // Most likely an IOException, or the connection being torn down underneath us
+                var failureType = PhysicalConnection.ClassifyWriteFailure(ex, connection);
+                message.Fail(failureType, ex, null, Multiplexer);
+                message.Complete(connection);
+
+                // We don't know how far the write got; kill the connection
+                connection?.RecordConnectionFailed(failureType, ex);
                 return WriteResult.WriteFailure;
             }
         }
@@ -1676,6 +1748,8 @@ namespace StackExchange.Redis
                     return _nextHighIntegrityToken++;
             }
         }
+
+        internal bool CanSimulateConnectionFailure => Multiplexer.RawConfig.AllowAdmin && physical?.CanSimulateConnectionFailure == true;
 
         /// <summary>
         /// For testing only.

@@ -1,14 +1,36 @@
 ﻿using System;
+using RESPite;
 
 namespace StackExchange.Redis;
 
+// ReSharper disable InconsistentNaming
 internal enum RedisCommand
 {
-    NONE, // must be first for "zero reasons"
+    [AsciiHash("")] // not a command; must be first for "zero reasons"
+    NONE,
 
     APPEND,
     ASKING,
     AUTH,
+
+    ARCOUNT,
+    ARDEL,
+    ARDELRANGE,
+    ARGET,
+    ARGETRANGE,
+    ARGREP,
+    ARINFO,
+    ARINSERT,
+    ARLASTITEMS,
+    ARLEN,
+    ARMGET,
+    ARMSET,
+    ARNEXT,
+    AROP,
+    ARRING,
+    ARSCAN,
+    ARSEEK,
+    ARSET,
 
     BGREWRITEAOF,
     BGSAVE,
@@ -30,13 +52,17 @@ internal enum RedisCommand
     DECR,
     DECRBY,
     DEL,
+    DELEX,
+    DIGEST,
     DISCARD,
     DUMP,
 
     ECHO,
     EVAL,
     EVALSHA,
+    [AsciiHash("EVAL_RO")]
     EVAL_RO,
+    [AsciiHash("EVALSHA_RO")]
     EVALSHA_RO,
     EXEC,
     EXISTS,
@@ -73,12 +99,14 @@ internal enum RedisCommand
     HGETEX,
     HGETDEL,
     HGETALL,
+    HIMPORT,
     HINCRBY,
     HINCRBYFLOAT,
     HKEYS,
     HLEN,
     HMGET,
     HMSET,
+    HOTKEYS,
     HPERSIST,
     HPEXPIRE,
     HPEXPIREAT,
@@ -95,6 +123,7 @@ internal enum RedisCommand
     INCR,
     INCRBY,
     INCRBYFLOAT,
+    INCREX,
     INFO,
 
     KEYS,
@@ -106,6 +135,7 @@ internal enum RedisCommand
     LINSERT,
     LLEN,
     LMOVE,
+    LMOVEM,
     LMPOP,
     LPOP,
     LPOS,
@@ -122,6 +152,7 @@ internal enum RedisCommand
     MONITOR,
     MOVE,
     MSET,
+    MSETEX,
     MSETNX,
     MULTI,
 
@@ -163,6 +194,7 @@ internal enum RedisCommand
     SCARD,
     SCRIPT,
     SDIFF,
+    SDIFFCARD,
     SDIFFSTORE,
     SELECT,
     SENTINEL,
@@ -182,6 +214,7 @@ internal enum RedisCommand
     SMISMEMBER,
     SMOVE,
     SORT,
+    [AsciiHash("SORT_RO")]
     SORT_RO,
     SPOP,
     SPUBLISH,
@@ -190,6 +223,7 @@ internal enum RedisCommand
     STRLEN,
     SUBSCRIBE,
     SUNION,
+    SUNIONCARD,
     SUNIONSTORE,
     SSCAN,
     SSUBSCRIBE,
@@ -215,6 +249,7 @@ internal enum RedisCommand
     VISMEMBER,
     VLINKS,
     VRANDMEMBER,
+    VRANGE,
     VREM,
     VSETATTR,
     VSIM,
@@ -226,11 +261,13 @@ internal enum RedisCommand
     XADD,
     XAUTOCLAIM,
     XCLAIM,
+    XCFGSET,
     XDEL,
     XDELEX,
     XGROUP,
     XINFO,
     XLEN,
+    XNACK,
     XPENDING,
     XRANGE,
     XREAD,
@@ -274,6 +311,16 @@ internal enum RedisCommand
     UNKNOWN,
 }
 
+internal static partial class RedisCommandMetadata
+{
+    [AsciiHash(CaseSensitive = false)]
+    public static partial bool TryParseCI(ReadOnlySpan<byte> command, out RedisCommand value);
+
+    [AsciiHash(CaseSensitive = false)]
+    public static partial bool TryParseCI(ReadOnlySpan<char> command, out RedisCommand value);
+}
+
+// ReSharper restore InconsistentNaming
 internal static class RedisCommandExtensions
 {
     /// <summary>
@@ -292,6 +339,13 @@ internal static class RedisCommandExtensions
             //   for example spreading load via a .DemandReplica flag in the caller.
             // Basically: would it fail on a read-only replica in 100% of cases? Then it goes in the list.
             case RedisCommand.APPEND:
+            case RedisCommand.ARDEL:
+            case RedisCommand.ARDELRANGE:
+            case RedisCommand.ARINSERT:
+            case RedisCommand.ARMSET:
+            case RedisCommand.ARRING:
+            case RedisCommand.ARSEEK:
+            case RedisCommand.ARSET:
             case RedisCommand.BITOP:
             case RedisCommand.BLPOP:
             case RedisCommand.BRPOP:
@@ -299,6 +353,8 @@ internal static class RedisCommandExtensions
             case RedisCommand.DECR:
             case RedisCommand.DECRBY:
             case RedisCommand.DEL:
+            case RedisCommand.DELEX:
+            case RedisCommand.DIGEST:
             case RedisCommand.EXPIRE:
             case RedisCommand.EXPIREAT:
             case RedisCommand.FLUSHALL:
@@ -312,6 +368,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.HEXPIREAT:
             case RedisCommand.HGETDEL:
             case RedisCommand.HGETEX:
+            case RedisCommand.HIMPORT:
             case RedisCommand.HINCRBY:
             case RedisCommand.HINCRBYFLOAT:
             case RedisCommand.HMSET:
@@ -324,8 +381,10 @@ internal static class RedisCommandExtensions
             case RedisCommand.INCR:
             case RedisCommand.INCRBY:
             case RedisCommand.INCRBYFLOAT:
+            case RedisCommand.INCREX:
             case RedisCommand.LINSERT:
             case RedisCommand.LMOVE:
+            case RedisCommand.LMOVEM:
             case RedisCommand.LMPOP:
             case RedisCommand.LPOP:
             case RedisCommand.LPUSH:
@@ -336,6 +395,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.MIGRATE:
             case RedisCommand.MOVE:
             case RedisCommand.MSET:
+            case RedisCommand.MSETEX:
             case RedisCommand.MSETNX:
             case RedisCommand.PERSIST:
             case RedisCommand.PEXPIRE:
@@ -369,6 +429,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.VREM:
             case RedisCommand.VSETATTR:
             case RedisCommand.XAUTOCLAIM:
+            case RedisCommand.XCFGSET:
             case RedisCommand.ZADD:
             case RedisCommand.ZDIFFSTORE:
             case RedisCommand.ZINTERSTORE:
@@ -387,6 +448,17 @@ internal static class RedisCommandExtensions
             case RedisCommand.NONE:
             case RedisCommand.ASKING:
             case RedisCommand.AUTH:
+            case RedisCommand.ARCOUNT:
+            case RedisCommand.ARGET:
+            case RedisCommand.ARGETRANGE:
+            case RedisCommand.ARGREP:
+            case RedisCommand.ARINFO:
+            case RedisCommand.ARLASTITEMS:
+            case RedisCommand.ARLEN:
+            case RedisCommand.ARMGET:
+            case RedisCommand.ARNEXT:
+            case RedisCommand.AROP:
+            case RedisCommand.ARSCAN:
             case RedisCommand.BGREWRITEAOF:
             case RedisCommand.BGSAVE:
             case RedisCommand.BITCOUNT:
@@ -424,6 +496,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.HKEYS:
             case RedisCommand.HLEN:
             case RedisCommand.HMGET:
+            case RedisCommand.HOTKEYS:
             case RedisCommand.HPEXPIRETIME:
             case RedisCommand.HPTTL:
             case RedisCommand.HRANDFIELD:
@@ -463,6 +536,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.SCARD:
             case RedisCommand.SCRIPT:
             case RedisCommand.SDIFF:
+            case RedisCommand.SDIFFCARD:
             case RedisCommand.SELECT:
             case RedisCommand.SENTINEL:
             case RedisCommand.SHUTDOWN:
@@ -480,6 +554,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.STRLEN:
             case RedisCommand.SUBSCRIBE:
             case RedisCommand.SUNION:
+            case RedisCommand.SUNIONCARD:
             case RedisCommand.SUNSUBSCRIBE:
             case RedisCommand.SSCAN:
             case RedisCommand.SYNC:
@@ -523,6 +598,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.VISMEMBER:
             case RedisCommand.VLINKS:
             case RedisCommand.VRANDMEMBER:
+            case RedisCommand.VRANGE:
             case RedisCommand.VSIM:
             // Writable commands, but allowed for the writable-replicas scenario
             case RedisCommand.COPY:
@@ -535,6 +611,7 @@ internal static class RedisCommandExtensions
             case RedisCommand.XDEL:
             case RedisCommand.XDELEX:
             case RedisCommand.XGROUP:
+            case RedisCommand.XNACK:
             case RedisCommand.XREADGROUP:
             case RedisCommand.XTRIM:
                 return false;

@@ -1,19 +1,367 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using RESPite;
+using RESPite.Messages;
 
 namespace StackExchange.Redis.Server
 {
-    public abstract class RedisServer : RespServer
+    public abstract partial class RedisServer : RespServer
     {
+        public const int DefaultDatabaseCount = 16;
+
         // non-trivial wildcards not implemented yet!
         public static bool IsMatch(string pattern, string key) =>
             pattern == "*" || string.Equals(pattern, key, StringComparison.OrdinalIgnoreCase);
 
-        protected RedisServer(int databases = 16, TextWriter output = null) : base(output)
+        private ConcurrentDictionary<EndPoint, Node> _nodes = new();
+
+        // additional identities for nodes that already exist; deliberately *not* extra _nodes entries,
+        // so that _nodes stays one-key-per-node: EndPointComparer cannot order mixed endpoint types
+        // (it returns 0), and AddEmptyNode derives the next endpoint from an arbitrary existing key,
+        // so a mixed _nodes would make both CLUSTER NODES/SLOTS ordering and node naming arbitrary
+        private readonly ConcurrentDictionary<EndPoint, Node> _aliases = new();
+
+        public bool TryGetNode(EndPoint endpoint, out Node node)
+            => _nodes.TryGetValue(endpoint, out node) || _aliases.TryGetValue(endpoint, out node);
+
+        public EndPoint DefaultEndPoint { get; }
+
+        public override Node DefaultNode
         {
+            get
+            {
+                foreach (var pair in _nodes)
+                {
+                    return pair.Value;
+                }
+                return null;
+            }
+        }
+
+        public IEnumerable<EndPoint> GetEndPoints()
+        {
+            foreach (var pair in _nodes)
+            {
+                yield return pair.Key;
+            }
+        }
+
+        /// <summary>
+        /// The secondary identities registered via <see cref="AddAlias"/> or <see cref="SetHostname"/>;
+        /// these are not returned by <see cref="GetEndPoints"/>, which reports one endpoint per node.
+        /// </summary>
+        public IEnumerable<EndPoint> GetAliases()
+        {
+            foreach (var pair in _aliases)
+            {
+                yield return pair.Key;
+            }
+        }
+
+        /// <summary>
+        /// Register an additional identity for an existing node. The node remains keyed by its original
+        /// endpoint, but requests for <paramref name="alias"/> resolve to it, so a single node can be
+        /// reached by several names - which is what makes identity-unification testable.
+        /// </summary>
+        public void AddAlias(EndPoint alias, EndPoint node)
+        {
+            if (alias is null) throw new ArgumentNullException(nameof(alias));
+            if (!_nodes.TryGetValue(node, out var target)) throw new KeyNotFoundException($"Node not found: {Format.ToString(node)}");
+            if (_nodes.ContainsKey(alias)) throw new ArgumentException($"Already a node in its own right: {Format.ToString(alias)}", nameof(alias));
+            if (!_aliases.TryAdd(alias, target) && !ReferenceEquals(_aliases[alias], target))
+            {
+                throw new ArgumentException($"Already an alias of a different node: {Format.ToString(alias)}", nameof(alias));
+            }
+        }
+
+        /// <summary>
+        /// Announce a hostname for a node, as <c>cluster-announce-hostname</c> does; this is reported by
+        /// <c>CLUSTER NODES</c> and registered as an alias, so the node can be reached by that name as
+        /// well as by the endpoint it is keyed on.
+        /// </summary>
+        public void SetHostname(EndPoint endpoint, string hostname)
+        {
+            if (!_nodes.TryGetValue(endpoint, out var node)) throw new KeyNotFoundException($"Node not found: {Format.ToString(endpoint)}");
+            node.Hostname = hostname;
+            if (!string.IsNullOrWhiteSpace(hostname))
+            {
+                AddAlias(new DnsEndPoint(hostname, node.Port), endpoint);
+            }
+        }
+
+        public bool Migrate(int hashSlot, EndPoint to)
+        {
+            if (ServerType != ServerType.Cluster) throw new InvalidOperationException($"Server mode is {ServerType}");
+            if (!TryGetNode(to, out var target)) throw new KeyNotFoundException($"Target node not found: {Format.ToString(to)}");
+            foreach (var pair in _nodes)
+            {
+                if (pair.Value.HasSlot(hashSlot))
+                {
+                    if (pair.Value == target) return false; // nothing to do
+
+                    if (!pair.Value.RemoveSlot(hashSlot))
+                    {
+                        throw new KeyNotFoundException($"Unable to remove slot {hashSlot} from old owner");
+                    }
+                    target.AddSlot(hashSlot);
+                    return true;
+                }
+            }
+            throw new KeyNotFoundException($"Source node not found for slot {hashSlot}");
+        }
+        public bool Migrate(Span<byte> key, EndPoint to) => Migrate(ServerSelectionStrategy.GetClusterSlot(key), to);
+        public bool Migrate(in RedisKey key, EndPoint to) => Migrate(GetHashSlot(key), to);
+
+        /// <summary>
+        /// The value a node announces when hostname reporting is configured but no hostname is set;
+        /// prescribed by the <c>CLUSTER SLOTS</c> contract, not chosen here.
+        /// </summary>
+        private const string UnannouncedHostname = "?";
+
+        private const string ClusterPreferredEndpointType = "cluster-preferred-endpoint-type";
+        private const string ClusterAnnounceHostname = "cluster-announce-hostname";
+
+        // hostnames, the endpoint-type preference and the CLUSTER SLOTS metadata map all arrived in 7.0;
+        // before that there is no hostname anywhere in the topology, so the whole mechanism is inert and
+        // a client sees exactly the ip-only shape it always did
+        private static readonly Version s_HostnameVersion = new(7, 0, 0);
+
+        private bool SupportsHostnames => RedisVersion is { } version && version >= s_HostnameVersion;
+
+        /// <summary>
+        /// Override the preferred endpoint type for a single node. The real parameter is per-node, so a
+        /// deployment *can* have nodes that disagree - nobody sane configures that deliberately, but a
+        /// rolling config change is exactly that for a window, and a client must not infer a
+        /// cluster-wide mode from any one node's reply.
+        /// </summary>
+        public void SetPreferredEndpointType(EndPoint endpoint, ClusterEndpointType preferred)
+        {
+            if (!_nodes.TryGetValue(endpoint, out var node)) throw new KeyNotFoundException($"Node not found: {Format.ToString(endpoint)}");
+            node.PreferredEndpointType = preferred;
+        }
+
+        private static string ToConfigValue(ClusterEndpointType type) => type switch
+        {
+            ClusterEndpointType.Hostname => "hostname",
+            ClusterEndpointType.UnknownEndpoint => "unknown-endpoint",
+            _ => "ip",
+        };
+
+        /// <summary>
+        /// Which identity form this server prefers when naming nodes, mirroring the server's
+        /// <c>cluster-preferred-endpoint-type</c>. It governs the primary endpoint position in
+        /// <c>CLUSTER SLOTS</c> and the address in <c>-MOVED</c> redirects; <c>CLUSTER NODES</c> is
+        /// unaffected, since its field positions do not move.
+        /// </summary>
+        public ClusterEndpointType PreferredEndpointType { get; set; } = ClusterEndpointType.Ip;
+
+        /// <summary>
+        /// The identity form a server prefers when naming nodes; the values mirror
+        /// <c>cluster-preferred-endpoint-type</c>.
+        /// </summary>
+        public enum ClusterEndpointType
+        {
+            /// <summary>Report the node's ip address.</summary>
+            Ip = 0,
+
+            /// <summary>Report the node's announced hostname, or <c>?</c> if it has none.</summary>
+            Hostname,
+
+            /// <summary>Report no endpoint at all, leaving the client to use the one it dialled.</summary>
+            UnknownEndpoint,
+        }
+
+        /// <summary>
+        /// What a node knows about its own address. The values other than <see cref="Address"/> are
+        /// prescribed by the <c>CLUSTER SLOTS</c> contract rather than chosen here. Note the third
+        /// documented placeholder, <c>?</c>, is deliberately *not* a member: it is derived from
+        /// hostnames being preferred while none is announced, so that a combination the real server
+        /// cannot produce cannot be expressed here either.
+        /// </summary>
+        public enum AnnouncedAddress
+        {
+            /// <summary>The node knows its own address and reports it.</summary>
+            Address = 0,
+
+            /// <summary>
+            /// The RESP null: the server does not know this node's address, typically because it sits
+            /// behind a load balancer. A client should dial the endpoint it sent the command to, with
+            /// the port from the reply.
+            /// </summary>
+            Null,
+
+            /// <summary>
+            /// The empty string: the node does not know its own ip - a single-node cluster, or a node
+            /// that has not joined yet. May be treated as <see cref="Null"/>.
+            /// </summary>
+            Empty,
+        }
+
+        /// <summary>
+        /// Declare an extra <c>CLUSTER SLOTS</c> metadata entry for a node, beyond the ip/hostname the
+        /// complement rule produces. The real set is documented as extensible, so this exists to prove a
+        /// client keeps what it does not recognize.
+        /// </summary>
+        public void SetSlotsMetadata(EndPoint endpoint, string key, string value)
+        {
+            if (!_nodes.TryGetValue(endpoint, out var node)) throw new KeyNotFoundException($"Node not found: {Format.ToString(endpoint)}");
+            (node.SlotsMetadata ??= new List<KeyValuePair<string, string>>())
+                .Add(new KeyValuePair<string, string>(key, value));
+        }
+
+        /// <summary>
+        /// Declare an auxiliary field for a node, reported by <c>CLUSTER NODES</c> after the hostname.
+        /// Note a real 8.9 server emits none of these (<c>cluster-announce-human-nodename</c> does not
+        /// appear in the reply), so this exists to exercise the documented grammar - which is extensible -
+        /// rather than to mirror observed behaviour.
+        /// </summary>
+        public void SetAuxField(EndPoint endpoint, string key, string value)
+        {
+            if (!_nodes.TryGetValue(endpoint, out var node)) throw new KeyNotFoundException($"Node not found: {Format.ToString(endpoint)}");
+            (node.AuxFields ??= new List<KeyValuePair<string, string>>())
+                .Add(new KeyValuePair<string, string>(key, value));
+        }
+
+        /// <summary>
+        /// Control what a node reports as its own address, for exercising the placeholder values that
+        /// <c>CLUSTER SLOTS</c> can carry.
+        /// </summary>
+        public void SetAnnouncedAddress(EndPoint endpoint, AnnouncedAddress announced)
+        {
+            if (!_nodes.TryGetValue(endpoint, out var node)) throw new KeyNotFoundException($"Node not found: {Format.ToString(endpoint)}");
+            node.Announced = announced;
+        }
+
+        // the ip form of a node's identity, as it appears in either the primary position or the
+        // metadata; the empty string covers both "not known to the server" and "not known to the node",
+        // per the contract's note that "" applies to the ip metadata field as well as the endpoint
+        private static string GetIpForm(Node node)
+            => node.Announced == AnnouncedAddress.Address ? node.Host : "";
+
+        // a node we only know by name has no address identity of its own, so the only coherent shape is
+        // hostname-preferred with the ip unknown - anything else would have us report a hostname in a
+        // field that is documented to carry an address, which is the bug class this fake exists to expose
+        private static void ApplyNameOnlyIdentity(EndPoint endpoint, Node node)
+        {
+            if (endpoint is DnsEndPoint dns)
+            {
+                node.Hostname = dns.Host;
+                node.Announced = AnnouncedAddress.Empty;
+
+                // scoped to this node rather than the whole server: adding one name-only node to an
+                // address-keyed cluster is a legitimate topology, not a reconfiguration of its peers
+                node.PreferredEndpointType = ClusterEndpointType.Hostname;
+            }
+        }
+
+        // verified against a real 8.9 cluster: the *answering* node's preference governs every entry in
+        // the reply, while hostname availability is a property of each described node. So asking a
+        // hostname-preferring node about a peer with no hostname yields "?", and the same peer asked of an
+        // ip-preferring node yields its address
+        private static TypedRedisValue GetAnnouncedEndpoint(Node perspective, Node node)
+        {
+            switch (perspective.EffectiveEndpointType)
+            {
+                case ClusterEndpointType.UnknownEndpoint:
+                    return TypedRedisValue.BulkString(RedisValue.Null);
+                case ClusterEndpointType.Hostname:
+                    return TypedRedisValue.BulkString(
+                        string.IsNullOrWhiteSpace(node.Hostname) ? UnannouncedHostname : node.Hostname);
+                default:
+                    return node.Announced == AnnouncedAddress.Null
+                        ? TypedRedisValue.BulkString(RedisValue.Null)
+                        : TypedRedisValue.BulkString(GetIpForm(node));
+            }
+        }
+
+        [Flags]
+        public enum NodeFlags
+        {
+            None = 0, // note: implicitly primary, since no replica flag
+            Replica = 1 << 0,
+            Handshake = 1 << 1,
+            Fail = 1 << 2,
+            PFail = 1 << 3,
+            NoAddress = 1 << 4,
+            NoFailover = 1 << 5,
+        }
+
+        /// <summary>
+        /// Add an empty node at a specific endpoint; the derived-endpoint overload copies the *form* of an
+        /// existing key, so it cannot produce a node whose identity form differs from its peers'.
+        /// </summary>
+        public EndPoint AddEmptyNode(EndPoint endpoint, NodeFlags flags = NodeFlags.None)
+        {
+            if (endpoint is null) throw new ArgumentNullException(nameof(endpoint));
+            var node = new Node(this, endpoint, flags);
+            node.UpdateSlots([]); // explicit empty range (rather than implicit "all nodes")
+            ApplyNameOnlyIdentity(endpoint, node);
+            if (!_nodes.TryAdd(endpoint, node))
+            {
+                throw new ArgumentException($"Node already exists: {Format.ToString(endpoint)}", nameof(endpoint));
+            }
+            return endpoint;
+        }
+
+        public EndPoint AddEmptyNode(NodeFlags flags = NodeFlags.None)
+        {
+            EndPoint endpoint;
+            Node node;
+            do
+            {
+                endpoint = null;
+                int maxPort = 0;
+                foreach (var pair in _nodes)
+                {
+                    endpoint ??= pair.Key;
+                    switch (pair.Key)
+                    {
+                        case IPEndPoint ip:
+                            if (ip.Port > maxPort) maxPort = ip.Port;
+                            break;
+                        case DnsEndPoint dns:
+                            if (dns.Port > maxPort) maxPort = dns.Port;
+                            break;
+                    }
+                }
+
+                switch (endpoint)
+                {
+                    case null:
+                        endpoint = new IPEndPoint(IPAddress.Loopback, 6379);
+                        break;
+                    case IPEndPoint ip:
+                        endpoint = new IPEndPoint(ip.Address, maxPort + 1);
+                        break;
+                    case DnsEndPoint dns:
+                        endpoint = new DnsEndPoint(dns.Host, maxPort + 1);
+                        break;
+                }
+
+                node = new(this, endpoint, flags);
+                node.UpdateSlots([]); // explicit empty range (rather than implicit "all nodes")
+                ApplyNameOnlyIdentity(endpoint, node);
+            }
+            // defensive loop for concurrency
+            while (!_nodes.TryAdd(endpoint, node));
+            return endpoint;
+        }
+
+        protected RedisServer(EndPoint endpoint = null, int databases = DefaultDatabaseCount, TextWriter output = null) : base(output)
+        {
+            DefaultEndPoint = endpoint ??= new IPEndPoint(IPAddress.Loopback, 6379);
+            var defaultNode = new Node(this, endpoint, NodeFlags.None);
+            ApplyNameOnlyIdentity(endpoint, defaultNode);
+            _nodes.TryAdd(endpoint, defaultNode);
+            RedisVersion = s_DefaultServerVersion;
             if (databases < 1) throw new ArgumentOutOfRangeException(nameof(databases));
             Databases = databases;
             var config = ServerConfiguration;
@@ -42,8 +390,143 @@ namespace StackExchange.Redis.Server
         }
         public int Databases { get; }
 
+        public string Password { get; set; } = "";
+
+        /// <summary>
+        /// When set, every command is rejected with a <c>LOADING</c> error, mimicking a server that is
+        /// still loading its dataset into memory.
+        /// </summary>
+        public bool IsLoading { get; set; }
+
+        public override TypedRedisValue Execute(RedisClient client, in RedisRequest request)
+        {
+            if (IsLoading)
+            {
+                return TypedRedisValue.Error("LOADING");
+            }
+            var pw = Password;
+            if (!string.IsNullOrEmpty(pw) & !client.IsAuthenticated)
+            {
+                if (!IsAuthCommand(request.KnownCommand))
+                    return TypedRedisValue.Error("NOAUTH Authentication required.");
+            }
+            else if (client.Protocol is RedisProtocol.Resp2 && client.IsSubscriber &&
+                     !IsPubSubCommand(request.KnownCommand))
+            {
+                return TypedRedisValue.Error(
+                    $"ERR only [P|S][UN]SUBSCRIBE / PING / QUIT allowed in this context (got: '{request.Command}')");
+            }
+            return base.Execute(client, request);
+
+            static bool IsAuthCommand(RedisCommand cmd) => cmd is RedisCommand.AUTH or RedisCommand.HELLO;
+            static bool IsPubSubCommand(RedisCommand cmd)
+                => cmd is RedisCommand.SUBSCRIBE or RedisCommand.UNSUBSCRIBE
+                    or RedisCommand.SSUBSCRIBE or RedisCommand.SUNSUBSCRIBE
+                    or RedisCommand.PSUBSCRIBE or RedisCommand.PUNSUBSCRIBE
+                    or RedisCommand.PING or RedisCommand.QUIT;
+        }
+
+        [RedisCommand(2)]
+        protected virtual TypedRedisValue Auth(RedisClient client, in RedisRequest request)
+        {
+            if (request.GetString(1) == Password)
+            {
+                client.IsAuthenticated = true;
+                return TypedRedisValue.OK;
+            }
+            return TypedRedisValue.Error("ERR invalid password");
+        }
+
+        protected virtual RedisProtocol MaxProtocol => RedisProtocol.Resp3;
+
+        [RedisCommand(-1)]
+        protected virtual TypedRedisValue Hello(RedisClient client, in RedisRequest request)
+        {
+            var protocol = client.Protocol;
+            bool isAuthed = client.IsAuthenticated;
+            string name = client.Name;
+            if (request.Count >= 2)
+            {
+                if (!request.TryGetInt32(1, out var protover)) return TypedRedisValue.Error("ERR Protocol version is not an integer or out of range");
+                switch (protover)
+                {
+                    case 2:
+                        protocol = RedisProtocol.Resp2;
+                        break;
+                    case 3:
+                        protocol = RedisProtocol.Resp3;
+                        break;
+                    default:
+                        return TypedRedisValue.Error("NOPROTO unsupported protocol version");
+                }
+                protocol = (RedisProtocol)Math.Min((int)protocol, (int)MaxProtocol);
+
+                static TypedRedisValue ArgFail(in RespReader reader) => TypedRedisValue.Error($"ERR Syntax error in HELLO option '{reader.ReadString()}'\"");
+
+                for (int i = 2; i < request.Count; i++)
+                {
+                    int remaining = request.Count - (i + 1);
+                    var fieldReader = request.GetReader(i);
+                    HelloSubFields field;
+                    unsafe
+                    {
+                        if (!fieldReader.TryParseScalar(&HelloSubFieldsMetadata.TryParseCI, out field))
+                        {
+                            return ArgFail(fieldReader);
+                        }
+                    }
+
+                    switch (field)
+                    {
+                        case HelloSubFields.Auth:
+                            if (remaining < 2) return ArgFail(fieldReader);
+                            // ignore username for now
+                            var pw = request.GetString(i + 2);
+                            if (pw != Password) return TypedRedisValue.Error("WRONGPASS invalid username-password pair or user is disabled.");
+                            isAuthed = true;
+                            i += 2;
+                            break;
+                        case HelloSubFields.SetName:
+                            if (remaining < 1) return ArgFail(fieldReader);
+                            name = request.GetString(++i);
+                            break;
+                        default:
+                            return ArgFail(fieldReader);
+                    }
+                }
+            }
+
+            // all good, update client
+            long proto32 = protocol switch
+            {
+                >= RedisProtocol.Resp3 => 3,
+                >= RedisProtocol.Resp2 => 2,
+                _ => throw new InvalidOperationException($"Unexpected protocol: {protocol}"),
+            };
+            client.Protocol = protocol;
+            client.IsAuthenticated = isAuthed;
+            client.Name = name;
+
+            var reply = TypedRedisValue.Rent(14, out var span, RespPrefix.Map);
+            span[0] = TypedRedisValue.BulkString("server");
+            span[1] = TypedRedisValue.BulkString("redis");
+            span[2] = TypedRedisValue.BulkString("version");
+            span[3] = TypedRedisValue.BulkString(VersionString);
+            span[4] = TypedRedisValue.BulkString("proto");
+            span[5] = TypedRedisValue.Integer(proto32);
+            span[6] = TypedRedisValue.BulkString("id");
+            span[7] = TypedRedisValue.Integer(client.Id);
+            span[8] = TypedRedisValue.BulkString("mode");
+            span[9] = TypedRedisValue.BulkString(ServerModeValue);
+            span[10] = TypedRedisValue.BulkString("role");
+            span[11] = TypedRedisValue.BulkString("master");
+            span[12] = TypedRedisValue.BulkString("modules");
+            span[13] = TypedRedisValue.EmptyArray(RespPrefix.Array);
+            return reply;
+        }
+
         [RedisCommand(-3)]
-        protected virtual TypedRedisValue Sadd(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Sadd(RedisClient client, in RedisRequest request)
         {
             int added = 0;
             var key = request.GetKey(1);
@@ -54,10 +537,10 @@ namespace StackExchange.Redis.Server
             }
             return TypedRedisValue.Integer(added);
         }
-        protected virtual bool Sadd(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
+        protected virtual bool Sadd(int database, in RedisKey key, in RedisValue value) => throw new NotSupportedException();
 
         [RedisCommand(-3)]
-        protected virtual TypedRedisValue Srem(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Srem(RedisClient client, in RedisRequest request)
         {
             int removed = 0;
             var key = request.GetKey(1);
@@ -68,53 +551,665 @@ namespace StackExchange.Redis.Server
             }
             return TypedRedisValue.Integer(removed);
         }
-        protected virtual bool Srem(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
+        protected virtual bool Srem(int database, in RedisKey key, in RedisValue value) => throw new NotSupportedException();
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Spop(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Spop(RedisClient client, in RedisRequest request)
             => TypedRedisValue.BulkString(Spop(client.Database, request.GetKey(1)));
 
-        protected virtual RedisValue Spop(int database, RedisKey key) => throw new NotSupportedException();
+        protected virtual RedisValue Spop(int database, in RedisKey key) => throw new NotSupportedException();
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Scard(RedisClient client, RedisRequest request)
-            => TypedRedisValue.Integer(Scard(client.Database, request.GetKey(1)));
+        protected virtual TypedRedisValue Scard(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.Integer(Scard(client.Database, request.GetKey(1, KeyFlags.ReadOnly)));
 
-        protected virtual long Scard(int database, RedisKey key) => throw new NotSupportedException();
+        protected virtual long Scard(int database, in RedisKey key) => throw new NotSupportedException();
 
         [RedisCommand(3)]
-        protected virtual TypedRedisValue Sismember(RedisClient client, RedisRequest request)
-            => Sismember(client.Database, request.GetKey(1), request.GetValue(2)) ? TypedRedisValue.One : TypedRedisValue.Zero;
+        protected virtual TypedRedisValue Sismember(RedisClient client, in RedisRequest request)
+            => Sismember(client.Database, request.GetKey(1, KeyFlags.ReadOnly), request.GetValue(2)) ? TypedRedisValue.One : TypedRedisValue.Zero;
 
-        protected virtual bool Sismember(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
+        protected virtual bool Sismember(int database, in RedisKey key, in RedisValue value) => throw new NotSupportedException();
 
-        [RedisCommand(3, "client", "setname", LockFree = true)]
-        protected virtual TypedRedisValue ClientSetname(RedisClient client, RedisRequest request)
+        [RedisCommand(3)]
+        protected virtual TypedRedisValue Rename(RedisClient client, in RedisRequest request)
+        {
+            RedisKey oldKey = request.GetKey(1), newKey = request.GetKey(2);
+            return oldKey == newKey || Rename(client.Database, oldKey, newKey) ? TypedRedisValue.OK : TypedRedisValue.Error("ERR no such key");
+        }
+
+        protected virtual bool Rename(int database, in RedisKey oldKey, in RedisKey newKey)
+        {
+            // can implement with Exists/Del/Set
+            if (!Exists(database, oldKey)) return false;
+            Del(database, newKey);
+            Set(database, newKey, Get(database, oldKey));
+            Del(database, oldKey);
+            return true;
+        }
+
+        [RedisCommand(4)]
+        protected virtual TypedRedisValue SetEx(RedisClient client, in RedisRequest request)
+        {
+            RedisKey key = request.GetKey(1);
+            int seconds = request.GetInt32(2);
+            var value = request.GetValue(3);
+            Set(client.Database, key, value, TimeSpan.FromSeconds(seconds));
+            return TypedRedisValue.OK;
+        }
+
+        [RedisCommand(-2)]
+        protected virtual TypedRedisValue Touch(RedisClient client, in RedisRequest request)
+        {
+            for (int i = 1; i < request.Count; i++)
+            {
+                Touch(client.Database, request.GetKey(i));
+            }
+
+            return TypedRedisValue.OK;
+        }
+
+        [RedisCommand(-2)]
+        protected virtual TypedRedisValue Watch(RedisClient client, in RedisRequest request)
+        {
+            for (int i = 1; i < request.Count; i++)
+            {
+                var key = request.GetKey(i, KeyFlags.ReadOnly);
+                if (!client.Watch(key))
+                    return TypedRedisValue.Error("WATCH inside MULTI is not allowed");
+            }
+            return TypedRedisValue.OK;
+        }
+
+        [RedisCommand(1)]
+        protected virtual TypedRedisValue Unwatch(RedisClient client, in RedisRequest request)
+        {
+            return client.Unwatch() ? TypedRedisValue.OK : TypedRedisValue.Error("UNWATCH inside MULTI is not allowed");
+        }
+
+        [RedisCommand(1)]
+        protected virtual TypedRedisValue Multi(RedisClient client, in RedisRequest request)
+        {
+            return client.Multi() ? TypedRedisValue.OK : TypedRedisValue.Error("MULTI calls can not be nested");
+        }
+
+        [RedisCommand(1)]
+        protected virtual TypedRedisValue Discard(RedisClient client, in RedisRequest request)
+        {
+            return client.Discard() ? TypedRedisValue.OK : TypedRedisValue.Error("DISCARD without MULTI");
+        }
+
+        [RedisCommand(1)]
+        protected virtual TypedRedisValue Exec(RedisClient client, in RedisRequest request)
+        {
+            var exec = client.FlushMulti(out var commands);
+            switch (exec)
+            {
+                case RedisClient.ExecResult.NotInTransaction:
+                    return TypedRedisValue.Error("EXEC without MULTI");
+                case RedisClient.ExecResult.WatchConflict:
+                    return TypedRedisValue.NullArray(RespPrefix.Array);
+                case RedisClient.ExecResult.AbortedByError:
+                    return TypedRedisValue.Error("EXECABORT Transaction discarded because of previous errors.");
+            }
+            Debug.Assert(exec is RedisClient.ExecResult.CommandsReturned);
+
+            var results = TypedRedisValue.Rent(commands.Length, out var span, RespPrefix.Array);
+            int index = 0;
+            var lease = RedisRequest.GetLease();
+            try
+            {
+                foreach (var cmd in commands)
+                {
+                    RedisRequest inner = new(cmd, ref lease);
+                    inner = inner.WithClient(client);
+                    span[index++] = Execute(client, inner);
+                }
+            }
+            finally
+            {
+                RedisRequest.ReleaseLease(ref lease);
+            }
+            return results;
+        }
+
+        [RedisCommand(3, nameof(RedisCommand.CLIENT), "setname", LockFree = true)]
+        protected virtual TypedRedisValue ClientSetname(RedisClient client, in RedisRequest request)
         {
             client.Name = request.GetString(2);
             return TypedRedisValue.OK;
         }
 
-        [RedisCommand(2, "client", "getname", LockFree = true)]
-        protected virtual TypedRedisValue ClientGetname(RedisClient client, RedisRequest request)
+        [RedisCommand(2, nameof(RedisCommand.CLIENT), "getname", LockFree = true)]
+        protected virtual TypedRedisValue ClientGetname(RedisClient client, in RedisRequest request)
             => TypedRedisValue.BulkString(client.Name);
 
-        [RedisCommand(3, "client", "reply", LockFree = true)]
-        protected virtual TypedRedisValue ClientReply(RedisClient client, RedisRequest request)
+        [RedisCommand(3, nameof(RedisCommand.CLIENT), "reply", LockFree = true)]
+        protected virtual TypedRedisValue ClientReply(RedisClient client, in RedisRequest request)
         {
-            if (request.IsString(2, "on")) client.SkipReplies = -1; // reply to nothing
-            else if (request.IsString(2, "off")) client.SkipReplies = 0; // reply to everything
-            else if (request.IsString(2, "skip")) client.SkipReplies = 2; // this one, and the next one
+            if (request.IsString(2, "on"u8)) client.SkipReplies = -1; // reply to nothing
+            else if (request.IsString(2, "off"u8)) client.SkipReplies = 0; // reply to everything
+            else if (request.IsString(2, "skip"u8)) client.SkipReplies = 2; // this one, and the next one
             else return TypedRedisValue.Error("ERR syntax error");
             return TypedRedisValue.OK;
         }
 
-        [RedisCommand(-1)]
-        protected virtual TypedRedisValue Cluster(RedisClient client, RedisRequest request)
-            => request.CommandNotFound();
+        [RedisCommand(2, nameof(RedisCommand.CLIENT), "id", LockFree = true)]
+        protected virtual TypedRedisValue ClientId(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.Integer(client.Id);
+
+        [RedisCommand(2, nameof(RedisCommand.CLIENT), "list", LockFree = true)]
+        protected virtual TypedRedisValue ClientList(RedisClient client, in RedisRequest request)
+        {
+            var sb = new StringBuilder();
+            ForAllClients(
+                sb,
+                static (other, state) =>
+                {
+                    if (state.Length != 0) state.AppendLine();
+                    state.Append("id=").Append(other.Id)
+                        .Append(" addr=").Append(other.Node.Host).Append(':').Append(other.Node.Port)
+                        .Append(" age=0 idle=0")
+                        .Append(" db=").Append(other.Database)
+                        .Append(" sub=").Append(other.SubscriptionCount)
+                        .Append(" psub=").Append(other.PatternSubscriptionCount)
+                        .Append(" ssub=").Append(other.ShardedSubscriptionCount)
+                        .Append(" multi=0")
+                        .Append(" cmd=NULL")
+                        .Append(" name=").Append(other.Name ?? "")
+                        .Append(" resp=").Append(other.Protocol is RedisProtocol.Resp3 ? 3 : 2)
+                        .Append(" flags=").Append(other.IsSubscriber ? "P" : "N");
+                    return 1;
+                });
+            return TypedRedisValue.BulkString(sb.ToString());
+        }
+
+        [RedisCommand(4, nameof(RedisCommand.CLIENT), "setinfo", LockFree = true)]
+        protected virtual TypedRedisValue ClientSetInfo(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.OK; // only exists to keep logs clean
+
+        private bool IsClusterEnabled(out TypedRedisValue fault)
+        {
+            if (ServerType == ServerType.Cluster)
+            {
+                fault = default;
+                return true;
+            }
+            fault = TypedRedisValue.Error("ERR This instance has cluster support disabled");
+            return false;
+        }
+
+        [RedisCommand(2, nameof(RedisCommand.CLUSTER), subcommand: "nodes", LockFree = true)]
+        protected virtual TypedRedisValue ClusterNodes(RedisClient client, in RedisRequest request)
+        {
+            if (!IsClusterEnabled(out TypedRedisValue fault)) return fault;
+
+            var sb = new StringBuilder();
+            foreach (var pair in _nodes.OrderBy(x => x.Key, EndPointComparer.Instance))
+            {
+                var node = pair.Value;
+                // <id> <ip:port@cport[,hostname]> ...
+                sb.Append(node.Id).Append(" ").Append(node.Host).Append(":").Append(node.Port).Append("@").Append(node.Port + 10000);
+                if (SupportsHostnames)
+                {
+                    // the hostname slot is positional: it can be empty while aux fields follow it
+                    var aux = node.AuxFields;
+                    if (!string.IsNullOrWhiteSpace(node.Hostname) || aux is { Count: > 0 })
+                    {
+                        sb.Append(",").Append(node.Hostname);
+                    }
+                    if (aux is { Count: > 0 })
+                    {
+                        foreach (var field in aux)
+                        {
+                            sb.Append(",").Append(field.Key).Append("=").Append(field.Value);
+                        }
+                    }
+                }
+                sb.Append(" ");
+                if (node == client.Node)
+                {
+                    sb.Append("myself,");
+                }
+                sb.Append((node.Flags & NodeFlags.Replica) == 0 ? "master" : "slave");
+                if ((node.Flags & NodeFlags.Handshake) != 0)
+                {
+                    sb.Append(",handshake");
+                }
+                if ((node.Flags & NodeFlags.Fail) != 0) sb.Append(",fail");
+                if ((node.Flags & NodeFlags.PFail) != 0) sb.Append(",fail?");
+                if ((node.Flags & NodeFlags.NoAddress) != 0) sb.Append(",noaddr");
+                if ((node.Flags & NodeFlags.NoFailover) != 0) sb.Append(",nofailover");
+                sb.Append(" - 0 0 1 connected");
+                foreach (var range in node.Slots)
+                {
+                    sb.Append(" ").Append(range.ToString());
+                }
+                sb.AppendLine();
+            }
+            return TypedRedisValue.BulkString(sb.ToString());
+        }
+
+        [RedisCommand(2, nameof(RedisCommand.CLUSTER), subcommand: "slots", LockFree = true)]
+        protected virtual TypedRedisValue ClusterSlots(RedisClient client, in RedisRequest request)
+        {
+            if (!IsClusterEnabled(out TypedRedisValue fault)) return fault;
+
+            int count = 0, index = 0;
+            foreach (var pair in _nodes)
+            {
+                count += pair.Value.Slots.Length;
+            }
+            var perspective = client?.Node ?? (TryGetNode(DefaultEndPoint, out var fallback) ? fallback : null);
+            var slots = TypedRedisValue.Rent(count, out var slotsSpan, RespPrefix.Array);
+            foreach (var pair in _nodes.OrderBy(x => x.Key, EndPointComparer.Instance))
+            {
+                var node = pair.Value;
+                GetHost(pair.Key, out int port);
+                foreach (var range in node.Slots)
+                {
+                    if (index >= count) break; // someone changed things while we were working
+                    slotsSpan[index++] = TypedRedisValue.Rent(3, out var slotSpan, RespPrefix.Array);
+                    slotSpan[0] = TypedRedisValue.Integer(range.From);
+                    slotSpan[1] = TypedRedisValue.Integer(range.To);
+                    // the metadata element itself only exists from 7.0; older servers stop at the node id
+                    slotSpan[2] = TypedRedisValue.Rent(SupportsHostnames ? 4 : 3, out var nodeSpan, RespPrefix.Array);
+
+                    // note the first field is positionally "the endpoint" and its *content* is whichever
+                    // form is preferred, so it may well be a hostname rather than an address
+                    nodeSpan[0] = GetAnnouncedEndpoint(perspective ?? node, node);
+                    nodeSpan[1] = TypedRedisValue.Integer(port);
+                    nodeSpan[2] = TypedRedisValue.BulkString(node.Id);
+                    if (SupportsHostnames)
+                    {
+                        nodeSpan[3] = GetEndpointMetadata(perspective ?? node, node);
+                    }
+                }
+            }
+            return slots;
+        }
+
+        // the metadata map is documented as the *complement* of the primary position: ip when the
+        // preferred type is not ip, hostname when the node has one and the preferred type is not
+        // hostname. So the union of the primary field and the metadata is every form the node has, with
+        // no duplication - which is what makes one reply enough to reconcile identities.
+        private static TypedRedisValue GetEndpointMetadata(Node perspective, Node node)
+        {
+            bool wantIp = perspective.EffectiveEndpointType != ClusterEndpointType.Ip;
+            bool wantHostname = perspective.EffectiveEndpointType != ClusterEndpointType.Hostname
+                && !string.IsNullOrWhiteSpace(node.Hostname);
+
+            var extra = node.SlotsMetadata;
+            int pairs = (wantIp ? 1 : 0) + (wantHostname ? 1 : 0) + (extra?.Count ?? 0);
+            if (pairs == 0) return TypedRedisValue.EmptyArray(RespPrefix.Map);
+
+            var result = TypedRedisValue.Rent(2 * pairs, out var span, RespPrefix.Map);
+            int index = 0;
+            if (wantIp)
+            {
+                span[index++] = TypedRedisValue.BulkString("ip");
+                span[index++] = TypedRedisValue.BulkString(GetIpForm(node));
+            }
+            if (wantHostname)
+            {
+                span[index++] = TypedRedisValue.BulkString("hostname");
+                span[index++] = TypedRedisValue.BulkString(node.Hostname);
+            }
+            if (extra is not null)
+            {
+                foreach (var pair in extra)
+                {
+                    span[index++] = TypedRedisValue.BulkString(pair.Key);
+                    span[index++] = TypedRedisValue.BulkString(pair.Value);
+                }
+            }
+            return result;
+        }
+
+        private sealed class EndPointComparer : IComparer<EndPoint>
+        {
+            private EndPointComparer() { }
+            public static readonly EndPointComparer Instance = new();
+
+            public int Compare(EndPoint x, EndPoint y)
+            {
+                if (x is null) return y is null ? 0 : -1;
+                if (y is null) return 1;
+                if (x is IPEndPoint ipX && y is IPEndPoint ipY)
+                {
+                    // ignore the address, go by port alone
+                    return ipX.Port.CompareTo(ipY.Port);
+                }
+                if (x is DnsEndPoint dnsX && y is DnsEndPoint dnsY)
+                {
+                    var delta = dnsX.Host.CompareTo(dnsY.Host, StringComparison.Ordinal);
+                    if (delta != 0) return delta;
+                    return dnsX.Port.CompareTo(dnsY.Port);
+                }
+
+                return 0; // whatever
+            }
+        }
+
+        public static string GetHost(EndPoint endpoint, out int port)
+        {
+            if (endpoint is IPEndPoint ip)
+            {
+                port = ip.Port;
+                return ip.Address.ToString();
+            }
+            if (endpoint is DnsEndPoint dns)
+            {
+                port = dns.Port;
+                return dns.Host;
+            }
+            throw new NotSupportedException("Unknown endpoint type: " + endpoint.GetType().Name);
+        }
+
+        public sealed class Node
+        {
+            public override string ToString()
+            {
+                var sb = new StringBuilder();
+                sb.Append(Host).Append(":").Append(Port).Append(" (");
+                var slots = _slots;
+                if (slots is null)
+                {
+                    sb.Append("all keys");
+                }
+                else
+                {
+                    bool first = true;
+                    foreach (var slot in Slots)
+                    {
+                        if (!first) sb.Append(",");
+                        sb.Append(slot);
+                        first = false;
+                    }
+
+                    if (first) sb.Append("empty");
+                }
+                sb.Append(")");
+                return sb.ToString();
+            }
+
+            public string Host { get; }
+
+            /// <summary>
+            /// The announced hostname of this node, if any; an additional identity rather than a
+            /// replacement for <see cref="Host"/>, which remains what the node is keyed on.
+            /// </summary>
+            public string Hostname { get; internal set; }
+
+            /// <summary>
+            /// What this node knows about its own address; <see cref="AnnouncedAddress.Address"/>
+            /// unless a test says otherwise.
+            /// </summary>
+            public AnnouncedAddress Announced { get; internal set; }
+
+            /// <summary>
+            /// Auxiliary <c>name=value</c> fields this node declares after its hostname in
+            /// <c>CLUSTER NODES</c>; null when it declares none.
+            /// </summary>
+            public List<KeyValuePair<string, string>> AuxFields { get; internal set; }
+
+            /// <summary>
+            /// Extra <c>CLUSTER SLOTS</c> metadata entries beyond the complement rule's ip/hostname.
+            /// </summary>
+            public List<KeyValuePair<string, string>> SlotsMetadata { get; internal set; }
+
+            /// <summary>
+            /// This node's own preferred endpoint type, or <c>null</c> to follow the server-wide default.
+            /// Nullable rather than copied at construction, so that setting the server default later
+            /// still applies to nodes that have no opinion.
+            /// </summary>
+            public ClusterEndpointType? PreferredEndpointType { get; internal set; }
+
+            /// <summary>
+            /// The preference as it actually applies to this node, given the server version; a pre-7.0
+            /// server has no such setting at all, so it reports addresses.
+            /// </summary>
+            internal ClusterEndpointType EffectiveEndpointType => _server.SupportsHostnames
+                ? PreferredEndpointType ?? _server.PreferredEndpointType
+                : ClusterEndpointType.Ip;
+
+            /// <summary>
+            /// The host portion this node is named by in a <c>-MOVED</c> redirect issued by
+            /// <paramref name="perspective"/> - the redirect uses the *answering* node's preferred
+            /// endpoint type, as a real server does. Empty when no endpoint can be given, in which case a
+            /// client should dial the endpoint it sent the command to, using the port from the redirect.
+            /// </summary>
+            public string AnnouncedHostFrom(Node perspective) => (perspective ?? this).EffectiveEndpointType switch
+            {
+                ClusterEndpointType.UnknownEndpoint => "",
+                ClusterEndpointType.Hostname => string.IsNullOrWhiteSpace(Hostname) ? UnannouncedHostname : Hostname,
+                _ => GetIpForm(this),
+            };
+
+            public int Port { get; }
+            public string Id { get; } = NewId();
+
+            private SlotRange[] _slots;
+
+            private readonly RedisServer _server;
+            public RedisServer Server => _server;
+            public NodeFlags Flags { get; }
+            public Node(RedisServer server, EndPoint endpoint, NodeFlags flags)
+            {
+                Host = GetHost(endpoint, out var port);
+                Port = port;
+                _server = server;
+                Flags = flags;
+            }
+
+            public void UpdateSlots(SlotRange[] slots) => _slots = slots;
+            public ReadOnlySpan<SlotRange> Slots => _slots ?? SlotRange.SharedAllSlots;
+            public bool CheckCrossSlot => _server.CheckCrossSlot;
+
+            public bool HasSlot(int hashSlot)
+            {
+                if (hashSlot == ServerSelectionStrategy.NoSlot) return true;
+                var slots = _slots;
+                if (slots is null) return true; // all nodes
+                foreach (var slot in slots)
+                {
+                    if (slot.Includes(hashSlot)) return true;
+                }
+                return false;
+            }
+
+            public bool HasSlot(in RedisKey key)
+            {
+                var slots = _slots;
+                if (slots is null) return true; // all nodes
+                var hashSlot = GetHashSlot(key);
+                foreach (var slot in slots)
+                {
+                    if (slot.Includes(hashSlot)) return true;
+                }
+                return false;
+            }
+
+            public bool HasSlot(ReadOnlySpan<byte> key)
+            {
+                var slots = _slots;
+                if (slots is null) return true; // all nodes
+                var hashSlot = ServerSelectionStrategy.GetClusterSlot(key);
+                foreach (var slot in slots)
+                {
+                    if (slot.Includes(hashSlot)) return true;
+                }
+                return false;
+            }
+
+            private static int s_idCounter;
+#if !NET
+            private static readonly Random s_rand = new Random();
+#endif
+
+            private static string NewId()
+            {
+                Span<char> data = stackalloc char[40];
+                ReadOnlySpan<char> alphabet = "0123456789abcdef";
+#if NET
+                var rand = Random.Shared;
+                for (int i = 0; i < data.Length; i++)
+                {
+                    data[i] = alphabet[rand.Next(alphabet.Length)];
+                }
+#else
+                // one shared instance: .NET Framework seeds Random from Environment.TickCount, so an
+                // instance per call yields identical sequences - and therefore identical node ids - for
+                // nodes created within the same tick
+                lock (s_rand)
+                {
+                    for (int i = 0; i < data.Length; i++)
+                    {
+                        data[i] = alphabet[s_rand.Next(alphabet.Length)];
+                    }
+                }
+#endif
+
+                // ...and weave in a counter, so ids are unique by construction rather than by luck. Node ids
+                // are the identity that topology reconciliation keys on, so a collision here does not produce
+                // a test failure that looks like a collision: it looks like the client wrongly merging nodes
+                var unique = (uint)Interlocked.Increment(ref s_idCounter);
+                for (int i = 0; i < 8; i++)
+                {
+                    data[i] = alphabet[(int)((unique >> (28 - (i * 4))) & 0xF)];
+                }
+                return data.ToString();
+            }
+
+            public void AddSlot(int hashSlot)
+            {
+                SlotRange[] oldSlots, newSlots;
+                do
+                {
+                    oldSlots = _slots;
+                    newSlots = oldSlots;
+                    if (oldSlots is null)
+                    {
+                        newSlots = [new SlotRange(hashSlot, hashSlot)];
+                    }
+                    else
+                    {
+                        bool found = false;
+                        int index = 0;
+                        foreach (var slot in oldSlots)
+                        {
+                            if (slot.Includes(hashSlot)) return; // already covered
+                            if (slot.To == hashSlot - 1)
+                            {
+                                // extend the range
+                                newSlots = new SlotRange[oldSlots.Length];
+                                oldSlots.AsSpan().CopyTo(newSlots);
+                                newSlots[index] = new SlotRange(slot.From, hashSlot);
+                                found = true;
+                                break;
+                            }
+
+                            index++;
+                        }
+
+                        if (!found)
+                        {
+                            newSlots = [..oldSlots, new SlotRange(hashSlot, hashSlot)];
+                            Array.Sort(newSlots);
+                        }
+                    }
+                }
+                while (Interlocked.CompareExchange(ref _slots, newSlots, oldSlots) != oldSlots);
+            }
+
+            public bool RemoveSlot(int hashSlot)
+            {
+                SlotRange[] oldSlotsRaw, newSlots;
+                do
+                {
+                    oldSlotsRaw = _slots;
+                    newSlots = oldSlotsRaw;
+                    // avoid the implicit null "all slots" usage
+                    var oldSlots = oldSlotsRaw ?? SlotRange.SharedAllSlots;
+                    bool found = false;
+                    int index = 0;
+                    foreach (var s in oldSlots)
+                    {
+                        if (s.Includes(hashSlot))
+                        {
+                            found = true;
+                            var oldSpan = oldSlots.AsSpan();
+                            if (s.IsSingleSlot)
+                            {
+                                // remove it
+                                newSlots = new SlotRange[oldSlots.Length - 1];
+                                if (index > 0) oldSpan.Slice(0, index).CopyTo(newSlots);
+                                if (index < oldSlots.Length - 1) oldSpan.Slice(index + 1).CopyTo(newSlots.AsSpan(index));
+                            }
+                            else if (s.From == hashSlot)
+                            {
+                                // truncate the start
+                                newSlots = new SlotRange[oldSlots.Length];
+                                oldSpan.CopyTo(newSlots);
+                                newSlots[index] = new SlotRange(s.From + 1, s.To);
+                            }
+                            else if (s.To == hashSlot)
+                            {
+                                // truncate the end
+                                newSlots = new SlotRange[oldSlots.Length];
+                                oldSpan.CopyTo(newSlots);
+                                newSlots[index] = new SlotRange(s.From, s.To - 1);
+                            }
+                            else
+                            {
+                                // split it
+                                newSlots = new SlotRange[oldSlots.Length + 1];
+                                if (index > 0) oldSpan.Slice(0, index).CopyTo(newSlots);
+                                newSlots[index] = new SlotRange(s.From, hashSlot - 1);
+                                newSlots[index + 1] = new SlotRange(hashSlot + 1, s.To);
+                                if (index < oldSlots.Length - 1) oldSpan.Slice(index + 1).CopyTo(newSlots.AsSpan(index + 2));
+                            }
+                            break;
+                        }
+                        index++;
+                    }
+
+                    if (!found) return false;
+                }
+                while (Interlocked.CompareExchange(ref _slots, newSlots, oldSlotsRaw) != oldSlotsRaw);
+
+                return true;
+            }
+
+            public void AssertKey(in RedisKey key)
+            {
+                var slots = _slots;
+                if (slots is not null)
+                {
+                    var hashSlot = GetHashSlot(key);
+                    if (!HasSlot(hashSlot)) KeyMovedException.Throw(hashSlot);
+                }
+            }
+
+            public void Touch(int db, in RedisKey key) => _server.Touch(db, key);
+
+            public void OnOutOfBand(RedisClient client, TypedRedisValue message)
+                => _server.OnOutOfBand(client, message);
+        }
+
+        public virtual bool CheckCrossSlot => ServerType == ServerType.Cluster;
+
+        protected override Node GetNode(int hashSlot)
+        {
+            foreach (var pair in _nodes)
+            {
+                if (pair.Value.HasSlot(hashSlot)) return pair.Value;
+            }
+            return base.GetNode(hashSlot);
+        }
 
         [RedisCommand(-3)]
-        protected virtual TypedRedisValue Lpush(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Lpush(RedisClient client, in RedisRequest request)
         {
             var key = request.GetKey(1);
             long length = -1;
@@ -126,7 +1221,7 @@ namespace StackExchange.Redis.Server
         }
 
         [RedisCommand(-3)]
-        protected virtual TypedRedisValue Rpush(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Rpush(RedisClient client, in RedisRequest request)
         {
             var key = request.GetKey(1);
             long length = -1;
@@ -138,36 +1233,36 @@ namespace StackExchange.Redis.Server
         }
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Lpop(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Lpop(RedisClient client, in RedisRequest request)
             => TypedRedisValue.BulkString(Lpop(client.Database, request.GetKey(1)));
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Rpop(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Rpop(RedisClient client, in RedisRequest request)
             => TypedRedisValue.BulkString(Rpop(client.Database, request.GetKey(1)));
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Llen(RedisClient client, RedisRequest request)
-            => TypedRedisValue.Integer(Llen(client.Database, request.GetKey(1)));
+        protected virtual TypedRedisValue Llen(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.Integer(Llen(client.Database, request.GetKey(1, KeyFlags.ReadOnly)));
 
-        protected virtual long Lpush(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
-        protected virtual long Rpush(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
-        protected virtual long Llen(int database, RedisKey key) => throw new NotSupportedException();
-        protected virtual RedisValue Rpop(int database, RedisKey key) => throw new NotSupportedException();
-        protected virtual RedisValue Lpop(int database, RedisKey key) => throw new NotSupportedException();
+        protected virtual long Lpush(int database, in RedisKey key, in RedisValue value) => throw new NotSupportedException();
+        protected virtual long Rpush(int database, in RedisKey key, in RedisValue value) => throw new NotSupportedException();
+        protected virtual long Llen(int database, in RedisKey key) => throw new NotSupportedException();
+        protected virtual RedisValue Rpop(int database, in RedisKey key) => throw new NotSupportedException();
+        protected virtual RedisValue Lpop(int database, in RedisKey key) => throw new NotSupportedException();
 
         [RedisCommand(4)]
-        protected virtual TypedRedisValue LRange(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue LRange(RedisClient client, in RedisRequest request)
         {
-            var key = request.GetKey(1);
+            var key = request.GetKey(1, KeyFlags.ReadOnly);
             long start = request.GetInt64(2), stop = request.GetInt64(3);
 
             var len = Llen(client.Database, key);
-            if (len == 0) return TypedRedisValue.EmptyArray;
+            if (len == 0) return TypedRedisValue.EmptyArray(RespPrefix.Array);
 
             if (start < 0) start = len + start;
             if (stop < 0) stop = len + stop;
 
-            if (stop < 0 || start >= len || stop < start) return TypedRedisValue.EmptyArray;
+            if (stop < 0 || start >= len || stop < start) return TypedRedisValue.EmptyArray(RespPrefix.Array);
 
             if (start < 0) start = 0;
             else if (start >= len) start = len - 1;
@@ -175,13 +1270,26 @@ namespace StackExchange.Redis.Server
             if (stop < 0) stop = 0;
             else if (stop >= len) stop = len - 1;
 
-            var arr = TypedRedisValue.Rent(checked((int)((stop - start) + 1)), out var span);
+            var arr = TypedRedisValue.Rent(checked((int)((stop - start) + 1)), out var span, RespPrefix.Array);
             LRange(client.Database, key, start, span);
             return arr;
         }
-        protected virtual void LRange(int database, RedisKey key, long start, Span<TypedRedisValue> arr) => throw new NotSupportedException();
+        protected virtual void LRange(int database, in RedisKey key, long start, Span<TypedRedisValue> arr) => throw new NotSupportedException();
 
-        protected virtual void OnUpdateServerConfiguration() { }
+        // both of these parameters are per-node on a real server, so the values published depend on the
+        // connection asking; pre-7.0 they do not exist at all and are simply absent. This is why CONFIG GET
+        // is not LockFree: it writes the answering node's view into the shared configuration first
+        protected virtual void OnUpdateServerConfiguration(RedisClient client)
+        {
+            if (!SupportsHostnames) return;
+
+            var node = client?.Node ?? (TryGetNode(DefaultEndPoint, out var fallback) ? fallback : null);
+            if (node is null) return;
+
+            var config = ServerConfiguration;
+            config[ClusterPreferredEndpointType] = ToConfigValue(node.EffectiveEndpointType);
+            config[ClusterAnnounceHostname] = node.Hostname ?? "";
+        }
         protected RedisConfig ServerConfiguration { get; } = RedisConfig.Create();
         protected struct RedisConfig
         {
@@ -212,17 +1320,17 @@ namespace StackExchange.Redis.Server
                 return count;
             }
         }
-        [RedisCommand(3, "config", "get", LockFree = true)]
-        protected virtual TypedRedisValue Config(RedisClient client, RedisRequest request)
+        [RedisCommand(3, nameof(RedisCommand.CONFIG), "get")]
+        protected virtual TypedRedisValue Config(RedisClient client, in RedisRequest request)
         {
             var pattern = request.GetString(2);
 
-            OnUpdateServerConfiguration();
+            OnUpdateServerConfiguration(client);
             var config = ServerConfiguration;
             var matches = config.CountMatch(pattern);
-            if (matches == 0) return TypedRedisValue.EmptyArray;
+            if (matches == 0) return TypedRedisValue.EmptyArray(RespPrefix.Map);
 
-            var arr = TypedRedisValue.Rent(2 * matches, out var span);
+            var arr = TypedRedisValue.Rent(2 * matches, out var span, RespPrefix.Map);
             int index = 0;
             foreach (var pair in config.Wrapped)
             {
@@ -241,23 +1349,23 @@ namespace StackExchange.Redis.Server
         }
 
         [RedisCommand(2, LockFree = true)]
-        protected virtual TypedRedisValue Echo(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Echo(RedisClient client, in RedisRequest request)
             => TypedRedisValue.BulkString(request.GetValue(1));
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Exists(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Exists(RedisClient client, in RedisRequest request)
         {
             int count = 0;
             var db = client.Database;
             for (int i = 1; i < request.Count; i++)
             {
-                if (Exists(db, request.GetKey(i)))
+                if (Exists(db, request.GetKey(i, KeyFlags.ReadOnly)))
                     count++;
             }
             return TypedRedisValue.Integer(count);
         }
 
-        protected virtual bool Exists(int database, RedisKey key)
+        protected virtual bool Exists(int database, in RedisKey key)
         {
             try
             {
@@ -267,32 +1375,56 @@ namespace StackExchange.Redis.Server
         }
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Get(RedisClient client, RedisRequest request)
-            => TypedRedisValue.BulkString(Get(client.Database, request.GetKey(1)));
+        protected virtual TypedRedisValue Get(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.BulkString(Get(client.Database, request.GetKey(1, KeyFlags.ReadOnly)));
 
-        protected virtual RedisValue Get(int database, RedisKey key) => throw new NotSupportedException();
+        protected virtual RedisValue Get(int database, in RedisKey key) => throw new NotSupportedException();
 
-        [RedisCommand(3)]
-        protected virtual TypedRedisValue Set(RedisClient client, RedisRequest request)
+        [RedisCommand(-3)]
+        protected virtual TypedRedisValue Set(RedisClient client, in RedisRequest request)
         {
-            Set(client.Database, request.GetKey(1), request.GetValue(2));
-            return TypedRedisValue.OK;
+            TimeSpan? expiry = null;
+            var key = request.GetKey(1);
+            var value = request.GetValue(2);
+            SetFlags flags = SetFlags.None;
+            for (int i = 3; i < request.Count; i++)
+            {
+                if (request.IsString(i, "nx"u8) || request.IsString(i, "NX"u8)) flags |= SetFlags.NX;
+                else if (request.IsString(i, "xx"u8) || request.IsString(i, "XX"u8)) flags |= SetFlags.XX;
+                else if (request.IsString(i, "ex"u8) || request.IsString(i, "EX"u8)) expiry = TimeSpan.FromSeconds(request.GetInt32(++i));
+                else if (request.IsString(i, "px"u8) || request.IsString(i, "PX"u8)) expiry = TimeSpan.FromMilliseconds(request.GetInt32(++i));
+                else return TypedRedisValue.Error("ERR syntax error");
+            }
+            const SetFlags BOTH = SetFlags.NX | SetFlags.XX;
+            if ((flags & BOTH) == BOTH) return TypedRedisValue.Error("ERR Invalid flags combination");
+            var result = Set(client.Database, request.GetKey(1), request.GetValue(2), expiry, flags);
+            return result ? TypedRedisValue.OK : TypedRedisValue.BulkString(RedisValue.Null);
         }
-        protected virtual void Set(int database, RedisKey key, RedisValue value) => throw new NotSupportedException();
+
+        [Flags]
+        public enum SetFlags
+        {
+            None = 0,
+            NX = 1,
+            XX = 2,
+        }
+
+        protected virtual bool Set(int database, in RedisKey key, in RedisValue value, TimeSpan? expiry = null, SetFlags flags = SetFlags.None) => throw new NotSupportedException();
+
         [RedisCommand(1)]
-        protected new virtual TypedRedisValue Shutdown(RedisClient client, RedisRequest request)
+        protected new virtual TypedRedisValue Shutdown(RedisClient client, in RedisRequest request)
         {
             DoShutdown(ShutdownReason.ClientInitiated);
             return TypedRedisValue.OK;
         }
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Strlen(RedisClient client, RedisRequest request)
-            => TypedRedisValue.Integer(Strlen(client.Database, request.GetKey(1)));
+        protected virtual TypedRedisValue Strlen(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.Integer(Strlen(client.Database, request.GetKey(1, KeyFlags.ReadOnly)));
 
-        protected virtual long Strlen(int database, RedisKey key) => Get(database, key).Length();
+        protected virtual long Strlen(int database, in RedisKey key) => Get(database, key).Length();
 
         [RedisCommand(-2)]
-        protected virtual TypedRedisValue Del(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Del(RedisClient client, in RedisRequest request)
         {
             int count = 0;
             for (int i = 1; i < request.Count; i++)
@@ -302,16 +1434,65 @@ namespace StackExchange.Redis.Server
             }
             return TypedRedisValue.Integer(count);
         }
-        protected virtual bool Del(int database, RedisKey key) => throw new NotSupportedException();
+        protected virtual bool Del(int database, in RedisKey key) => throw new NotSupportedException();
+
+        [RedisCommand(2)]
+        protected virtual TypedRedisValue GetDel(RedisClient client, in RedisRequest request)
+        {
+            var key = request.GetKey(1);
+            var value = Get(client.Database, key);
+            if (!value.IsNull) Del(client.Database, key);
+            return TypedRedisValue.BulkString(value);
+        }
 
         [RedisCommand(1)]
-        protected virtual TypedRedisValue Dbsize(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Dbsize(RedisClient client, in RedisRequest request)
             => TypedRedisValue.Integer(Dbsize(client.Database));
 
         protected virtual long Dbsize(int database) => throw new NotSupportedException();
 
+        [RedisCommand(3)]
+        protected virtual TypedRedisValue Expire(RedisClient client, in RedisRequest request)
+        {
+            var key = request.GetKey(1);
+            var seconds = request.GetInt32(2);
+            return TypedRedisValue.Integer(Expire(client.Database, key, TimeSpan.FromSeconds(seconds)) ? 1 : 0);
+        }
+
+        [RedisCommand(3)]
+        protected virtual TypedRedisValue PExpire(RedisClient client, in RedisRequest request)
+        {
+            var key = request.GetKey(1);
+            var millis = request.GetInt64(2);
+            return TypedRedisValue.Integer(Expire(client.Database, key, TimeSpan.FromMilliseconds(millis)) ? 1 : 0);
+        }
+
+        [RedisCommand(2)]
+        protected virtual TypedRedisValue Ttl(RedisClient client, in RedisRequest request)
+        {
+            var key = request.GetKey(1, KeyFlags.ReadOnly);
+            var ttl = Ttl(client.Database, key);
+            if (ttl == null || ttl <= TimeSpan.Zero) return TypedRedisValue.Integer(-2);
+            if (ttl == TimeSpan.MaxValue) return TypedRedisValue.Integer(-1);
+            return TypedRedisValue.Integer((int)ttl.Value.TotalSeconds);
+        }
+
+        protected virtual TimeSpan? Ttl(int database, in RedisKey key) => throw new NotSupportedException();
+
+        [RedisCommand(2)]
+        protected virtual TypedRedisValue Pttl(RedisClient client, in RedisRequest request)
+        {
+            var key = request.GetKey(1, KeyFlags.ReadOnly);
+            var ttl = Ttl(client.Database, key);
+            if (ttl == null || ttl <= TimeSpan.Zero) return TypedRedisValue.Integer(-2);
+            if (ttl == TimeSpan.MaxValue) return TypedRedisValue.Integer(-1);
+            return TypedRedisValue.Integer((long)ttl.Value.TotalMilliseconds);
+        }
+
+        protected virtual bool Expire(int database, in RedisKey key, TimeSpan timeout) => throw new NotSupportedException();
+
         [RedisCommand(1)]
-        protected virtual TypedRedisValue Flushall(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Flushall(RedisClient client, in RedisRequest request)
         {
             var count = Databases;
             for (int i = 0; i < count; i++)
@@ -322,7 +1503,7 @@ namespace StackExchange.Redis.Server
         }
 
         [RedisCommand(1)]
-        protected virtual TypedRedisValue Flushdb(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Flushdb(RedisClient client, in RedisRequest request)
         {
             Flushdb(client.Database);
             return TypedRedisValue.OK;
@@ -330,7 +1511,7 @@ namespace StackExchange.Redis.Server
         protected virtual void Flushdb(int database) => throw new NotSupportedException();
 
         [RedisCommand(-1, LockFree = true, MaxArgs = 2)]
-        protected virtual TypedRedisValue Info(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Info(RedisClient client, in RedisRequest request)
         {
             var info = Info(request.Count == 1 ? null : request.GetString(1));
             return TypedRedisValue.BulkString(info);
@@ -346,23 +1527,62 @@ namespace StackExchange.Redis.Server
             if (IsMatch("Persistence")) Info(sb, "Persistence");
             if (IsMatch("Stats")) Info(sb, "Stats");
             if (IsMatch("Replication")) Info(sb, "Replication");
+            if (IsMatch("Cluster")) Info(sb, "Cluster");
             if (IsMatch("Keyspace")) Info(sb, "Keyspace");
             return sb.ToString();
         }
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Keys(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Keys(RedisClient client, in RedisRequest request)
         {
             List<TypedRedisValue> found = null;
-            foreach (var key in Keys(client.Database, request.GetKey(1)))
+            bool checkSlot = ServerType is ServerType.Cluster;
+            var node = client.Node ?? DefaultNode;
+            foreach (var key in Keys(client.Database, request.GetKey(1, flags: KeyFlags.NoSlotCheck | KeyFlags.ReadOnly)))
             {
+                if (checkSlot && !node.HasSlot(key)) continue;
                 if (found == null) found = new List<TypedRedisValue>();
                 found.Add(TypedRedisValue.BulkString(key.AsRedisValue()));
             }
-            if (found == null) return TypedRedisValue.EmptyArray;
-            return TypedRedisValue.MultiBulk(found);
+            if (found == null) return TypedRedisValue.EmptyArray(RespPrefix.Array);
+            return TypedRedisValue.MultiBulk(found, RespPrefix.Array);
         }
-        protected virtual IEnumerable<RedisKey> Keys(int database, RedisKey pattern) => throw new NotSupportedException();
+        protected virtual IEnumerable<RedisKey> Keys(int database, in RedisKey pattern) => throw new NotSupportedException();
+
+        private static readonly Version s_DefaultServerVersion = new(1, 0, 0);
+
+        private string _versionString;
+        public string VersionString => _versionString;
+        private static string FormatVersion(Version v)
+        {
+            var sb = new StringBuilder().Append(v.Major).Append('.').Append(v.Minor);
+            if (v.Revision >= 0) sb.Append('.').Append(v.Revision);
+            if (v.Build >= 0) sb.Append('.').Append(v.Build);
+            return sb.ToString();
+        }
+
+        public Version RedisVersion
+        {
+            get;
+            set
+            {
+                if (field == value) return;
+                field = value;
+                _versionString = FormatVersion(value);
+            }
+        }
+
+        public DateTime StartTime { get; set; } = DateTime.UtcNow;
+        public ServerType ServerType { get; set; } = ServerType.Standalone;
+
+        private string ServerModeValue => ServerType switch
+        {
+            ServerType.Cluster => "cluster",
+            ServerType.Sentinel => "sentinel",
+            _ => "standalone",
+        };
+
+        protected virtual string ServerModeKey => "redis_mode";
 
         protected virtual void Info(StringBuilder sb, string section)
         {
@@ -375,14 +1595,17 @@ namespace StackExchange.Redis.Server
             switch (section)
             {
                 case "Server":
-                    AddHeader().AppendLine("redis_version:1.0")
-                        .AppendLine("redis_mode:standalone")
+                    AddHeader().Append("redis_version:").AppendLine(VersionString)
+                        .Append(ServerModeKey).Append(':').Append(ServerModeValue).AppendLine()
                         .Append("os:").Append(Environment.OSVersion).AppendLine()
                         .Append("arch_bits:x").Append(IntPtr.Size * 8).AppendLine();
                     using (var process = Process.GetCurrentProcess())
                     {
-                        sb.Append("process:").Append(process.Id).AppendLine();
+                        sb.Append("process_id:").Append(process.Id).AppendLine();
                     }
+                    var time = DateTime.UtcNow - StartTime;
+                    sb.Append("uptime_in_seconds:").Append((int)time.TotalSeconds).AppendLine();
+                    sb.Append("uptime_in_days:").Append((int)time.TotalDays).AppendLine();
                     // var port = TcpPort();
                     // if (port >= 0) sb.Append("tcp_port:").Append(port).AppendLine();
                     break;
@@ -401,30 +1624,34 @@ namespace StackExchange.Redis.Server
                 case "Replication":
                     AddHeader().AppendLine("role:master");
                     break;
+                case "Cluster":
+                    AddHeader().Append("cluster_enabled:").Append(ServerType is ServerType.Cluster ? 1 : 0).AppendLine();
+                    break;
                 case "Keyspace":
                     break;
             }
         }
-        [RedisCommand(2, "memory", "purge")]
-        protected virtual TypedRedisValue MemoryPurge(RedisClient client, RedisRequest request)
+
+        [RedisCommand(2, nameof(RedisCommand.MEMORY), "purge")]
+        protected virtual TypedRedisValue MemoryPurge(RedisClient client, in RedisRequest request)
         {
             GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced);
             return TypedRedisValue.OK;
         }
         [RedisCommand(-2)]
-        protected virtual TypedRedisValue Mget(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Mget(RedisClient client, in RedisRequest request)
         {
             int argCount = request.Count;
-            var arr = TypedRedisValue.Rent(argCount - 1, out var span);
+            var arr = TypedRedisValue.Rent(argCount - 1, out var span, RespPrefix.Map);
             var db = client.Database;
             for (int i = 1; i < argCount; i++)
             {
-                span[i - 1] = TypedRedisValue.BulkString(Get(db, request.GetKey(i)));
+                span[i - 1] = TypedRedisValue.BulkString(Get(db, request.GetKey(i, KeyFlags.ReadOnly)));
             }
             return arr;
         }
         [RedisCommand(-3)]
-        protected virtual TypedRedisValue Mset(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Mset(RedisClient client, in RedisRequest request)
         {
             int argCount = request.Count;
             var db = client.Database;
@@ -434,88 +1661,71 @@ namespace StackExchange.Redis.Server
             }
             return TypedRedisValue.OK;
         }
+
         [RedisCommand(-1, LockFree = true, MaxArgs = 2)]
-        protected virtual TypedRedisValue Ping(RedisClient client, RedisRequest request)
-            => TypedRedisValue.SimpleString(request.Count == 1 ? "PONG" : request.GetString(1));
+        protected virtual TypedRedisValue Ping(RedisClient client, in RedisRequest request)
+        {
+            if (client.IsResp2 & client.IsSubscriber)
+            {
+                var reply = TypedRedisValue.Rent(2, out var span, RespPrefix.Array);
+                span[0] = TypedRedisValue.BulkString("pong");
+                RedisValue value = request.Count == 1 ? RedisValue.Null : request.GetValue(1);
+                span[1] = TypedRedisValue.BulkString(value);
+                return reply;
+            }
+            return TypedRedisValue.SimpleString(request.Count == 1 ? "PONG" : request.GetString(1));
+        }
 
         [RedisCommand(1, LockFree = true)]
-        protected virtual TypedRedisValue Quit(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Quit(RedisClient client, in RedisRequest request)
         {
+            client.Complete();
             RemoveClient(client);
             return TypedRedisValue.OK;
         }
 
         [RedisCommand(1, LockFree = true)]
-        protected virtual TypedRedisValue Role(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Role(RedisClient client, in RedisRequest request)
         {
-            var arr = TypedRedisValue.Rent(3, out var span);
+            var arr = TypedRedisValue.Rent(3, out var span, RespPrefix.Array);
             span[0] = TypedRedisValue.BulkString("master");
             span[1] = TypedRedisValue.Integer(0);
-            span[2] = TypedRedisValue.EmptyArray;
+            span[2] = TypedRedisValue.EmptyArray(RespPrefix.Array);
             return arr;
         }
 
         [RedisCommand(2, LockFree = true)]
-        protected virtual TypedRedisValue Select(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Select(RedisClient client, in RedisRequest request)
         {
             var raw = request.GetValue(1);
-            if (!raw.IsInteger) return TypedRedisValue.Error("ERR invalid DB index");
-            int db = (int)raw;
+            if (!raw.TryParse(out int db)) return TypedRedisValue.Error("ERR invalid DB index");
             if (db < 0 || db >= Databases) return TypedRedisValue.Error("ERR DB index is out of range");
+            if (db != 0 && !SupportMultiDb(out var err)) return TypedRedisValue.Error(err);
             client.Database = db;
             return TypedRedisValue.OK;
         }
 
-        [RedisCommand(-2)]
-        protected virtual TypedRedisValue Subscribe(RedisClient client, RedisRequest request)
-            => SubscribeImpl(client, request);
-        [RedisCommand(-2)]
-        protected virtual TypedRedisValue Unsubscribe(RedisClient client, RedisRequest request)
-            => SubscribeImpl(client, request);
-
-        private TypedRedisValue SubscribeImpl(RedisClient client, RedisRequest request)
+        protected virtual bool SupportMultiDb(out string err)
         {
-            var reply = TypedRedisValue.Rent(3 * (request.Count - 1), out var span);
-            int index = 0;
-            request.TryGetCommandBytes(0, out var cmd);
-            var cmdString = TypedRedisValue.BulkString(cmd.ToArray());
-            var mode = cmd[0] == (byte)'p' ? RedisChannel.RedisChannelOptions.Pattern : RedisChannel.RedisChannelOptions.None;
-            for (int i = 1; i < request.Count; i++)
+            if (ServerType is ServerType.Cluster)
             {
-                var channel = request.GetChannel(i, mode);
-                int count;
-                if (s_Subscribe.Equals(cmd))
-                {
-                    count = client.Subscribe(channel);
-                }
-                else if (s_Unsubscribe.Equals(cmd))
-                {
-                    count = client.Unsubscribe(channel);
-                }
-                else
-                {
-                    reply.Recycle(index);
-                    return TypedRedisValue.Nil;
-                }
-                span[index++] = cmdString;
-                span[index++] = TypedRedisValue.BulkString((byte[])channel);
-                span[index++] = TypedRedisValue.Integer(count);
+                err = "ERR SELECT is not allowed in cluster mode";
+                return false;
             }
-            return reply;
+            err = "";
+            return true;
         }
-        private static readonly CommandBytes
-            s_Subscribe = new CommandBytes("subscribe"),
-            s_Unsubscribe = new CommandBytes("unsubscribe");
+
         private static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
         [RedisCommand(1, LockFree = true)]
-        protected virtual TypedRedisValue Time(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Time(RedisClient client, in RedisRequest request)
         {
             var delta = Time() - UnixEpoch;
             var ticks = delta.Ticks;
             var seconds = ticks / TimeSpan.TicksPerSecond;
             var micros = (ticks % TimeSpan.TicksPerSecond) / (TimeSpan.TicksPerMillisecond / 1000);
-            var reply = TypedRedisValue.Rent(2, out var span);
+            var reply = TypedRedisValue.Rent(2, out var span, RespPrefix.Array);
             span[0] = TypedRedisValue.BulkString(seconds);
             span[1] = TypedRedisValue.BulkString(micros);
             return reply;
@@ -523,25 +1733,53 @@ namespace StackExchange.Redis.Server
         protected virtual DateTime Time() => DateTime.UtcNow;
 
         [RedisCommand(-2)]
-        protected virtual TypedRedisValue Unlink(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Unlink(RedisClient client, in RedisRequest request)
             => Del(client, request);
 
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Incr(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Incr(RedisClient client, in RedisRequest request)
             => TypedRedisValue.Integer(IncrBy(client.Database, request.GetKey(1), 1));
         [RedisCommand(2)]
-        protected virtual TypedRedisValue Decr(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue Decr(RedisClient client, in RedisRequest request)
             => TypedRedisValue.Integer(IncrBy(client.Database, request.GetKey(1), -1));
 
         [RedisCommand(3)]
-        protected virtual TypedRedisValue IncrBy(RedisClient client, RedisRequest request)
+        protected virtual TypedRedisValue DecrBy(RedisClient client, in RedisRequest request)
+            => TypedRedisValue.Integer(IncrBy(client.Database, request.GetKey(1), -request.GetInt64(2)));
+
+        [RedisCommand(3)]
+        protected virtual TypedRedisValue IncrBy(RedisClient client, in RedisRequest request)
             => TypedRedisValue.Integer(IncrBy(client.Database, request.GetKey(1), request.GetInt64(2)));
 
-        protected virtual long IncrBy(int database, RedisKey key, long delta)
+        protected virtual long IncrBy(int database, in RedisKey key, long delta)
         {
             var value = ((long)Get(database, key)) + delta;
             Set(database, key, value);
             return value;
         }
+
+        public virtual void OnFlush(RedisClient client, int messages, long bytes)
+        {
+        }
+
+        public virtual void OnClientCompleted(RedisClient redisClient, Exception exception)
+        {
+        }
+    }
+
+    internal static partial class HelloSubFieldsMetadata
+    {
+        [AsciiHash(CaseSensitive = false)]
+        public static partial bool TryParseCI(ReadOnlySpan<byte> command, out HelloSubFields value);
+    }
+
+    internal enum HelloSubFields
+    {
+        [AsciiHash("")]
+        None = 0,
+        [AsciiHash("AUTH")]
+        Auth,
+        [AsciiHash("SETNAME")]
+        SetName,
     }
 }

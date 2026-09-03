@@ -1,12 +1,12 @@
 ﻿using System;
 using System.Buffers;
+using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Pipelines.Sockets.Unofficial;
 
 namespace StackExchange.Redis.Configuration
 {
@@ -36,6 +36,30 @@ namespace StackExchange.Redis.Configuration
         /// </summary>
         public virtual ValueTask<Stream?> BeforeAuthenticateAsync(EndPoint endpoint, ConnectionType connectionType, Socket? socket, CancellationToken cancellationToken) => default;
 
+        /// <summary>
+        /// Optionally supply the ENTIRE transport for this connection - the same hijack as
+        /// <see cref="BeforeAuthenticateAsync"/> one level deeper: instead of yielding a
+        /// <see cref="Stream"/> over a socket the library owns, yield a
+        /// <see cref="RESPite.Transports.DuplexTransport"/> the tunnel owns, and no socket is created at
+        /// all. Return null (the default for every existing tunnel) for the standard socket path.
+        /// </summary>
+        /// <param name="endpoint">The logical endpoint being connected to.</param>
+        /// <param name="connectionType">Whether this is the interactive or subscription connection.</param>
+        /// <param name="tls">
+        /// The TLS intent this transport must honour: since the transport owns connect and TLS
+        /// end-to-end, the library does not (and cannot) apply <see cref="ConfigurationOptions.Ssl"/>
+        /// and friends on its behalf.
+        /// </param>
+        /// <param name="cancellationToken">Cancellation for the connect attempt.</param>
+        /// <remarks>
+        /// A transport that establishes TLS must report that via
+        /// <see cref="RESPite.Transports.DuplexTransport.IsEncrypted"/>; if
+        /// <see cref="TlsOptions.IsEnabled"/> is set and the transport reports otherwise, the
+        /// connection is failed rather than used.
+        /// </remarks>
+        [Experimental(RESPite.Experiments.Transport, UrlFormat = RESPite.Experiments.UrlFormat)]
+        public virtual ValueTask<RESPite.Transports.DuplexTransport?> ConnectTransportAsync(EndPoint endpoint, ConnectionType connectionType, TlsOptions tls, CancellationToken cancellationToken) => default;
+
         private sealed class HttpProxyTunnel : Tunnel
         {
             public EndPoint Proxy { get; }
@@ -58,47 +82,29 @@ namespace StackExchange.Redis.Configuration
                     offset += encoding.GetBytes(ep, 0, ep.Length, chunk, offset);
                     offset += encoding.GetBytes(Suffix, 0, Suffix.Length, chunk, offset);
 
-                    static void SafeAbort(object? obj)
+                    await socket.SendAsync(chunk.AsMemory(0, offset), SocketFlags.None, cancellationToken).ForAwait();
+
+                    // we expect to see: "HTTP/1.1 200 OK\n"; note our buffer is definitely big enough already
+                    int toRead = Math.Max(encoding.GetByteCount(ExpectedResponse1), encoding.GetByteCount(ExpectedResponse2)), read;
+                    offset = 0;
+
+                    var actualResponse = "";
+                    while (toRead > 0 && !actualResponse.EndsWith("\r\n\r\n"))
                     {
-                        try
-                        {
-                            (obj as SocketAwaitableEventArgs)?.Abort(SocketError.TimedOut);
-                        }
-                        catch { } // best effort only
-                    }
+                        read = await socket.ReceiveAsync(chunk.AsMemory(offset, toRead), SocketFlags.None, cancellationToken).ForAwait();
+                        if (read <= 0) break; // EOF (since we're never doing zero-length reads)
+                        toRead -= read;
+                        offset += read;
 
-                    using (var args = new SocketAwaitableEventArgs())
-                    using (cancellationToken.Register(static s => SafeAbort(s), args))
+                        actualResponse = encoding.GetString(chunk, 0, offset);
+                    }
+                    if (toRead != 0 && !actualResponse.EndsWith("\r\n\r\n")) throw new EndOfStreamException("EOF negotiating HTTP tunnel");
+                    // lazy
+                    if (ExpectedResponse1 != actualResponse && ExpectedResponse2 != actualResponse)
                     {
-                        args.SetBuffer(chunk, 0, offset);
-                        if (!socket.SendAsync(args)) args.Complete();
-                        await args;
-
-                        // we expect to see: "HTTP/1.1 200 OK\n"; note our buffer is definitely big enough already
-                        int toRead = Math.Max(encoding.GetByteCount(ExpectedResponse1), encoding.GetByteCount(ExpectedResponse2)), read;
-                        offset = 0;
-
-                        var actualResponse = "";
-                        while (toRead > 0 && !actualResponse.EndsWith("\r\n\r\n"))
-                        {
-                            args.SetBuffer(chunk, offset, toRead);
-                            if (!socket.ReceiveAsync(args)) args.Complete();
-                            read = await args;
-
-                            if (read <= 0) break; // EOF (since we're never doing zero-length reads)
-                            toRead -= read;
-                            offset += read;
-
-                            actualResponse = encoding.GetString(chunk, 0, offset);
-                        }
-                        if (toRead != 0 && !actualResponse.EndsWith("\r\n\r\n")) throw new EndOfStreamException("EOF negotiating HTTP tunnel");
-                        // lazy
-                        if (ExpectedResponse1 != actualResponse && ExpectedResponse2 != actualResponse)
-                        {
-                            throw new InvalidOperationException("Unexpected response negotiating HTTP tunnel");
-                        }
-                        ArrayPool<byte>.Shared.Return(chunk);
+                        throw new InvalidOperationException("Unexpected response negotiating HTTP tunnel");
                     }
+                    ArrayPool<byte>.Shared.Return(chunk);
                 }
                 return default; // no need for custom stream wrapper here
             }

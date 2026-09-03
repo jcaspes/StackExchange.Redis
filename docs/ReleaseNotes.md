@@ -6,9 +6,131 @@ Current package versions:
 | ------------ | ----------------- | ----- |
 | [![StackExchange.Redis](https://img.shields.io/nuget/v/StackExchange.Redis.svg)](https://www.nuget.org/packages/StackExchange.Redis/) | [![StackExchange.Redis](https://img.shields.io/nuget/vpre/StackExchange.Redis.svg)](https://www.nuget.org/packages/StackExchange.Redis/) | [![StackExchange.Redis MyGet](https://img.shields.io/myget/stackoverflow/vpre/StackExchange.Redis.svg)](https://www.myget.org/feed/stackoverflow/package/nuget/StackExchange.Redis) |
 
-## Unreleased
+## 3.0
+
+From 3.0, [release notes will be maintained in GitHub only](https://github.com/StackExchange/StackExchange.Redis/releases) to avoid duplication.
+
+---
+
+
+## 2.13.17
+
+- Fix TCP platform-dependent TCP keep-alive problems, and make an explicit option. ([#3090 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3090))
+- Tear down connection on write failure to prevent queue desync ([#3092 by @Pranish-Pantha](https://github.com/StackExchange/StackExchange.Redis/pull/3092)) 
+- Fix logic inversion with 8.8 `ARGREP NOCASE`, add `IsReversed` to simplify ordering, and support `ARINFO FULL`. ([#3087 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3087))
+- Avoid sentinel issues if `ROLE` unavailable; fix #3064 ([#3088 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3088))
+- Add 8.8 support for `INCREX` ([#3065 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3065))
+
+## 2.13.10
+
+- Add experimental Redis 8.8 array support, including array APIs on `IDatabase`/`IDatabaseAsync`,
+  array helper types, `RedisType.Array`, and array delete keyspace notification event types. ([#3076 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3076))
+- Enable TCP keep-alives ([#3078 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3078))
+- Fix incorrect routing of some sorted-set and stream commands ([#3080 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3080))
+- `ConfigurationOptions` : don't persist `Protocol` when it comes from the defaults-provider. ([#3082 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3082))
+
+## 2.13.1
+
+***IMPORTANT:*** This release changes the default protocol from RESP2 to RESP3 for Azure Managed Redis endpoints (only) ; this
+has scalability and feature advantages, but if you are using modules or ad-hoc commands,
+*[please see the RESP3 notes](https://seredis.dev/Resp3)*,
+which includes:
+
+- the purpose of RESP3
+- scenarios where RESP2 vs RESP3 may be visible
+- how to explicitly choose to remain on RESP2
+- notes on additional libraries such as NRedisStack
+
+Changes:
+
+- Prefer RESP3 for Azure Managed Redis endpoints ([#3067 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3067))
+
+## 2.12.27
+
+- Recognize Azure Managed Redis (AMR) resources in new Azure clouds ([#3068 by @philon-msft](https://github.com/StackExchange/StackExchange.Redis/pull/3068))
+- Remove `[Experimental]` 8.8 `GCRA` feature ([#3074 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3074))
+- Detect server-mode correctly on Valkey 8+ instances ([#3050 by @wipiano](https://github.com/StackExchange/StackExchange.Redis/pull/3050))
+- Add Redis 8.8 stream negative acknowledgements (`XNACK`) ([#3058 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3058))
+- Add experimental `Aggregate.Count` support for sorted-set combination operations against Redis 8.8 ([#3059 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3059))
+- Support Redis 8.8 sub-key (hash field) notifications ([#3062 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3062))
+- Add `ValueCondition` overloads for `SortedSetIncrement`/`SortedSetIncrementAsync`, supporting `ZADD INCR` with existence conditions ([#3071 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3071))
+
+## 2.12.14
+
+- Critical fix for high-integrity mode in cluster scenarios ([#3049 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/issues/3049))
+
+## 2.12.8
+
+- (this release also includes experimental 8.8 `GCRA` support; this feature is not being shipped yet, and it is being removed from later releases)
+- Remove experimental flag on `VSIM` ([#3041 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3041))
+- Add `IServer.GetProductVariant` to detect the product variant and version of the connected server, and use that internally
+  to enable multi-DB operations on Valkey clusters ([#3040 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3040))
+- Ignore cluster nodes with the `handshake` flag ([#3043 by @TimLovellSmith](https://github.com/StackExchange/StackExchange.Redis/pull/3043))
+
+## 2.12.4
+
+- Fix RESP3 client handshakes on non-RESP3 servers by ([#3037 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3037))
+- Improve detection of connect/handshake failures and how that impacts the retry-policy ([#3038 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3038))
+
+
+## 2.12.1
+
+- Add missing `LCS` outputs and missing `RedisType.VectorSet` ([#3028 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3028))
+- Track and report multiplexer count ([#3030 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3030))
+- (docs) Add Entra ID authentication docs ([#3023 by @philon-msft](https://github.com/StackExchange/StackExchange.Redis/pull/3023))
+- (eng) Improve test infrastructure (toy-server) ([#3021 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3021), [#3022 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3022), [#3027 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3027), [#3028 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3028))
+- (eng) Pre-V2 work: bring RESPite down, toy-server, migrate to `AsciiHash` ([#3028 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3028))
+
+## 2.11.8
+
+* Handle `-MOVED` error pointing to same endpoint. ([#3003 by @barshaul](https://github.com/StackExchange/StackExchange.Redis/pull/3003))
+* fix time conversion error in `HOTKEYS` ([#3017 by @mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3017))
+
+- Add support for `VRANGE` ([#3011 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3011))
+- Add defensive code in azure-maintenance-events handling ([#3013 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3013))
+
+## 2.11.3
+
+- Add support for `VRANGE` ([#3011 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3011))
+- Add defensive code in azure-maintenance-events handling ([#3013 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3013))
+
+## 2.11.0
+
+- Add support for `HOTKEYS` ([#3008 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3008))
+- Add support for keyspace notifications ([#2995 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2995))
+- Add support for idempotent stream entry (`XADD IDMP[AUTO]`) support  ([#3006 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/3006))
+- (internals) split AMR out to a separate options provider ([#2986 by NickCraver and philon-msft](https://github.com/StackExchange/StackExchange.Redis/pull/2986))
+
+## 2.10.14
+
+- Fix bug with connection startup failing in low-memory scenarios ([#3002 by nathan-miller23](https://github.com/StackExchange/StackExchange.Redis/pull/3002))
+- Fix under-count of `TotalOutstanding` in server-counters ([#2996 by nathan-miller23](https://github.com/StackExchange/StackExchange.Redis/pull/2996))
+- Fix incorrect debug assertion in `HGETEX` (no impact to release library) ([#2999 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2999))
+
+
+## 2.10.1
+
+- Support Redis 8.4 CAS/CAD operations (`DIGEST`, and the `IFEQ`, `IFNE`, `IFDEQ`, `IFDNE` modifiers on `SET` / `DEL`)
+  via the new `ValueCondition` abstraction, and use CAS/CAD operations for `Lock*` APIs when possible ([#2978 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2978))
+  - **note**: overload resolution for `StringSet[Async]` may be impacted in niche cases, requiring trivial build changes (there are no runtime-breaking changes such as missing methods)
+- Support `XREADGROUP CLAIM` ([#2972 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2972)) 
+- Support `MSETEX` (Redis 8.4.0) for multi-key operations with expiration ([#2977 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2977))
+
+## 2.9.32
+
+- Fix `SSUBSCRIBE` routing during slot migrations ([#2969 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2969))
+
+## 2.9.25
+
+- (build) Fix SNK on non-Windows builds ([#2963 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2963))
+
+## 2.9.24
 
 - Fix [#2951](https://github.com/StackExchange/StackExchange.Redis/issues/2951) - sentinel reconnection failure ([#2956 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2956))
+- Mitigate [#2955](https://github.com/StackExchange/StackExchange.Redis/issues/2955) (unbalanced pub/sub routing) / add `RedisValue.WithKeyRouting()` ([#2958 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2958))
+- Fix envoyproxy command exclusions ([#2957 by sshumakov](https://github.com/StackExchange/StackExchange.Redis/pull/2957))
+- Restrict `RedisValue` hex fallback (`string` conversion) to encoding failures ([2954 by jcaspes](https://github.com/StackExchange/StackExchange.Redis/pull/2954))
+- (internals) prefer `Volatile.Read` over `Thread.VolatileRead` ([2960 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2960))
 
 ## 2.9.17
 
@@ -45,7 +167,7 @@ Current package versions:
 
 - Add support for new `BITOP` operations in CE 8.2 ([#2900 by atakavci](https://github.com/StackExchange/StackExchange.Redis/pull/2900))
 - Package updates ([#2906 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2906))
-- Docs: added [guidance on async timeouts](https://stackexchange.github.io/StackExchange.Redis/AsyncTimeouts) ([#2910 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2910))
+- Docs: added [guidance on async timeouts](https://seredis.dev/AsyncTimeouts) ([#2910 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2910))
 - Fix handshake error with `CLIENT ID` ([#2909 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2909))
 
 ## 2.8.41
@@ -93,14 +215,14 @@ Current package versions:
 
 ## 2.8.0
 
-- Add high-integrity mode ([docs](https://stackexchange.github.io/StackExchange.Redis/Configuration), [#2471 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2741))
+- Add high-integrity mode ([docs](https://seredis.dev/Configuration), [#2471 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2741))
 - TLS certificate/`TrustIssuer`: Check EKU in X509 chain checks when validating certificates ([#2670 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2670))
 
 ## 2.7.33
 
 - **Potentially Breaking**: Fix `CheckTrustedIssuer` certificate validation for broken chain scenarios ([#2665 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2665))
   - Users inadvertently trusting a remote cert with a broken chain could not be failing custom validation before this change. This is only in play if you are using `ConfigurationOptions.TrustIssuer` at all.
-- Add new `LoggingTunnel` API; see [https://stackexchange.github.io/StackExchange.Redis/RespLogging](https://stackexchange.github.io/StackExchange.Redis/RespLogging) ([#2660 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2660))
+- Add new `LoggingTunnel` API; see [https://seredis.dev/RespLogging](https://seredis.dev/RespLogging) ([#2660 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2660))
 - Fix [#2664](https://github.com/StackExchange/StackExchange.Redis/issues/2664): Move ProcessBacklog to fully sync to prevent thread pool hopping and blocking on awaits ([#2667 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2667))
 
 ## 2.7.27
@@ -132,7 +254,7 @@ Current package versions:
 
 ## 2.7.4
 
-- Adds: RESP3 support ([#2396 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2396)) - see https://stackexchange.github.io/StackExchange.Redis/Resp3
+- Adds: RESP3 support ([#2396 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2396)) - see https://seredis.dev/Resp3
 - Fix [#2507](https://github.com/StackExchange/StackExchange.Redis/issues/2507): Pub/sub with multi-item payloads should be usable ([#2508 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2508))
 - Add: connection-id tracking (internal only, no public API) ([#2508 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/2508))
 - Add: `ConfigurationOptions.LoggerFactory` for logging to an `ILoggerFactory` (e.g. `ILogger`) all connection and error events ([#2051 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2051))
@@ -216,7 +338,7 @@ Current package versions:
 - Fix [#1968](https://github.com/StackExchange/StackExchange.Redis/issues/1968): Improved handling of EVAL scripts during server restarts and failovers, detecting and re-sending the script for a retry when needed ([#2170 by martintmk](https://github.com/StackExchange/StackExchange.Redis/pull/2170))
 - Adds: `ConfigurationOptions.SslClientAuthenticationOptions` (`netcoreapp3.1`/`net5.0`+ only) to give more control over SSL/TLS authentication ([#2224 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2224))
 - Fix [#2240](https://github.com/StackExchange/StackExchange.Redis/pull/2241): Improve support for DNS-based IPv6 endpoints ([#2241 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2241))
-- Adds: `ConfigurationOptions.HeartbeatInterval` (**Advanced Setting** - [see docs](https://stackexchange.github.io/StackExchange.Redis/Configuration#configuration-options)) To allow more finite control of the client heartbeat, which encompases how often command timeouts are actually evaluated - still defaults to 1,000 ms ([#2243 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2243))
+- Adds: `ConfigurationOptions.HeartbeatInterval` (**Advanced Setting** - [see docs](https://seredis.dev/Configuration#configuration-options)) To allow more finite control of the client heartbeat, which encompases how often command timeouts are actually evaluated - still defaults to 1,000 ms ([#2243 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2243))
 - Fix [#1879](https://github.com/StackExchange/StackExchange.Redis/issues/1879): Improve exception message when the wrong password is used ([#2246 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2246))
 - Fix [#2233](https://github.com/StackExchange/StackExchange.Redis/issues/2233): Repeated connection to Sentinel servers using the same ConfigurationOptions would fail ([#2242 by NickCraver](https://github.com/StackExchange/StackExchange.Redis/pull/2242))
 
@@ -407,7 +529,7 @@ Current package versions:
 - Fix: Ensure active-message is cleared ([#1374 by hamish-omny](https://github.com/StackExchange/StackExchange.Redis/pull/1374))
 - Adds: Sentinel support ([#1067 by shadim](https://github.com/StackExchange/StackExchange.Redis/pull/1067), [#692 by lexxdark](https://github.com/StackExchange/StackExchange.Redis/pull/692))
 - Adds: `IAsyncEnumerable<T>` scanning APIs now supported ([#1087 by mgravell](https://github.com/StackExchange/StackExchange.Redis/pull/1087))
-- Adds: New API for use with misbehaving sync-contexts ([more info](https://stackexchange.github.io/StackExchange.Redis/ThreadTheft))
+- Adds: New API for use with misbehaving sync-contexts ([more info](https://seredis.dev/ThreadTheft))
 - Adds: `TOUCH` support ([#1291 by gkorland](https://github.com/StackExchange/StackExchange.Redis/pull/1291))
 - Adds: `Condition` API (transactions) now supports `SortedSetLengthEqual` ([#1332 by phosphene47](https://github.com/StackExchange/StackExchange.Redis/pull/1332))
 - Adds: `SocketManager` is now more configurable ([#1115 by naile](https://github.com/StackExchange/StackExchange.Redis/pull/1115))
@@ -487,7 +609,7 @@ Current package versions:
   only releasing `StackExchange.Redis` (strong-named). This is a binary breaking change that requires consumers to be re-compiled; it cannot be applied via binding-redirects
 - **Hard Break**: The platform targets have been rationalized - supported targets are .NETStandard 2.0 (and above), .NETFramework 4.6.1 (and above), and .NETFramework 4.7.2 (and above)
   (note - the last two are mainly due to assembly binding problems)
-- **Hard Break**: The profiling API has been overhauled and simplified; full documentation is [provided here](https://stackexchange.github.io/StackExchange.Redis/Profiling_v2.html)
+- **Hard Break**: The profiling API has been overhauled and simplified; full documentation is [provided here](https://seredis.dev/Profiling_v2.html)
 - **Soft Break**: The `PreserveAsyncOrder` behaviour of the pub/sub API has been deprecated; a *new* API has been provided for scenarios that require in-order pub/sub handling -
   the `Subscribe` method has a new overload *without* a handler parameter which returns a `ChannelMessageQueue`, which provides `async` ordered access to messages)
 - Internal: The network architecture has moved to use `System.IO.Pipelines`; this has allowed us to simplify and unify a lot of the network code, and in particular fix a lot of problems relating to how the library worked with TLS and/or .NETStandard
