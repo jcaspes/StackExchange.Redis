@@ -5,6 +5,7 @@
 		<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
 		<AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
 		<PlatformTarget>x86</PlatformTarget>
+    <NoWarn>$(NoWarn);StringToRedisValue</NoWarn>
 	</PropertyGroup>
 	<ItemGroup>
 	  <None Remove="Platform.config" />
