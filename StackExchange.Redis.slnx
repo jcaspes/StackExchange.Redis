@@ -44,6 +44,7 @@
   </Folder>
   <Folder Name="/toys/">
     <Project Path="toys/KestrelRedisServer/KestrelRedisServer.csproj" />
+    <Project Path="toys/MemoryTester/MemoryTester.csproj" />
     <Project Path="toys/OpBench/OpBench.csproj" />
     <Project Path="toys/StackExchange.Redis.Server/StackExchange.Redis.Server.csproj" />
     <Project Path="toys/TestConsole/TestConsole.csproj" />
